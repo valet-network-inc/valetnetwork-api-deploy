@@ -1,0 +1,445 @@
+openapi: 3.0.0
+info:
+  title: Valet NYC Admin API
+  version: 1.0.0
+  description: Admin dashboard and analytics API documentation for Valet NYC
+
+servers:
+  - url: http://localhost:3001/api
+    description: Development server
+  - url: https://valetnycdev.nfndev.com/api
+    description: Dev server
+  - url: https://valetnyc-api-uat.nfndev.com/api
+    description: UAT server
+  - url: https://valetnyc-api-production.nfndev.com/api
+    description: Temp Prod server
+
+tags:
+  - name: Admin
+    description: Admin dashboard and analytics
+
+components:
+  schemas:
+    Error:
+      type: object
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+        error:
+          type: string
+
+paths:
+  /admin/metrics/business:
+    get:
+      summary: Get business metrics
+      tags: [Admin]
+      description: Retrieve comprehensive business metrics including total requests, completed jobs, revenue, and performance indicators
+      parameters:
+        - in: query
+          name: startDate
+          schema:
+            type: string
+            format: date-time
+          description: Start date for metrics (ISO 8601 format)
+        - in: query
+          name: endDate
+          schema:
+            type: string
+            format: date-time
+          description: End date for metrics (ISO 8601 format)
+      responses:
+        '200':
+          description: Business metrics retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: object
+                    properties:
+                      totalRequests:
+                        type: integer
+                      completedJobs:
+                        type: integer
+                      completionRate:
+                        type: string
+                      grossRevenue:
+                        type: string
+                      netRevenue:
+                        type: string
+                      activeUsers:
+                        type: integer
+                      activeValets:
+                        type: integer
+                      avgPickupETA:
+                        type: string
+                      avgRetrieveTime:
+                        type: string
+                      cancellationRate:
+                        type: string
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /admin/metrics/users:
+    get:
+      summary: Get user metrics
+      tags: [Admin]
+      description: Retrieve user-side metrics including new users, returning users, and request patterns
+      parameters:
+        - in: query
+          name: startDate
+          schema:
+            type: string
+            format: date-time
+          description: Start date for metrics
+        - in: query
+          name: endDate
+          schema:
+            type: string
+            format: date-time
+          description: End date for metrics
+      responses:
+        '200':
+          description: User metrics retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: object
+                    properties:
+                      newUsers:
+                        type: integer
+                      returningUsers:
+                        type: integer
+                      totalActiveUsers:
+                        type: integer
+                      returnRate:
+                        type: string
+                      requestsByServiceType:
+                        type: array
+                        items:
+                          type: object
+                      requestsByHour:
+                        type: array
+                        items:
+                          type: object
+                      requestsByDayOfWeek:
+                        type: array
+                        items:
+                          type: object
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /admin/metrics/valets:
+    get:
+      summary: Get valet metrics
+      tags: [Admin]
+      description: Retrieve comprehensive valet performance metrics including jobs completed, acceptance rates, and efficiency metrics
+      parameters:
+        - in: query
+          name: startDate
+          schema:
+            type: string
+            format: date-time
+          description: Start date for metrics
+        - in: query
+          name: endDate
+          schema:
+            type: string
+            format: date-time
+          description: End date for metrics
+      responses:
+        '200':
+          description: Valet metrics retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: object
+                    properties:
+                      fleetAverages:
+                        type: object
+                        properties:
+                          avgJobsPerValet:
+                            type: string
+                          avgAcceptanceRate:
+                            type: string
+                          avgMissedRate:
+                            type: string
+                      jobsPerValet:
+                        type: array
+                        items:
+                          type: object
+                      dispatchAcceptTime:
+                        type: array
+                        items:
+                          type: object
+                      acceptanceRate:
+                        type: array
+                        items:
+                          type: object
+                      missedRequests:
+                        type: array
+                        items:
+                          type: object
+                      pickupDistance:
+                        type: array
+                        items:
+                          type: object
+                      parkingSearchTime:
+                        type: array
+                        items:
+                          type: object
+                      retrievalTime:
+                        type: array
+                        items:
+                          type: object
+                      idleTime:
+                        type: array
+                        items:
+                          type: object
+                      aspMovesPerHour:
+                        type: array
+                        items:
+                          type: object
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /admin/valets:
+    get:
+      summary: Get valet list with metrics
+      tags: [Admin]
+      description: Retrieve list of all valets with their performance metrics and pagination support
+      parameters:
+        - in: query
+          name: page
+          schema:
+            type: integer
+            default: 1
+          description: Page number for pagination (default 1)
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            default: 10
+          description: Number of valets per page (default 10)
+        - in: query
+          name: startDate
+          schema:
+            type: string
+            format: date-time
+          description: Start date for metrics calculation
+        - in: query
+          name: endDate
+          schema:
+            type: string
+            format: date-time
+          description: End date for metrics calculation
+      responses:
+        '200':
+          description: Valet list with metrics retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        _id:
+                          type: string
+                        firstName:
+                          type: string
+                        lastName:
+                          type: string
+                        isActive:
+                          type: boolean
+                        shiftStatus:
+                          type: string
+                        currentLocation:
+                          type: object
+                        metrics:
+                          type: object
+                          properties:
+                            jobsCompleted:
+                              type: integer
+                            acceptanceRate:
+                              type: string
+                            missedRequests:
+                              type: integer
+                            dispatchAcceptTime:
+                              type: string
+                            pickupDistance:
+                              type: string
+                            parkingSearchTime:
+                              type: string
+                            retrievalTime:
+                              type: string
+                            idleTime:
+                              type: string
+                            aspMovesPerHour:
+                              type: string
+                  pagination:
+                    type: object
+                    properties:
+                      currentPage:
+                        type: integer
+                      totalPages:
+                        type: integer
+                      totalValets:
+                        type: integer
+                      limit:
+                        type: integer
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /admin/valets/deactivate:
+    post:
+      summary: Deactivate a valet
+      tags: [Admin]
+      description: Deactivate a valet account and cancel their active orders
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                valetId:
+                  type: string
+                  description: The valet ID to deactivate
+              required: [valetId]
+      responses:
+        '200':
+          description: Valet deactivated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  valet:
+                    type: object
+                    properties:
+                      _id:
+                        type: string
+                      firstName:
+                        type: string
+                      lastName:
+                        type: string
+                      isActive:
+                        type: boolean
+        '400':
+          description: Missing valetId
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Valet not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /admin/valets/reactivate:
+    post:
+      summary: Reactivate a valet
+      tags: [Admin]
+      description: Reactivate a previously deactivated valet account
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                valetId:
+                  type: string
+                  description: The valet ID to reactivate
+              required: [valetId]
+      responses:
+        '200':
+          description: Valet reactivated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  valet:
+                    type: object
+                    properties:
+                      _id:
+                        type: string
+                      firstName:
+                        type: string
+                      lastName:
+                        type: string
+                      isActive:
+                        type: boolean
+                      isValet:
+                        type: boolean
+        '400':
+          description: Missing valetId
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Valet not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'

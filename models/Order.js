@@ -1,0 +1,356 @@
+const mongoose = require('mongoose');
+
+const OrderSchema = new mongoose.Schema({
+    customer: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'User',
+        required: true,
+    },
+    customerLocation: {
+        lat: {
+            type: Number,
+            required: true,
+        },
+        lng: {
+            type: Number,
+            required: true,
+        },
+        streetAddress: {
+            type: String,
+            required: true,
+        },
+    },
+    parkingType: {
+        type: String,
+        required: true,
+        enum: ['street', 'garage', 'private', 'retrieval'],
+        default: 'street',
+    },
+    orderType: {
+        type: String,
+        enum: ['parking', 'retrieval'],
+        default: 'parking',
+    },
+    parkingLocation: {
+        lat: {
+            type: Number,
+        },
+        lng: {
+            type: Number,
+        },
+        streetAddress: {
+            type: String,
+        },
+    },
+
+    // Where the keys physically changed hands at order start. Recorded by
+    // the valet the moment they take possession of the keys. Used as the
+    // default retrieval coordinate (build 11) and as the stable "key
+    // pickup location" anchor for build 12's pre-positioned dispatch
+    // math (walk + walk + drive).
+    keyDropoffLocation: {
+        lat: { type: Number },
+        lng: { type: Number },
+        streetAddress: { type: String },
+        recordedAt: { type: Date },
+    },
+
+    duration: { type: Number, required: true }, // Duration in minutes
+
+    // Customer-initiated duration extensions. Each row is one paid extension
+    // event. Pricing tier: $5 first additional hour, +$1 each after — billed
+    // as a separate Stripe charge per extension (not a top-up of the
+    // original PaymentIntent which is already captured).
+    extensions: [
+        {
+            additionalHours: { type: Number, required: true },
+            amountCents: { type: Number, required: true },
+            paymentIntentId: { type: String, required: true },
+            chargedAt: { type: Date, required: true },
+            requestedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+        },
+    ],
+    pickUpTime: { type: Date, required: true },
+    valet: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    valetLocation: {
+        lat: {
+            type: Number,
+        },
+        lng: {
+            type: Number,
+        },
+        streetAddress: {
+            type: String,
+        },
+    },
+    status: {
+        type: String,
+        required: true,
+        // One parked state. A park ends with the keys back in the customer's
+        // hand — always — so there is nothing to distinguish. Whether that
+        // handoff has happened yet is `otpVerifiedTimes.returnKey`; whether a
+        // return trip is already paid for is `serviceType`.
+        enum: ['pending', 'accepted', 'in-progress', 'in_progress', 'parked', 'keys-returning', 'completed', 'cancelled'],
+        // Phones still running the App Store build send the retired
+        // 'parked-with-keys' when a valet finishes a park. Fold it in rather
+        // than rejecting it — a hard 400 here would strand those valets
+        // mid-park until they updated. Nothing ever reads it back out.
+        set: (v) => (v === 'parked-with-keys' ? 'parked' : v),
+        default: 'pending',
+    },
+    paymentMethod: {
+        type: String,
+        enum: ['card', 'pm_card_visa', 'Apple Pay'],
+        required: true,
+    },
+    totalAmount: { type: Number, required: true }, // Total amount in cents
+    paymentStatus: {
+        type: String,
+        enum: ['pending', 'paid', 'failed'],
+        default: 'pending',
+    },
+    paymentIntentId: { type: String },
+    paymentDetails: {
+        amount: { type: Number }, // Amount in cents
+        currency: { type: String, default: 'usd' },
+        clientSecret: { type: String },
+        chargeId: { type: String }, // Stripe charge ID
+        receiptUrl: { type: String }, // Stripe receipt URL
+        paymentMethodDetails: {
+            type: { type: String }, // card, apple_pay, etc.
+            last4: { type: String }, // Last 4 digits of card
+            brand: { type: String }, // Card brand (visa, mastercard, etc.)
+        },
+        paidAt: { type: Date }, // When payment was completed
+        failureReason: { type: String }, // Reason if payment failed
+    },
+    conversationId: { type: String },
+    review: {
+        rating: { type: Number, min: 0, max: 5 },
+        comment: { type: String },
+    },
+    // Enterprise (doorman) account — end-customer details entered by the enterprise user at summon time.
+    // When these are present, the valet's app displays them in place of the order creator's info.
+    endCustomerName: {
+        type: String,
+    },
+    endCustomerPhone: {
+        type: String,
+    },
+    // Enterprise feature fields
+    eventCode: {
+        type: String, // Code for enterprise events (e.g., wedding, conference)
+    },
+    isFreeService: {
+        type: Boolean,
+        default: false, // Whether this service is free for enterprise event attendees
+    },
+    serviceType: {
+        type: String,
+        enum: ['standard', 'park-and-hold'], // park-and-hold keeps keys with valet
+        default: 'standard',
+    },
+    // Car Watch add-on: customer paid $1/hr for a valet to keep eyes on the
+    // parked car (deter tickets/damage/break-ins + be a witness). When true,
+    // the valet's order view flags it so they know to watch the vehicle.
+    carWatch: {
+        type: Boolean,
+        default: false,
+    },
+    carWatchAmount: {
+        type: Number, // Car Watch portion of totalAmount, in cents
+        default: 0,
+    },
+    linkedOrderId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'Order', // Links parking order to its retrieval order
+    },
+    // When the valet closed the park out ("Swipe to End Order"). This is what
+    // takes the job off their screen — the key handoff alone doesn't, because
+    // the swipe still has to happen after it. Older clients signal this by
+    // sending the retired 'parked-with-keys'; `updateOrder` translates that.
+    parkClosedAt: {
+        type: Date,
+    },
+
+    // Key-return handoff. Enterprise / front desk generates a short-lived
+    // OTP; valet types it after physically dropping the keys to confirm
+    // the handoff. Required gate for park-and-hold orders to reach
+    // `completed`. Drives the insurance trail — the order can't close
+    // until someone at the receiving end vouches for the key handoff.
+    keyReturn: {
+        otp: { type: String },               // 4-digit code, plain (short-lived)
+        otpGeneratedAt: { type: Date },
+        otpExpiresAt: { type: Date },        // typically generatedAt + 15 min
+        otpAttempts: { type: Number, default: 0 },
+        completedAt: { type: Date },
+        // Who generated and who verified — useful for audit
+        generatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+        verifiedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    },
+    // Vehicle information for car tracking/shuffling
+    vehicle: {
+        color: {
+            type: String,
+            trim: true,
+        },
+        model: {
+            type: String,
+            trim: true,
+        },
+        licensePlate: {
+            type: String,
+            trim: true,
+            uppercase: true,
+        },
+        keyTagNumber: {
+            type: String,
+            trim: true,
+        },
+    },
+    // OTP for order completion confirmation
+    otp: {
+        code: {
+            type: String,
+        },
+        createdAt: {
+            type: Date,
+        },
+        expiresAt: {
+            type: Date,
+        },
+        verified: {
+            type: Boolean,
+            default: false,
+        },
+        verifiedAt: {
+            type: Date,
+        },
+        type: {
+            type: String,
+            enum: ['order_creation', 'parking_location', 'return_key'],
+        },
+    },
+    otpVerifiedTimes: {
+        orderCreation: {
+            type: Date,
+        },
+        parkingLocation: {
+            type: Date,
+        },
+        returnKey: {
+            type: Date,
+        },
+    },
+    aspMode: {
+        type: Boolean,
+        default: false,
+    },
+    asp_time: {
+        type: Date,
+    },
+    aspNotificationSent: {
+        type: Boolean,
+        default: false,
+    },
+    aspOrderCreated: {
+        type: Boolean,
+        default: false,
+    },
+    notifiedValets: [{
+        valet: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: 'User',
+        },
+        notifiedAt: {
+            type: Date,
+        },
+        accepted: {
+            type: Boolean,
+            default: false,
+        },
+        acceptedAt: {
+            type: Date,
+        },
+    }],
+    acceptanceLocation: {
+        lat: {
+            type: Number,
+        },
+        lng: {
+            type: Number,
+        },
+    },
+    pickupDistance: {
+        type: Number, // Distance in meters from valet to customer at acceptance
+    },
+    parkedAt: {
+        type: Date, // Timestamp when valet updated parking location
+    },
+    // Top-level timestamp of when the assigned valet accepted the order. Used by
+    // the valet-cancel cooldown logic (valet can only cancel after a few minutes).
+    acceptedAt: {
+        type: Date,
+    },
+    // True once the valet has been credited for this order's earnings.
+    // Used to ensure idempotency — re-saving a completed order won't double-pay.
+    creditedValet: {
+        type: Boolean,
+        default: false,
+    },
+    // --- Park & Retrieve: the customer called off the prepaid return trip ---
+    // Set by cancelRetrievalLeg. Deliberately additive: totalAmount,
+    // serviceType and paymentStatus are left alone, because every receipt and
+    // tip-base calculation on both clients carves the retrieval portion out of
+    // a park-and-hold total itself. Editing the total would make the parking
+    // receipt read $7 instead of $10.
+    retrievalCancelled: {
+        type: Boolean,
+        default: false,
+    },
+    retrievalCancelledAt: {
+        type: Date,
+    },
+    // The one place a refund is recorded anywhere in this system. Stripe is
+    // otherwise the only record that money went back.
+    retrievalRefund: {
+        amountCents: { type: Number },
+        refundId: { type: String },
+        status: { type: String },
+        refundedAt: { type: Date },
+    },
+}, {
+    timestamps: true, // Adds createdAt and updatedAt automatically
+});
+
+/**
+ * Speak the old dialect to old clients.
+ *
+ * We store ONE parked state. Every app and web build shipped before this
+ * change instead looks for `parked-with-keys` to mean "the valet has finished
+ * and closed out, the keys are with the customer, and a return trip is still
+ * owed" — it's what gates the customer's free "bring it back" control and what
+ * tells the valet the job is off their plate. Sending those clients a bare
+ * `parked` silently costs the customer a return they already paid for.
+ *
+ * So the wire format keeps the old word for exactly that situation while the
+ * database keeps one state. Clients from this change onward normalise it back
+ * on the way in, so it reads as `parked` to them.
+ *
+ * REMOVE once App Store, TestFlight and web are all past the collapse.
+ */
+const speaksOldDialect = (o) =>
+    o &&
+    o.status === 'parked' &&
+    o.orderType === 'parking' &&
+    o.serviceType === 'park-and-hold' &&
+    !!o.parkClosedAt;
+
+OrderSchema.set('toJSON', {
+    transform: (doc, ret) => {
+        if (speaksOldDialect(ret)) ret.status = 'parked-with-keys';
+        return ret;
+    },
+});
+
+module.exports = mongoose.model('Order', OrderSchema);

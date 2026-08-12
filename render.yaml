@@ -1,0 +1,56 @@
+services:
+  - type: web
+    name: valetnetwork-api
+    runtime: node
+    plan: starter          # NOT free — free instances sleep after 15 min idle
+    region: virginia       # closest Render region to NYC
+    buildCommand: npm ci --omit=dev
+    startCommand: node server.js
+    healthCheckPath: /health
+
+    envVars:
+      # --- Safe to commit ---------------------------------------------------
+      # Kept as "development" on purpose: this is what the old production box
+      # ran, and code branches on it. Changing it is a separate decision.
+      - key: NODE_ENV
+        value: development
+      - key: PUBLIC_BACKEND_URL
+        value: https://api.valetnetwork.co
+      - key: PAYMENT_SUCCESS_URL
+        value: https://valetnetwork.co/payment-success
+      - key: FIREBASE_STORAGE_BUCKET
+        value: valetnyc-39ecd.firebasestorage.app
+      - key: RESEND_FROM
+        value: noreply@valetnetwork.co
+      # Leave false for the first boot. Flip to true only after checking the
+      # pending-order backlog — the first tick cancels and refunds everything
+      # older than 30 minutes.
+      - key: AUTO_CANCEL_ENABLED
+        value: "false"
+
+      # --- Secrets: set these in the Render dashboard, never in this file ----
+      - key: MONGO_URI
+        sync: false
+      - key: STRIPE_API_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: ADMIN_API_KEY
+        sync: false
+      - key: REACT_APP_GOOGLE_MAPS_APIKEY
+        sync: false
+      # Paste the ENTIRE valetnyc-39ecd service-account JSON as one line.
+      # Without this the app falls back to the dev Firebase project and every
+      # push notification silently goes nowhere.
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: YARDSTIK_API_KEY
+        sync: false
+      - key: YARDSTIK_BASE_URL
+        sync: false
+      - key: YARDSTIK_PACKAGE_SYSTEM_NAME
+        sync: false
+      - key: YARDSTIK_WEBHOOK_SIGNATURE_KEY
+        sync: false

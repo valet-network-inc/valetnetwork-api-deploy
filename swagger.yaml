@@ -1,0 +1,2514 @@
+openapi: 3.0.0
+info:
+  title: Valet NYC API
+  version: 1.0.0
+  description: API documentation for Valet NYC backend service
+  contact:
+    name: Valet NYC Team
+
+servers:
+  - url: http://localhost:3001/api
+    description: Development server
+  - url: https://valetnycdev.nfndev.com/api
+    description: Dev server
+  - url: https://valetnyc-api-uat.nfndev.com/api
+    description: UAT server
+  - url: https://valetnyc-api-production.nfndev.com/api
+    description: Temp Prod server
+
+tags:
+  - name: Auth
+    description: Authentication and user management
+  - name: Order
+    description: Order management and tracking
+  - name: Payment
+    description: Payment processing and guest checkout
+  - name: Notification
+    description: Push notifications and alerts
+  - name: Subscription
+    description: Subscription management
+  - name: Event
+    description: Event code validation
+  - name: Key Transfer
+    description: Key transfer management between valets
+  - name: Location
+    description: Location-based features including free space marking
+  - name: Admin
+    description: Admin dashboard and analytics
+
+components:
+  schemas:
+    User:
+      type: object
+      properties:
+        _id:
+          type: string
+        uid:
+          type: string
+        email:
+          type: string
+        displayName:
+          type: string
+        userType:
+          type: string
+          enum: [customer, valet]
+        location:
+          type: object
+          properties:
+            type:
+              type: string
+              default: Point
+            coordinates:
+              type: array
+              items:
+                type: number
+        createdAt:
+          type: string
+          format: date-time
+
+    Order:
+      type: object
+      properties:
+        _id:
+          type: string
+        userId:
+          type: string
+        status:
+          type: string
+          enum: [pending, accepted, in_progress, completed, cancelled]
+        pickupLocation:
+          type: object
+        vehicleInfo:
+          type: object
+        createdAt:
+          type: string
+          format: date-time
+
+    Subscription:
+      type: object
+      properties:
+        _id:
+          type: string
+        userId:
+          type: string
+        planType:
+          type: string
+          enum: [monthly, annual]
+        status:
+          type: string
+          enum: [active, cancelled, expired]
+        startDate:
+          type: string
+          format: date-time
+        renewalDate:
+          type: string
+          format: date-time
+
+    Payment:
+      type: object
+      properties:
+        _id:
+          type: string
+        order:
+          type: string
+          description: Order ID
+        customer:
+          type: string
+          description: Customer user ID
+        paymentIntentId:
+          type: string
+          description: Stripe payment intent ID
+        amount:
+          type: number
+          description: Amount in cents
+        currency:
+          type: string
+          default: usd
+        clientSecret:
+          type: string
+        status:
+          type: string
+          enum: [pending, processing, succeeded, failed, canceled]
+        paymentMethod:
+          type: string
+          enum: [card, apple_pay, google_pay]
+        chargeId:
+          type: string
+        receiptUrl:
+          type: string
+        paymentMethodDetails:
+          type: object
+          properties:
+            type:
+              type: string
+            last4:
+              type: string
+            brand:
+              type: string
+        failureReason:
+          type: string
+        failureCode:
+          type: string
+        paidAt:
+          type: string
+          format: date-time
+        requestedAt:
+          type: string
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    GuestPayment:
+      type: object
+      properties:
+        _id:
+          type: string
+        conversationId:
+          type: string
+          description: Unique conversation ID (one guest payment per conversation)
+        customer:
+          type: string
+          description: Customer user ID
+        payment:
+          type: string
+          description: Payment record ID
+        order:
+          type: string
+          description: Order ID
+        amount:
+          type: number
+          description: Amount in cents
+        currency:
+          type: string
+          default: usd
+        status:
+          type: string
+          enum: [pending, processing, succeeded, failed]
+        paymentIntentId:
+          type: string
+          description: Stripe payment intent ID
+        paymentLinkId:
+          type: string
+          description: Stripe payment link ID
+        chargeId:
+          type: string
+        receiptUrl:
+          type: string
+        paymentMethodDetails:
+          type: object
+          properties:
+            type:
+              type: string
+            last4:
+              type: string
+            brand:
+              type: string
+        paidAt:
+          type: string
+          format: date-time
+        failureReason:
+          type: string
+        metadata:
+          type: object
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    Error:
+      type: object
+      properties:
+        success:
+          type: boolean
+          default: false
+        error:
+          type: string
+
+    KeyTag:
+      type: object
+      properties:
+        keyTagNumberold:
+          type: integer
+          minimum: 1
+          maximum: 200
+          description: Unique key tag number
+        orderId:
+          type: string
+          description: Associated order ID
+        vehicle:
+          type: object
+          properties:
+            make:
+              type: string
+              description: Vehicle make/brand
+            model:
+              type: string
+              description: Vehicle model
+            color:
+              type: string
+              description: Vehicle color
+            licensePlate:
+              type: string
+              description: Vehicle license plate
+            keyTagNumber:
+              type: string
+              description: Key tag number
+        parkingLocation:
+          type: string
+          description: Parking location address
+
+    KeyTransfer:
+      type: object
+      properties:
+        _id:
+          type: string
+          description: Transfer ID
+        senderValet:
+          type: object
+          properties:
+            _id:
+              type: string
+            name:
+              type: string
+            phone:
+              type: string
+        receiverValet:
+          type: object
+          properties:
+            _id:
+              type: string
+            name:
+              type: string
+            phone:
+              type: string
+        keys:
+          type: array
+          items:
+            $ref: '#/components/schemas/KeyTag'
+        status:
+          type: string
+          enum: [pending_acceptance, accepted, rejected, cancelled]
+          description: Transfer status
+        createdAt:
+          type: string
+          format: date-time
+        acceptedAt:
+          type: string
+          format: date-time
+        rejectedAt:
+          type: string
+          format: date-time
+        cancelledAt:
+          type: string
+          format: date-time
+        rejectionReason:
+          type: string
+        cancelledReason:
+          type: string
+        receiverConfirmedKeyTags:
+          type: array
+          items:
+            type: integer
+
+    KeyTransferAudit:
+      type: object
+      properties:
+        _id:
+          type: string
+        transferId:
+          type: string
+        senderValet:
+          type: object
+          properties:
+            _id:
+              type: string
+            firstName:
+              type: string
+            lastName:
+              type: string
+            phone:
+              type: string
+        receiverValet:
+          type: object
+          properties:
+            _id:
+              type: string
+            firstName:
+              type: string
+            lastName:
+              type: string
+            phone:
+              type: string
+        keyCount:
+          type: integer
+        keyTags:
+          type: array
+          items:
+            type: integer
+        action:
+          type: string
+          enum: [initiated, accepted, rejected, cancelled]
+        status:
+          type: string
+          enum: [pending_acceptance, accepted, rejected, cancelled]
+        reason:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+        ipAddress:
+          type: string
+        userAgent:
+          type: string
+
+    Valet:
+      type: object
+      properties:
+        _id:
+          type: string
+        firstName:
+          type: string
+        lastName:
+          type: string
+        phone:
+          type: string
+        profileImage:
+          type: string
+
+    FreeSpace:
+      type: object
+      properties:
+        _id:
+          type: string
+        userId:
+          type: string
+          description: User ID who marked the free space
+        segmentId:
+          type: string
+          description: Parking segment identifier
+        latitude:
+          type: number
+          description: Latitude coordinate
+        longitude:
+          type: number
+          description: Longitude coordinate
+        createdAt:
+          type: string
+          format: date-time
+
+paths:
+  /auth/loginUser:
+    post:
+      summary: Login or register a user with phone number
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                phone:
+                  type: string
+                  description: User phone number
+                firebaseUid:
+                  type: string
+                  description: Firebase UID from authentication
+                fcmToken:
+                  type: string
+                  description: Firebase Cloud Messaging token for push notifications
+                deviceId:
+                  type: string
+                  description: Device identifier
+              required: [phone, firebaseUid]
+      responses:
+        '200':
+          description: User logged in/registered successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  isNewUser:
+                    type: boolean
+                    description: Indicates if this is a new user or returning user
+                  message:
+                    type: string
+                    description: Status message
+                  user:
+                    $ref: '#/components/schemas/User'
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /auth/updateUser:
+    post:
+      summary: Update user profile
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                phone:
+                  type: string
+                  description: User phone number (required)
+                firstName:
+                  type: string
+                  description: User first name
+                lastName:
+                  type: string
+                  description: User last name
+                age:
+                  type: number
+                  description: User age
+                isValet:
+                  type: boolean
+                  description: Whether user is a valet
+                profileImage:
+                  type: string
+                  description: Profile image URL
+                isDoorman:
+                  type: boolean
+                  description: Whether user is a doorman
+                enterpriseCode:
+                  type: string
+                  description: Enterprise code for enterprise users
+                enterpriseName:
+                  type: string
+                  description: Enterprise name for enterprise users
+                userAgreementAccepted:
+                  type: boolean
+                  description: Whether user has accepted the user agreement
+              required: [phone]
+              example:
+                phone: "+1234567890"
+                firstName: "John"
+                lastName: "Doe"
+                age: 30
+                isValet: false
+                isDoorman: false
+                userAgreementAccepted: true
+      responses:
+        '200':
+          description: User updated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  user:
+                    $ref: '#/components/schemas/User'
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /auth/getUsers:
+    get:
+      summary: Get all users
+      tags: [Auth]
+      responses:
+        '200':
+          description: List of all users
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/User'
+
+  /auth/getUserById/{userId}:
+    get:
+      summary: Get user by ID
+      tags: [Auth]
+      parameters:
+        - in: path
+          name: userId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: User details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '404':
+          description: User not found
+
+  /auth/updateLocation:
+    post:
+      summary: Update user location
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                userId:
+                  type: string
+                latitude:
+                  type: number
+                longitude:
+                  type: number
+              required: [userId, latitude, longitude]
+      responses:
+        '200':
+          description: Location updated successfully
+
+  /auth/checkUserType:
+    post:
+      summary: Check if user is valet or customer
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                phone:
+                  type: string
+                  description: User phone number
+                firebaseUid:
+                  type: string
+                  description: Firebase UID
+              description: Either phone or firebaseUid is required
+      responses:
+        '200':
+          description: User type retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  userType:
+                    type: string
+                    enum: [valet, customer]
+                  userId:
+                    type: string
+                  phone:
+                    type: string
+                  firebaseUid:
+                    type: string
+                  isValet:
+                    type: boolean
+        '400':
+          description: Missing phone or firebaseUid
+        '404':
+          description: User not found
+        '500':
+          description: Server error
+
+  /auth/deleteAccount/{userId}:
+    delete:
+      summary: Delete user account
+      tags: [Auth]
+      parameters:
+        - in: path
+          name: userId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Account deleted successfully
+        '404':
+          description: User not found
+
+  /payment/createPaymentIntent:
+    post:
+      summary: Create a Stripe payment intent for an order
+      tags: [Payment]
+      description: Creates a payment intent and payment record. Payment method will be determined when frontend confirms payment.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                orderId:
+                  type: string
+                  description: Order ID to create payment for
+                amount:
+                  type: number
+                  description: Amount in cents
+                currency:
+                  type: string
+                  default: usd
+                  description: Currency code (default USD)
+              required: [orderId, amount]
+      responses:
+        '200':
+          description: Payment intent created successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  clientSecret:
+                    type: string
+                    description: Stripe client secret for frontend payment confirmation
+                  paymentIntentId:
+                    type: string
+                    description: Stripe payment intent ID
+                  paymentId:
+                    type: string
+                    description: Payment record ID in database
+        '400':
+          description: Missing required fields (orderId, amount)
+        '404':
+          description: Order not found
+        '503':
+          description: Stripe API key not configured
+
+  /payment/getPaymentStatus:
+    get:
+      summary: Get guest payment status by conversation ID
+      tags: [Payment]
+      description: Fetches guest payment status from database and verifies with Stripe if payment intent exists
+      parameters:
+        - name: conversationId
+          in: query
+          schema:
+            type: string
+          required: true
+          description: Conversation ID for guest checkout
+      responses:
+        '200':
+          description: Payment status retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  conversationId:
+                    type: string
+                  status:
+                    type: string
+                    enum: [pending, processing, succeeded, failed]
+                  amount:
+                    type: number
+                  currency:
+                    type: string
+                  paidAt:
+                    type: string
+                    format: date-time
+                  paymentIntentId:
+                    type: string
+                  paymentLinkId:
+                    type: string
+                  chargeId:
+                    type: string
+                  receiptUrl:
+                    type: string
+                  paymentMethodDetails:
+                    type: object
+        '400':
+          description: Missing conversationId parameter
+        '404':
+          description: Payment not found for this conversation
+
+  /payment/webhook:
+    post:
+      summary: Stripe webhook endpoint for payment events
+      tags: [Payment]
+      description: Receives Stripe webhook events (payment_intent.succeeded, payment_intent.payment_failed) and automatically updates GuestPayment status. Stripe will POST to this endpoint when payment status changes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Stripe webhook event payload
+      responses:
+        '200':
+          description: Webhook processed successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+        '400':
+          description: Webhook processing failed or secret not configured
+
+  /payment/webhook/test:
+    post:
+      summary: Test webhook endpoint (for manual testing)
+      tags: [Payment]
+      description: Test endpoint to manually send webhook events without Stripe signature verification. Use this to test webhook processing with custom JSON payloads.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                id:
+                  type: string
+                  example: evt_3T24kjDVABAZnsVJ1xRJAVY2
+                type:
+                  type: string
+                  example: payment_intent.succeeded
+                  enum: [payment_intent.succeeded, payment_intent.payment_failed]
+                data:
+                  type: object
+                  properties:
+                    object:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                          example: pi_3T24kjDVABAZnsVJ1qipgh0V
+                        amount:
+                          type: integer
+                          example: 2000
+                        currency:
+                          type: string
+                          example: usd
+                        status:
+                          type: string
+                          example: succeeded
+                        metadata:
+                          type: object
+                          properties:
+                            conversationId:
+                              type: string
+                            orderId:
+                              type: string
+                        charges:
+                          type: object
+      responses:
+        '200':
+          description: Webhook processed successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+        '400':
+          description: Webhook processing failed
+
+  /payment/createGuestPaymentLink:
+    post:
+      summary: Create a Stripe payment link for guest checkout
+      tags: [Payment]
+      description: Generates a shareable Stripe payment link for guest users (no account required). Automatically creates a GuestPayment record with the conversation ID. One guest payment per conversation ID.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                phone:
+                  type: string
+                  format: phone
+                  description: Guest phone number
+                conversationId:
+                  type: string
+                  description: Unique conversation ID (one guest payment per conversation)
+                amount:
+                  type: number
+                  description: Amount in cents
+                currency:
+                  type: string
+                  default: usd
+                  description: Currency code (default USD)
+              required: [phone, conversationId, amount]
+      responses:
+        '200':
+          description: Payment link created successfully and GuestPayment record created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  paymentUrl:
+                    type: string
+                    description: Shareable Stripe payment link URL
+                  paymentLinkId:
+                    type: string
+                    description: Stripe payment link ID
+                  guestPaymentId:
+                    type: string
+                    description: GuestPayment record ID in database
+                  phone:
+                    type: string
+                  conversationId:
+                    type: string
+                  amount:
+                    type: number
+        '400':
+          description: Missing required fields or guest payment already exists for this conversation
+        '503':
+          description: Stripe API key not configured
+
+  /payment/updatePaymentStatus:
+    post:
+      summary: Update payment status for an order
+      tags: [Payment]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                orderId:
+                  type: string
+                  description: Order ID
+                paymentIntentId:
+                  type: string
+                  description: Stripe payment intent ID
+                paymentStatus:
+                  type: string
+                  enum: [pending, paid, failed]
+                  description: Payment status
+                amount:
+                  type: number
+                  description: Amount in cents
+                currency:
+                  type: string
+                  default: usd
+                clientSecret:
+                  type: string
+                  description: Stripe client secret
+                chargeId:
+                  type: string
+                  description: Stripe charge ID
+                receiptUrl:
+                  type: string
+                  description: Stripe receipt URL
+                paymentMethodDetails:
+                  type: object
+                  properties:
+                    type:
+                      type: string
+                    last4:
+                      type: string
+                    brand:
+                      type: string
+                failureReason:
+                  type: string
+                  description: Reason for payment failure
+              required: [orderId, paymentIntentId, paymentStatus]
+      responses:
+        '200':
+          description: Payment status updated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  order:
+                    $ref: '#/components/schemas/Order'
+        '400':
+          description: Invalid request or payment verification failed
+        '404':
+          description: Order not found
+        '500':
+          description: Server error
+
+  /order/createOrder:
+    post:
+      summary: Create a new parking order (payment optional, can be added later)
+      tags: [Order]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                customer:
+                  type: string
+                  description: Customer user ID
+                customerLocation:
+                  type: object
+                  properties:
+                    lat:
+                      type: number
+                    lng:
+                      type: number
+                    streetAddress:
+                      type: string
+                parkingType:
+                  type: string
+                  enum: [street, garage, private, retrieval]
+                duration:
+                  type: number
+                  description: Duration in minutes
+                pickUpTime:
+                  type: string
+                  format: date-time
+                paymentMethod:
+                  type: string
+                  enum: [card, pm_card_visa, Apple Pay]
+                totalAmount:
+                  type: number
+                  description: Amount in cents (optional, can be calculated at order completion)
+                orderType:
+                  type: string
+                  enum: [parking, retrieval]
+                paymentIntentId:
+                  type: string
+                  description: Optional - Stripe payment intent ID if payment is ready
+                eventCode:
+                  type: string
+                  description: Optional - Event code for free services
+                isFreeService:
+                  type: boolean
+                serviceType:
+                  type: string
+                  enum: [standard, park-and-hold]
+                aspMode:
+                  type: boolean
+                  description: Optional - Enable ASP (Automatic Service Prompt) mode. If true, notification will be sent at asp_time (1.5 hours from order creation). Default is false.
+              required: [customer, customerLocation, parkingType, duration, pickUpTime, paymentMethod]
+      responses:
+        '201':
+          description: Order created successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  order:
+                    $ref: '#/components/schemas/Order'
+        '400':
+          description: Invalid request or validation failed
+        '500':
+          description: Server error
+
+  /order/createRetrievalOrder:
+    post:
+      summary: Create a retrieval order
+      tags: [Order]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                userId:
+                  type: string
+                parkedOrderId:
+                  type: string
+              required: [userId, parkedOrderId]
+      responses:
+        '200':
+          description: Retrieval order created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+
+  /order/getPendingOrders:
+    get:
+      summary: Get all pending orders
+      tags: [Order]
+      parameters:
+        - in: query
+          name: limit
+          schema:
+            type: number
+        - in: query
+          name: skip
+          schema:
+            type: number
+      responses:
+        '200':
+          description: List of pending orders
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Order'
+
+  /order/acceptOrder:
+    post:
+      summary: Accept an order as valet
+      tags: [Order]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                orderId:
+                  type: string
+                valetId:
+                  type: string
+              required: [orderId, valetId]
+      responses:
+        '200':
+          description: Order accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+
+  /order/hasActiveOrder:
+    get:
+      summary: Check if user has active order
+      tags: [Order]
+      parameters:
+        - in: query
+          name: userId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Active order status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  hasActiveOrder:
+                    type: boolean
+                  order:
+                    $ref: '#/components/schemas/Order'
+
+  /order/updateValetLocation:
+    post:
+      summary: Update valet location
+      tags: [Order]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                orderId:
+                  type: string
+                latitude:
+                  type: number
+                longitude:
+                  type: number
+              required: [orderId, latitude, longitude]
+      responses:
+        '200':
+          description: Location updated
+
+  /order/updateOrder:
+    post:
+      summary: Update order status (OTP required for completion unless already verified)
+      tags: [Order]
+      description: Update order status. If completing order, OTP is required unless it has been verified via verifyOTP endpoint.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                orderId:
+                  type: string
+                updates:
+                  type: object
+                  properties:
+                    status:
+                      type: string
+                      enum: [pending, accepted, in_progress, parked, parked-with-keys, completed, cancelled]
+                    notes:
+                      type: string
+                    review:
+                      type: object
+                      properties:
+                        rating:
+                          type: number
+                          minimum: 0
+                          maximum: 5
+                        comment:
+                          type: string
+                otp:
+                  type: string
+                  description: OTP code required when status is 'completed' and OTP hasn't been verified yet
+              required: [orderId, updates]
+      responses:
+        '200':
+          description: Order updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400':
+          description: OTP required or invalid for order completion
+
+  /order/verifyOTP:
+    post:
+      summary: Verify OTP for order completion
+      tags: [Order]
+      description: Verify OTP code for an order. Once verified, the order can be completed without providing OTP again.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                orderId:
+                  type: string
+                  description: ID of the order to verify OTP for
+                otp:
+                  type: string
+                  description: 6-digit OTP code
+              required: [orderId, otp]
+      responses:
+        '200':
+          description: OTP verified successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+        '400':
+          description: Invalid or expired OTP
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+        '404':
+          description: Order not found or no OTP exists
+
+  /order/return_key:
+    post:
+      summary: Generate OTP for returning keys
+      tags: [Order]
+      description: Generate a return key OTP for an order. This OTP is used when returning keys to the customer.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                orderId:
+                  type: string
+                  description: ID of the order to generate return key OTP for
+              required: [orderId]
+      responses:
+        '200':
+          description: Return key OTP generated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  order:
+                    type: object
+                    properties:
+                      _id:
+                        type: string
+                      otp:
+                        type: object
+                        properties:
+                          expiresAt:
+                            type: string
+                            format: date-time
+                          verified:
+                            type: boolean
+                          type:
+                            type: string
+                            enum: [return_key]
+        '404':
+          description: Order not found
+        '500':
+          description: Failed to generate return key OTP
+
+  /order/getOrdersByUser:
+    get:
+      summary: Get orders for a user
+      tags: [Order]
+      parameters:
+        - in: query
+          name: userId
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: limit
+          schema:
+            type: number
+        - in: query
+          name: skip
+          schema:
+            type: number
+      responses:
+        '200':
+          description: User's orders
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Order'
+
+  /order/checkKeyTagAvailability:
+    post:
+      summary: Check if a key tag number is available
+      tags: [Order]
+      description: Check if a key tag number is available for use in active orders
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                keyTagNumber:
+                  type: string
+                  description: The key tag number to check for availability
+              required: [keyTagNumber]
+      responses:
+        '200':
+          description: Key tag availability check result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  available:
+                    type: boolean
+                    description: Whether the key tag number is available
+                  message:
+                    type: string
+                  conflictingOrderId:
+                    type: string
+                    description: Order ID if the key tag is already in use
+        '400':
+          description: Missing or invalid keyTagNumber
+        '500':
+          description: Failed to check key tag availability
+
+  /order/addVehicleInfo:
+    post:
+      summary: Add vehicle info to order
+      tags: [Order]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                orderId:
+                  type: string
+                vehicleInfo:
+                  type: object
+                  properties:
+                    make:
+                      type: string
+                    model:
+                      type: string
+                    color:
+                      type: string
+                    licensePlate:
+                      type: string
+              required: [orderId, vehicleInfo]
+      responses:
+        '200':
+          description: Vehicle info added
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+
+  /order/getTodaysParkedCars/{valetId}:
+    get:
+      summary: Get today's parked cars for valet
+      tags: [Order]
+      parameters:
+        - in: path
+          name: valetId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: List of parked cars
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Order'
+
+  /order/updateCarLocation:
+    post:
+      summary: Update parked car location and generate OTP for completion
+      tags: [Order]
+      description: When valet updates parking location, an OTP is generated and sent to customer for order confirmation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                orderId:
+                  type: string
+                parkingLocation:
+                  type: object
+                  properties:
+                    lat:
+                      type: number
+                    lng:
+                      type: number
+                    streetAddress:
+                      type: string
+              required: [orderId, parkingLocation]
+      responses:
+        '200':
+          description: Car location updated and OTP generated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  order:
+                    type: object
+                    properties:
+                      _id:
+                        type: string
+                      otp:
+                        type: object
+                        properties:
+                          expiresAt:
+                            type: string
+                            format: date-time
+                          verified:
+                            type: boolean
+
+  /order/calculateConversationDistances:
+    post:
+      summary: Calculate distances for order matching
+      tags: [Order]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                pickupLocation:
+                  type: object
+                valetLocations:
+                  type: array
+                  items:
+                    type: object
+      responses:
+        '200':
+          description: Distances calculated
+
+  /notification/send:
+    post:
+      summary: Send notification to user
+      tags: [Notification]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                userId:
+                  type: string
+                title:
+                  type: string
+                body:
+                  type: string
+                data:
+                  type: object
+              required: [userId, title, body]
+      responses:
+        '200':
+          description: Notification sent successfully
+        '503':
+          description: Firebase not configured
+
+  /notification/notify-closest-valets:
+    post:
+      summary: Notify closest valets to pickup location
+      tags: [Notification]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                pickupLocation:
+                  type: object
+                orderId:
+                  type: string
+                radius:
+                  type: number
+                  description: Radius in kilometers
+              required: [pickupLocation, orderId]
+      responses:
+        '200':
+          description: Valets notified successfully
+        '503':
+          description: Firebase not configured
+
+  /notification/send-push:
+    post:
+      summary: Send push notification to a single user
+      tags: [Notification]
+      description: Send a push notification to a specific user using their Firebase UID. Retrieves FCM token from Firestore and sends notification via Firebase Cloud Messaging.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                firebaseUid:
+                  type: string
+                  description: Firebase UID of the recipient
+                title:
+                  type: string
+                  description: Notification title
+                body:
+                  type: string
+                  description: Notification body/message
+                data:
+                  type: object
+                  description: Optional custom data payload to include with notification
+                  example:
+                    type: key_transfer_request
+                    transferId: "507f1f77bcf86cd799439011"
+              required: [firebaseUid, title, body]
+      responses:
+        '200':
+          description: Push notification sent successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  response:
+                    type: object
+                    description: Firebase messaging response
+        '400':
+          description: Invalid request or user does not have valid FCM token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+        '500':
+          description: Server error while sending notification
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  error:
+                    type: string
+
+  /subscription/create:
+    post:
+      summary: Create a new subscription
+      tags: [Subscription]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                userId:
+                  type: string
+                planType:
+                  type: string
+                  enum: [monthly, annual]
+                paymentMethodId:
+                  type: string
+                referralCode:
+                  type: string
+              required: [userId, planType, paymentMethodId]
+      responses:
+        '200':
+          description: Subscription created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Subscription'
+
+  /subscription/generate-referral:
+    post:
+      summary: Generate referral code for doorman
+      tags: [Subscription]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                doormanId:
+                  type: string
+                doormanName:
+                  type: string
+              required: [doormanId, doormanName]
+      responses:
+        '200':
+          description: Referral code generated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  referralCode:
+                    type: string
+
+  /subscription/status/{userId}:
+    get:
+      summary: Get subscription status for user
+      tags: [Subscription]
+      parameters:
+        - in: path
+          name: userId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Subscription status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Subscription'
+
+  /subscription/process-billing:
+    post:
+      summary: Process subscription billing (admin only)
+      tags: [Subscription]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                adminKey:
+                  type: string
+              required: [adminKey]
+      responses:
+        '200':
+          description: Billing processed
+
+  /subscription/process-payouts:
+    post:
+      summary: Process doorman payouts (admin only)
+      tags: [Subscription]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                adminKey:
+                  type: string
+              required: [adminKey]
+      responses:
+        '200':
+          description: Payouts processed
+
+  /subscription/cancel/{subscriptionId}:
+    delete:
+      summary: Cancel subscription
+      tags: [Subscription]
+      parameters:
+        - in: path
+          name: subscriptionId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Subscription cancelled
+
+  /subscription/count:
+    get:
+      summary: Get active subscription count
+      tags: [Subscription]
+      responses:
+        '200':
+          description: Active subscription count
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  activeCount:
+                    type: number
+
+  /subscription/referred/{doormanId}:
+    get:
+      summary: Get subscriptions referred by doorman
+      tags: [Subscription]
+      parameters:
+        - in: path
+          name: doormanId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Referred subscriptions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Subscription'
+
+  /event/validate:
+    post:
+      summary: Validate an event code
+      tags: [Event]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                eventCode:
+                  type: string
+                userId:
+                  type: string
+              required: [eventCode, userId]
+      responses:
+        '200':
+          description: Event code validation result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  valid:
+                    type: boolean
+                  discount:
+                    type: number
+
+  /event/increment-usage:
+    post:
+      summary: Increment event code usage
+      tags: [Event]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                eventCode:
+                  type: string
+                orderId:
+                  type: string
+              required: [eventCode, orderId]
+      responses:
+        '200':
+          description: Usage incremented
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  usageCount:
+                    type: number
+
+  /event/{code}:
+    get:
+      summary: Get event details by code
+      tags: [Event]
+      parameters:
+        - in: path
+          name: code
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Event details
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  event:
+                    type: object
+                    properties:
+                      code:
+                        type: string
+                      discount:
+                        type: number
+                      maxUsage:
+                        type: number
+                      currentUsage:
+                        type: number
+                      expiryDate:
+                        type: string
+                        format: date-time
+
+  /key-transfer/my-keys:
+    get:
+      summary: Get all available keys for transfer
+      tags: [Key Transfer]
+      description: Retrieves list of keys currently assigned to the valet that are available for transfer
+      parameters:
+        - in: query
+          name: userId
+          required: true
+          schema:
+            type: string
+          description: Valet user ID
+      responses:
+        '200':
+          description: List of available keys
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/KeyTag'
+                  count:
+                    type: integer
+        '401':
+          description: User ID is required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Only valets can access key transfer features
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /key-transfer/outgoing:
+    get:
+      summary: Get outgoing transfer requests
+      tags: [Key Transfer]
+      description: Retrieves all outgoing key transfer requests initiated by the valet
+      parameters:
+        - in: query
+          name: userId
+          required: true
+          schema:
+            type: string
+          description: Valet user ID
+      responses:
+        '200':
+          description: List of outgoing transfers
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        _id:
+                          type: string
+                        receiverValet:
+                          type: object
+                          properties:
+                            _id:
+                              type: string
+                            name:
+                              type: string
+                            phone:
+                              type: string
+                        keys:
+                          type: array
+                          items:
+                            $ref: '#/components/schemas/KeyTag'
+                        status:
+                          type: string
+                        createdAt:
+                          type: string
+                          format: date-time
+                        canCancel:
+                          type: boolean
+                  count:
+                    type: integer
+
+  /key-transfer/incoming:
+    get:
+      summary: Get incoming transfer requests
+      tags: [Key Transfer]
+      description: Retrieves all incoming key transfer requests sent to the valet
+      parameters:
+        - in: query
+          name: userId
+          required: true
+          schema:
+            type: string
+          description: Valet user ID
+      responses:
+        '200':
+          description: List of incoming transfers
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        _id:
+                          type: string
+                        senderValet:
+                          type: object
+                          properties:
+                            _id:
+                              type: string
+                            name:
+                              type: string
+                            phone:
+                              type: string
+                        keys:
+                          type: array
+                          items:
+                            $ref: '#/components/schemas/KeyTag'
+                        status:
+                          type: string
+                        createdAt:
+                          type: string
+                          format: date-time
+                        canRespond:
+                          type: boolean
+                  count:
+                    type: integer
+
+  /key-transfer/active-valets:
+    get:
+      summary: Get list of active valets
+      tags: [Key Transfer]
+      description: Retrieves list of active valets available to receive key transfers
+      parameters:
+        - in: query
+          name: userId
+          required: true
+          schema:
+            type: string
+          description: Current valet user ID
+      responses:
+        '200':
+          description: List of active valets
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Valet'
+                  count:
+                    type: integer
+
+  /key-transfer/audit-logs:
+    get:
+      summary: Get key transfer audit logs
+      tags: [Key Transfer]
+      description: Retrieves immutable audit trail of all key transfer activities
+      parameters:
+        - in: query
+          name: userId
+          required: true
+          schema:
+            type: string
+          description: Current valet user ID
+        - in: query
+          name: transferId
+          schema:
+            type: string
+          description: Filter by transfer ID
+        - in: query
+          name: senderValetId
+          schema:
+            type: string
+          description: Filter by sender valet ID
+        - in: query
+          name: receiverValetId
+          schema:
+            type: string
+          description: Filter by receiver valet ID
+        - in: query
+          name: action
+          schema:
+            type: string
+            enum: [initiated, accepted, rejected, cancelled]
+          description: Filter by action type
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            default: 100
+          description: Number of records to return
+        - in: query
+          name: skip
+          schema:
+            type: integer
+            default: 0
+          description: Number of records to skip
+      responses:
+        '200':
+          description: Audit logs with pagination
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/KeyTransferAudit'
+                  pagination:
+                    type: object
+                    properties:
+                      total:
+                        type: integer
+                      limit:
+                        type: integer
+                      skip:
+                        type: integer
+                      hasMore:
+                        type: boolean
+
+  /key-transfer/initiate:
+    post:
+      summary: Initiate a key transfer request
+      tags: [Key Transfer]
+      description: Creates a new key transfer request to send keys to another valet
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                userId:
+                  type: string
+                  description: Sender valet ID
+                receiverValetId:
+                  type: string
+                  description: Receiver valet ID
+                keyOrderIds:
+                  type: array
+                  items:
+                    type: string
+                  description: Array of order IDs for keys to transfer
+              required: [userId, receiverValetId, keyOrderIds]
+      responses:
+        '201':
+          description: Transfer request created successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  data:
+                    $ref: '#/components/schemas/KeyTransfer'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /key-transfer/accept:
+    post:
+      summary: Accept a key transfer request
+      tags: [Key Transfer]
+      description: Accepts an incoming key transfer request and confirms receipt of all key tags
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                userId:
+                  type: string
+                  description: Receiver valet ID
+                transferId:
+                  type: string
+                  description: Transfer request ID
+                confirmedKeyTags:
+                  type: array
+                  items:
+                    type: integer
+                  description: Array of confirmed key tag numbers
+              required: [userId, transferId, confirmedKeyTags]
+      responses:
+        '200':
+          description: Transfer accepted successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  data:
+                    $ref: '#/components/schemas/KeyTransfer'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Unauthorized to accept this transfer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Transfer request not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /key-transfer/reject:
+    post:
+      summary: Reject a key transfer request
+      tags: [Key Transfer]
+      description: Rejects an incoming key transfer request with optional reason
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                userId:
+                  type: string
+                  description: Receiver valet ID
+                transferId:
+                  type: string
+                  description: Transfer request ID
+                rejectionReason:
+                  type: string
+                  description: Optional reason for rejection
+              required: [userId, transferId]
+      responses:
+        '200':
+          description: Transfer rejected successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  data:
+                    $ref: '#/components/schemas/KeyTransfer'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Unauthorized to reject this transfer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Transfer request not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /key-transfer/cancel:
+    post:
+      summary: Cancel a key transfer request
+      tags: [Key Transfer]
+      description: Cancels an outgoing key transfer request (only if status is pending_acceptance)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                userId:
+                  type: string
+                  description: Sender valet ID
+                transferId:
+                  type: string
+                  description: Transfer request ID
+                cancelReason:
+                  type: string
+                  description: Optional reason for cancellation
+              required: [userId, transferId]
+      responses:
+        '200':
+          description: Transfer cancelled successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  data:
+                    $ref: '#/components/schemas/KeyTransfer'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Unauthorized to cancel this transfer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Transfer request not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /location/mark-free-space:
+    post:
+      summary: Mark a parking space as free
+      tags: [Location]
+      description: User marks a particular parking location as free space
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                userId:
+                  type: string
+                  description: User ID marking the free space
+                segmentId:
+                  type: string
+                  description: Parking segment identifier
+                latitude:
+                  type: number
+                  description: Latitude coordinate of the free space
+                longitude:
+                  type: number
+                  description: Longitude coordinate of the free space
+              required: [userId, segmentId, latitude, longitude]
+      responses:
+        '201':
+          description: Free space marked successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  data:
+                    $ref: '#/components/schemas/FreeSpace'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /location/free-space/{freeSpaceId}:
+    delete:
+      summary: Delete a free space entry
+      tags: [Location]
+      description: Cancel/delete a previously marked free space entry
+      parameters:
+        - in: path
+          name: freeSpaceId
+          required: true
+          schema:
+            type: string
+          description: Free space entry ID
+      responses:
+        '200':
+          description: Free space entry deleted successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  data:
+                    $ref: '#/components/schemas/FreeSpace'
+        '404':
+          description: Free space entry not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /location/free-spaces:
+    get:
+      summary: List all free spaces from last 24 hours
+      tags: [Location]
+      description: Retrieve all free space entries marked in the last 24 hours
+      responses:
+        '200':
+          description: Free spaces retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  count:
+                    type: integer
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/FreeSpace'
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /location/free-spaces/user/{userId}:
+    get:
+      summary: List user's free space entries from last 24 hours
+      tags: [Location]
+      description: Retrieve free space entries marked by a specific user in the last 24 hours
+      parameters:
+        - in: path
+          name: userId
+          required: true
+          schema:
+            type: string
+          description: User ID
+      responses:
+        '200':
+          description: User free spaces retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  count:
+                    type: integer
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/FreeSpace'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /location/user-free-spaces:
+    get:
+      summary: Get user free spaces
+      tags: [Location]
+      description: Retrieve all free spaces marked by the current user
+      parameters:
+        - in: query
+          name: userId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: User free spaces retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/FreeSpace'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'

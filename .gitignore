@@ -1,0 +1,14 @@
+node_modules/
+
+# Secrets. These must never reach GitHub — the repo is pushed to deploy.
+.env
+.env.*
+!.env.example
+firebase-admin.json
+*-firebase-adminsdk-*.json
+*.pem
+*.p8
+
+# Logs
+*.log
+npm-debug.log*
