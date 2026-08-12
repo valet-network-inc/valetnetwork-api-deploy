@@ -812,9 +812,12 @@ exports.reactivateValet = async (req, res) => {
 // per-customer activity.
 exports.getCustomerList = async (req, res) => {
     try {
+        // User has no createdAt field — signup time is the timestamp embedded in
+        // the ObjectId, which is why this list showed blank dates and, because it
+        // was also sorting on that missing field, was not actually in date order.
         const customers = await User.find({ isValet: { $ne: true } })
             .select('_id firstName lastName phone isDoorman enterpriseBusinessName createdAt')
-            .sort({ createdAt: -1 })
+            .sort({ _id: -1 })
             .lean();
 
         // One pass over Orders to bucket counts by customer id.
@@ -834,7 +837,8 @@ exports.getCustomerList = async (req, res) => {
                 : `${c.firstName || ''} ${c.lastName || ''}`.trim() || '(no name)',
             phone: c.phone || '',
             type: c.isDoorman ? 'Enterprise' : 'Customer',
-            createdAt: c.createdAt,
+            createdAt: c.createdAt || c._id.getTimestamp(),
+            signedUpAt: c._id.getTimestamp(),
             totalRequests: countByCustomer[c._id.toString()] || 0,
         }));
 
