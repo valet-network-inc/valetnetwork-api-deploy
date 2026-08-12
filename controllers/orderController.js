@@ -224,7 +224,7 @@ exports.createOrder = async (req, res) => {
 
         // Enterprise (doorman) accounts are allowed to have multiple concurrent orders
         // because each order is for a different end-customer. Skip the active-order check for them.
-        const customerDoc = await User.findById(customer).select('isDoorman');
+        const customerDoc = await User.findById(customer).select('isDoorman phone');
         const isEnterpriseCustomer = !!customerDoc?.isDoorman;
 
         if (!isEnterpriseCustomer) {
@@ -259,6 +259,24 @@ exports.createOrder = async (req, res) => {
             });
 
             if (validatedEvent && validatedEvent.isValid()) {
+                // Some codes are issued to named people (e.g. an outage make-good)
+                // rather than to a venue. When allowedPhones is set, only those
+                // numbers may redeem it; an empty/absent list means unrestricted,
+                // which is how every pre-existing event code keeps working.
+                const allowed = validatedEvent.allowedPhones || [];
+                if (allowed.length > 0) {
+                    const last10 = (v) => String(v || '').replace(/\D/g, '').slice(-10);
+                    const callerPhone = last10(customerDoc?.phone);
+                    const permitted = allowed.some((p) => last10(p) === callerPhone && callerPhone.length === 10);
+                    if (!permitted) {
+                        console.log('Event code', validatedEvent.code, 'refused for phone', callerPhone || '(none)');
+                        return res.status(400).json({
+                            success: false,
+                            message: 'This code is not valid for your account.',
+                        });
+                    }
+                }
+
                 isEventValid = true;
                 finalIsFreeService = true;
                 finalServiceType = serviceType || validatedEvent.serviceType || 'standard';

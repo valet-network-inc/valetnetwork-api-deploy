@@ -37,6 +37,13 @@ const EventSchema = new mongoose.Schema({
         type: Boolean,
         default: true
     },
+    // Restricts redemption to specific customers by phone number. Empty means
+    // anyone may redeem, which is the behaviour every venue/event code relies on.
+    // Used for codes issued to named individuals, e.g. an outage make-good.
+    allowedPhones: {
+        type: [String],
+        default: []
+    },
     serviceType: {
         type: String,
         enum: ['standard', 'park-and-hold'],
