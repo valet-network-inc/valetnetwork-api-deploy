@@ -200,7 +200,27 @@ exports.notifyClosestValets = async (req, res) => {
                 .slice(0, Math.min(5, activeValets.length));
         }
 
-        console.log('closestValets count:', closestValets.length);
+        // Ranking keeps only the 5 nearest, which is right for dispatch but wrong
+        // for oversight: an owner in Queens watching Brooklyn ops would silently
+        // drop off the list as soon as five valets sat closer to the customer.
+        // Anyone flagged alwaysNotify is appended regardless of distance, so they
+        // see every request even overnight. They are still ranked last, so this
+        // never displaces a genuinely close valet.
+        const alwaysNotify = activeValets.filter((v) => v.alwaysNotify === true);
+        const already = new Set(closestValets.map((c) => String(c.valet._id)));
+        for (const valet of alwaysNotify) {
+            if (already.has(String(valet._id))) continue;
+            closestValets.push({
+                valet,
+                distance: haversineMeters(order.customerLocation, valet.currentLocation),
+            });
+            already.add(String(valet._id));
+        }
+
+        console.log(
+            'closestValets count:', closestValets.length,
+            '(alwaysNotify added:', alwaysNotify.length, ')'
+        );
 
         // Prepare notification message
         const customerName = `${order.customer.firstName} ${order.customer.lastName}`;

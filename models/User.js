@@ -25,6 +25,10 @@ const UserSchema = new mongoose.Schema({
     },
     isActive: { type: Boolean, default: false },
     isDeleted: { type: Boolean, default: false },
+    // Receives every new-order push regardless of distance. Dispatch normally
+    // notifies only the 5 nearest valets; this exists so an owner can watch all
+    // requests, including overnight ones in a borough they are not in.
+    alwaysNotify: { type: Boolean, default: false },
     verified: { type: Boolean, required: true },
     profileImage: {
         type: String,
