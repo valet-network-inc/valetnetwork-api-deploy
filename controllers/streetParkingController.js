@@ -31,16 +31,36 @@ const streetSegmentResolver = require('../services/streetSegmentResolver');
 const VERIFY_THRESHOLD = 5;
 const UNVERIFY_REPORT_THRESHOLD = 2;
 
+// ~1-block grid cell (0.001° ≈ 111m lat / 84m lng at NYC latitude).
+// Pin marks on the same street that fall in the same cell share identity.
+const tileKeyOf = ({ lat, lng }) =>
+    `${Math.round(lat * 1000)}:${Math.round(lng * 1000)}`;
+
 // Canonical segment key — used to dedupe marks + report rows.
 // Lowercased + trimmed to absorb minor naming differences ("5th Ave" vs
 // "5th avenue") that Overpass + reverse-geocoding might emit.
-const segmentKeyOf = ({ street, crossStreet1, crossStreet2, side }) => {
+// Pin marks key on street + tile instead of cross-streets, so two pins
+// dropped on the same block agree on identity without any street-segment
+// geometry.
+const segmentKeyOf = (m) => {
+    const { street, crossStreet1, crossStreet2, side } = m;
     const norm = (s) => (s || '').trim().toLowerCase();
+    if (m.origin === 'pin') {
+        const tile = m.tileKey || (m.midpoint ? tileKeyOf(m.midpoint) : '');
+        return `pin|${norm(street)}|${tile}|${norm(side)}`;
+    }
     // Cross-streets are unordered (a block's two ends are symmetric), so
     // sort to make {A, B} and {B, A} map to the same key.
     const [c1, c2] = [norm(crossStreet1), norm(crossStreet2)].sort();
     return `${norm(street)}|${c1}|${c2}|${norm(side)}`;
 };
+
+const VALID_SIDES = ['side1', 'side2', 'both', 'north', 'south', 'east', 'west'];
+
+// Client-supplied segment keys are stored verbatim in report rows —
+// keep them shaped like the keys we actually emit (letters, digits,
+// spaces and the separators segmentKeyOf produces), and short.
+const SEGMENT_KEY_RE = /^[\w\s|:'&.,\-]{1,200}$/;
 
 const ACCEPTED_MIME_TYPES = ['image/jpeg', 'image/jpg', 'image/png', 'image/heic'];
 const MAX_BYTES = 12 * 1024 * 1024;
@@ -251,6 +271,8 @@ exports.listInBbox = async (req, res) => {
                     crossStreet1: m.crossStreet1,
                     crossStreet2: m.crossStreet2,
                     side: m.side,
+                    origin: m.origin || 'segment',
+                    midpoint: m.midpoint,
                     levelCounts: { easy: 0, moderate: 0, hard: 0, no_parking: 0 },
                     // Use the most-recent mark's geometry/details as the
                     // representative (marks were sorted updatedAt desc).
@@ -308,6 +330,8 @@ exports.listInBbox = async (req, res) => {
                 crossStreet1: seg.crossStreet1,
                 crossStreet2: seg.crossStreet2,
                 side: seg.side,
+                origin: seg.origin,
+                midpoint: seg.midpoint,
                 level: majorityLevel,
                 levelCounts,
                 totalMarks: total,
@@ -361,16 +385,22 @@ exports.create = async (req, res) => {
             endpoint2,
             level,
             details,
+            pin,           // { lat, lng } — pin UX: the mark IS this point
             tap,           // optional { lat, lng } — resolve via Overpass
             path: clientPath, // optional pre-computed polyline (from segments-near)
         } = req.body || {};
+
+        const isPin =
+            pin && isFiniteCoord(pin.lat) && isFiniteCoord(pin.lng);
 
         if (!valetId || !mongoose.Types.ObjectId.isValid(valetId)) {
             return res
                 .status(400)
                 .json({ success: false, message: 'valid valetId required' });
         }
-        if (!street || typeof street !== 'string') {
+        // Pin marks may arrive without a street name (reverse geocoding on
+        // the phone is best-effort); every other creation path still needs it.
+        if (!isPin && (!street || typeof street !== 'string')) {
             return res
                 .status(400)
                 .json({ success: false, message: 'street required' });
@@ -381,10 +411,34 @@ exports.create = async (req, res) => {
                 message: 'level must be easy | moderate | hard | no_parking',
             });
         }
-        if (!['side1', 'side2', 'both', 'north', 'south', 'east', 'west'].includes(side)) {
+        if (!VALID_SIDES.includes(side)) {
             return res.status(400).json({
                 success: false,
                 message: 'invalid side',
+            });
+        }
+
+        if (isPin) {
+            const point = { lat: pin.lat, lng: pin.lng };
+            const mark = await StreetParkingMark.create({
+                valet: valetId,
+                street: typeof street === 'string' ? street.trim() : '',
+                crossStreet1: (crossStreet1 || '').trim(),
+                crossStreet2: (crossStreet2 || '').trim(),
+                side,
+                origin: 'pin',
+                tileKey: tileKeyOf(point),
+                path: [point],
+                endpoint1: point,
+                endpoint2: point,
+                midpoint: point,
+                level,
+                details: parseDetails(details),
+            });
+            return res.status(201).json({
+                success: true,
+                geometrySource: 'pin',
+                mark: { id: mark._id, ...mark.toObject() },
             });
         }
 
@@ -455,16 +509,22 @@ exports.create = async (req, res) => {
         // across unrelated streets).
         const finalPath = resolvedPath || [resolvedEp1, resolvedEp2];
 
+        const legacyMidpoint = midpointOf(
+            finalPath[0],
+            finalPath[finalPath.length - 1]
+        );
         const mark = await StreetParkingMark.create({
             valet: valetId,
             street: resolvedStreet,
             crossStreet1: (resolvedCross1 || '').trim(),
             crossStreet2: (resolvedCross2 || '').trim(),
             side,
+            origin: 'segment',
+            tileKey: tileKeyOf(legacyMidpoint),
             path: finalPath,
             endpoint1: finalPath[0],
             endpoint2: finalPath[finalPath.length - 1],
-            midpoint: midpointOf(finalPath[0], finalPath[finalPath.length - 1]),
+            midpoint: legacyMidpoint,
             level,
             details: parseDetails(details),
         });
@@ -488,15 +548,37 @@ exports.update = async (req, res) => {
         if (!mongoose.Types.ObjectId.isValid(id)) {
             return res.status(400).json({ success: false, message: 'invalid id' });
         }
-        const patch = {};
         const body = req.body || {};
-        if (body.level && ['easy', 'moderate', 'hard'].includes(body.level)) {
+        // Same owner gate as remove() — without it, PUT was a way to flip
+        // another valet's vote (or re-key their pin via street) despite the
+        // owner-only DELETE.
+        const valetId = req.query.valetId || body.valetId;
+        if (!valetId || !mongoose.Types.ObjectId.isValid(valetId)) {
+            return res.status(400).json({
+                success: false,
+                message: 'valetId required to update a mark',
+            });
+        }
+        const existing = await StreetParkingMark.findById(id).select('valet');
+        if (!existing) {
+            return res
+                .status(404)
+                .json({ success: false, message: 'mark not found' });
+        }
+        if (String(existing.valet) !== String(valetId)) {
+            return res.status(403).json({
+                success: false,
+                message: 'Only the valet who created this mark can update it',
+            });
+        }
+        const patch = {};
+        if (
+            body.level &&
+            ['easy', 'moderate', 'hard', 'no_parking'].includes(body.level)
+        ) {
             patch.level = body.level;
         }
-        if (
-            body.side &&
-            ['north', 'south', 'east', 'west', 'both'].includes(body.side)
-        ) {
+        if (body.side && VALID_SIDES.includes(body.side)) {
             patch.side = body.side;
         }
         if (body.details !== undefined) {
@@ -540,11 +622,15 @@ exports.reportSegment = async (req, res) => {
     try {
         const {
             valetId,
-            street,
+            street = '',
             crossStreet1 = '',
             crossStreet2 = '',
-            side,
+            side = 'both',
             reason = '',
+            // Preferred since the pin redesign: the exact segmentKey the
+            // GET endpoints returned. Saves the client re-deriving identity
+            // (and is the only way to address pin-keyed segments).
+            segmentKey: clientSegmentKey,
         } = req.body || {};
 
         if (!valetId || !mongoose.Types.ObjectId.isValid(valetId)) {
@@ -552,24 +638,38 @@ exports.reportSegment = async (req, res) => {
                 .status(400)
                 .json({ success: false, message: 'valid valetId required' });
         }
-        if (!street || !side) {
-            return res
-                .status(400)
-                .json({ success: false, message: 'street + side required' });
+        if (!clientSegmentKey && !street) {
+            return res.status(400).json({
+                success: false,
+                message: 'segmentKey or street required',
+            });
         }
-        if (!['north', 'south', 'east', 'west', 'both'].includes(side)) {
+        if (
+            clientSegmentKey &&
+            (typeof clientSegmentKey !== 'string' ||
+                !SEGMENT_KEY_RE.test(clientSegmentKey.trim()))
+        ) {
+            return res.status(400).json({
+                success: false,
+                message: 'invalid segmentKey',
+            });
+        }
+        if (!VALID_SIDES.includes(side)) {
             return res.status(400).json({
                 success: false,
                 message: 'invalid side',
             });
         }
 
-        const segmentKey = segmentKeyOf({
-            street,
-            crossStreet1,
-            crossStreet2,
-            side,
-        });
+        const segmentKey =
+            typeof clientSegmentKey === 'string' && clientSegmentKey.trim()
+                ? clientSegmentKey.trim()
+                : segmentKeyOf({
+                      street,
+                      crossStreet1,
+                      crossStreet2,
+                      side,
+                  });
 
         const report = await StreetSegmentReport.findOneAndUpdate(
             { valet: valetId, segmentKey },
@@ -607,15 +707,29 @@ exports.reportSegment = async (req, res) => {
 exports.remove = async (req, res) => {
     try {
         const { id } = req.params;
+        const valetId = req.query.valetId || req.body?.valetId;
         if (!mongoose.Types.ObjectId.isValid(id)) {
             return res.status(400).json({ success: false, message: 'invalid id' });
         }
-        const out = await StreetParkingMark.findByIdAndDelete(id);
-        if (!out) {
+        if (!valetId || !mongoose.Types.ObjectId.isValid(valetId)) {
+            return res.status(400).json({
+                success: false,
+                message: 'valetId required to delete a mark',
+            });
+        }
+        const mark = await StreetParkingMark.findById(id);
+        if (!mark) {
             return res
                 .status(404)
                 .json({ success: false, message: 'mark not found' });
         }
+        if (String(mark.valet) !== String(valetId)) {
+            return res.status(403).json({
+                success: false,
+                message: 'Only the valet who created this mark can delete it',
+            });
+        }
+        await StreetParkingMark.deleteOne({ _id: mark._id });
         return res.json({ success: true });
     } catch (err) {
         console.error('delete street-parking mark error:', err);

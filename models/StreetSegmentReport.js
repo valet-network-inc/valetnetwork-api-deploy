@@ -28,7 +28,9 @@ const StreetSegmentReportSchema = new mongoose.Schema(
             required: true,
             index: true,
         },
-        street: { type: String, required: true },
+        // Optional since the pin redesign — pin reports address the
+        // segment purely by segmentKey and may have no street name.
+        street: { type: String, default: '' },
         crossStreet1: { type: String, default: '' },
         crossStreet2: { type: String, default: '' },
         side: { type: String, required: true },

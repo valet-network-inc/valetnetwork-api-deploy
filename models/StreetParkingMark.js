@@ -43,9 +43,27 @@ const StreetParkingMarkSchema = new mongoose.Schema(
         // Segment identity — street name + two cross-streets bounding it.
         // Cross-streets may be empty strings if the geocoder couldn't
         // resolve them; the endpoint coords are still authoritative.
-        street: { type: String, required: true },
+        // Street became optional with the pin redesign: a pin is a pure
+        // location, the name is best-effort reverse-geocoded on the phone.
+        street: { type: String, default: '' },
         crossStreet1: { type: String, default: '' },
         crossStreet2: { type: String, default: '' },
+
+        // How the mark was created:
+        //   'segment' — legacy tap-a-line UX (Overpass polyline geometry)
+        //   'pin'     — pin UX: one dropped point, grouped by tileKey
+        origin: {
+            type: String,
+            enum: ['segment', 'pin'],
+            default: 'segment',
+            index: true,
+        },
+
+        // ~1-block grid cell of the midpoint (lat/lng each rounded to
+        // 0.001°). Pin marks on the same street + tile share identity, so
+        // the existing consensus math keeps working without street-segment
+        // geometry.
+        tileKey: { type: String, default: '', index: true },
 
         // Which side of the street the mark applies to.
         // 'side1' / 'side2' are the current valet-facing labels — they
