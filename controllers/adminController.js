@@ -911,7 +911,7 @@ exports.getServiceList = async (req, res) => {
         const orders = await Order.find({})
             .select(
                 '_id customer valet customerLocation parkingType orderType aspMode ' +
-                'status paymentStatus totalAmount isFreeService notifiedValets createdAt'
+                'status paymentStatus totalAmount isFreeService notifiedValets createdAt checkout'
             )
             .sort({ _id: -1 })
             .lean();
@@ -959,6 +959,16 @@ exports.getServiceList = async (req, res) => {
                 paymentStatus: o.paymentStatus || 'unknown',
                 valetName: nameOf(valet),
                 valetsPaged: Array.isArray(o.notifiedValets) ? o.notifiedValets.length : 0,
+                // How far this customer got. 'abandoned' means a card form was
+                // ready and no card was ever submitted; 'declined' means one was
+                // submitted and refused.
+                reached: o.paymentStatus === 'paid' || (o.checkout && o.checkout.paidAt)
+                    ? 'paid'
+                    : o.checkout && o.checkout.failedAt
+                        ? 'declined'
+                        : o.checkout && o.checkout.intentCreatedAt
+                            ? 'abandoned'
+                            : 'no card form',
                 address: (o.customerLocation && o.customerLocation.streetAddress) || '',
             };
         });
@@ -971,5 +981,75 @@ exports.getServiceList = async (req, res) => {
             message: 'Failed to fetch service list',
             error: err.message,
         });
+    }
+};
+
+// ==================== CHECKOUT FUNNEL ====================
+
+/**
+ * Where paying customers stop.
+ *
+ * Built from three server-side stamps (Order.checkout) so it needs no app
+ * release. Free/event-code orders are excluded — they never see a card form,
+ * so counting them would flatter the numbers.
+ *
+ * The distinction that matters is the last two buckets:
+ *   declined  — a card was submitted and the charge was refused (Stripe told us)
+ *   abandoned — a card form was ready and no card was ever submitted
+ *
+ * Before the webhook was repointed on 2026-08-12 those failure events were
+ * being delivered to the previous vendor's host, so "declined" is only reliable
+ * from that date forward. Older rows fall back to what the order itself says.
+ */
+exports.getCheckoutFunnel = async (req, res) => {
+    try {
+        const orders = await Order.find({ totalAmount: { $gt: 0 }, isFreeService: { $ne: true } })
+            .select('_id totalAmount paymentStatus checkout customer')
+            .sort({ _id: -1 })
+            .lean();
+
+        const buckets = { created: 0, reachedCheckout: 0, paid: 0, declined: 0, abandoned: 0 };
+        const declineReasons = {};
+        let lostCents = 0;
+
+        orders.forEach((o) => {
+            const c = o.checkout || {};
+            buckets.created += 1;
+            if (c.intentCreatedAt) buckets.reachedCheckout += 1;
+
+            if (o.paymentStatus === 'paid' || c.paidAt) {
+                buckets.paid += 1;
+                return;
+            }
+            if (c.failedAt) {
+                buckets.declined += 1;
+                const key = c.failureCode || 'unknown';
+                declineReasons[key] = (declineReasons[key] || 0) + 1;
+            } else {
+                buckets.abandoned += 1;
+            }
+            lostCents += o.totalAmount || 0;
+        });
+
+        const pct = (n) => (buckets.created ? Number(((n / buckets.created) * 100).toFixed(1)) : 0);
+
+        res.status(200).json({
+            success: true,
+            data: {
+                ...buckets,
+                paidRate: pct(buckets.paid),
+                abandonRate: pct(buckets.abandoned),
+                declineRate: pct(buckets.declined),
+                lostRevenue: (lostCents / 100).toFixed(2),
+                declineReasons,
+                // Stamps only exist for orders created after 2026-08-13. Older rows
+                // are classified from paymentStatus alone, so reachedCheckout
+                // undercounts history — say so rather than let it read as a drop.
+                note: 'checkout timestamps begin 2026-08-13; earlier orders are inferred from paymentStatus',
+            },
+        });
+    } catch (err) {
+        console.error('Error building checkout funnel:', err);
+        res.status(500).json({ success: false, message: 'Failed to build checkout funnel', error: err.message });
     }
 };

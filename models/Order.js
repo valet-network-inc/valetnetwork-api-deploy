@@ -110,6 +110,26 @@ const OrderSchema = new mongoose.Schema({
         default: 'pending',
     },
     paymentIntentId: { type: String },
+    // Checkout funnel, stamped entirely server-side — no client release needed.
+    //
+    // Between Aug 4 and Aug 13 2026 every paid order died somewhere after the
+    // order was created and before a card was charged, and there was no way to
+    // tell "customer walked away" from "the charge failed". These three
+    // timestamps split that black box using calls the backend already receives:
+    // the order POST, the create-intent POST, and the Stripe webhook.
+    //
+    // What it still cannot see is whether the card form rendered or was ever
+    // touched — that lives in the browser and would need a client change.
+    checkout: {
+        intentCreatedAt: { type: Date },
+        paidAt: { type: Date },
+        failedAt: { type: Date },
+        // Stripe's decline code and message, e.g. 'card_declined' /
+        // 'insufficient_funds'. Absent failure rows mean no card was submitted
+        // at all — Stripe records nothing when the customer never tries.
+        failureCode: { type: String },
+        failureMessage: { type: String },
+    },
     paymentDetails: {
         amount: { type: Number }, // Amount in cents
         currency: { type: String, default: 'usd' },

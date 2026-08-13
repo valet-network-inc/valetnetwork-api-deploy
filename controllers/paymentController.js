@@ -181,6 +181,18 @@ exports.createPaymentIntent = async (req, res) => {
 
         console.log('Created payment intent:', paymentIntent.id);
 
+        // Funnel step 2 of 3. Reaching here means the customer's checkout screen
+        // mounted and a card form was ready; the gap between this and paidAt is
+        // where customers are being lost. Best-effort — a stamping failure must
+        // never cost the customer their payment intent.
+        try {
+            await Order.findByIdAndUpdate(orderId, {
+                $set: { 'checkout.intentCreatedAt': new Date() },
+            });
+        } catch (stampErr) {
+            console.error('Failed to stamp checkout.intentCreatedAt:', stampErr.message);
+        }
+
         // Create Payment record
         const payment = new Payment({
             order: orderId,
@@ -766,6 +778,8 @@ exports.handleStripeWebhook = async (req, res) => {
                     orderId,
                     {
                         paymentStatus: 'paid',
+                        // Funnel step 3 of 3 — the customer actually paid.
+                        'checkout.paidAt': new Date(),
                         paymentIntentId: paymentIntent.id,
                         paymentDetails: {
                             amount: paymentIntent.amount,
@@ -882,6 +896,25 @@ exports.handleStripeWebhook = async (req, res) => {
             console.log('Payment failed - conversationId:', conversationId, 'orderId:', orderId);
 
             const failureReason = paymentIntent.last_payment_error?.message || 'Payment failed';
+
+            // Funnel: a card WAS submitted and the charge was refused. This is the
+            // signal that distinguishes "declined" from "walked away" — Stripe
+            // records nothing at all when no card is ever entered, so an order
+            // with intentCreatedAt and neither paidAt nor failedAt means the
+            // customer left without trying. Best-effort; never block the webhook.
+            if (orderId) {
+                try {
+                    await Order.findByIdAndUpdate(orderId, {
+                        $set: {
+                            'checkout.failedAt': new Date(),
+                            'checkout.failureCode': paymentIntent.last_payment_error?.code || 'unknown',
+                            'checkout.failureMessage': failureReason,
+                        },
+                    });
+                } catch (stampErr) {
+                    console.error('Failed to stamp checkout.failedAt:', stampErr.message);
+                }
+            }
 
             // Send Slack notification
             await sendSlackNotification(

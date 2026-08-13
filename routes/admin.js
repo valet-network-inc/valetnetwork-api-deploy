@@ -9,6 +9,7 @@ const {
     getValetListWithMetrics,
     getCustomerList,
     getServiceList,
+    getCheckoutFunnel,
 } = require('../controllers/adminController');
 const {
     listAllPayouts,
@@ -69,6 +70,8 @@ router.delete('/provider-recipients/:id', providerRecipient.remove);
 router.get('/users', getCustomerList);
 // Every service request ever created, for the "Services" tab.
 router.get('/services', getServiceList);
+// Where paying customers stop — built from server-side stamps only.
+router.get('/checkout-funnel', getCheckoutFunnel);
 
 // Payouts (manual settlement queue)
 router.get('/payouts', listAllPayouts);
