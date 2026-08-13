@@ -43,9 +43,14 @@ describe('resolveSignupPlatform — explicit platform wins', () => {
     });
 
     it('falls through on junk rather than storing it', () => {
-        expect(resolveSignupPlatform(req({ platform: 'nintendo-ds' }))).toBe('unknown');
-        expect(resolveSignupPlatform(req({ platform: '' }))).toBe('unknown');
-        expect(resolveSignupPlatform(req({ platform: 42 }))).toBe('unknown');
+        // Junk is ignored, and with nothing else to go on the request is web.
+        expect(resolveSignupPlatform(req({ platform: 'nintendo-ds' }))).toBe('web');
+        expect(resolveSignupPlatform(req({ platform: '' }))).toBe('web');
+        expect(resolveSignupPlatform(req({ platform: 42 }))).toBe('web');
+    });
+
+    it('junk does not override a real signal', () => {
+        expect(resolveSignupPlatform(req({ platform: 'nintendo-ds', fcmToken: 'abc' }))).toBe('ios');
     });
 });
 
@@ -73,11 +78,13 @@ describe('resolveSignupPlatform — inferring from the request', () => {
         expect(resolveSignupPlatform(req({}, UA.androidChrome))).toBe('web');
     });
 
-    it('says unknown when there is nothing to go on', () => {
-        expect(resolveSignupPlatform(req({}))).toBe('unknown');
-        expect(resolveSignupPlatform(req({}, 'curl/8.4.0'))).toBe('unknown');
-        expect(resolveSignupPlatform({})).toBe('unknown');
-        expect(resolveSignupPlatform(undefined)).toBe('unknown');
+    // The app and a browser are the only two ways to create an account, so
+    // anything without the app's fingerprints is treated as the browser.
+    it('falls back to web when there is nothing to go on', () => {
+        expect(resolveSignupPlatform(req({}))).toBe('web');
+        expect(resolveSignupPlatform(req({}, 'curl/8.4.0'))).toBe('web');
+        expect(resolveSignupPlatform({})).toBe('web');
+        expect(resolveSignupPlatform(undefined)).toBe('web');
     });
 });
 
@@ -95,13 +102,13 @@ describe('inferLegacyPlatform', () => {
         expect(inferLegacyPlatform({ firebaseUid: 'uid-2' }, OLD, new Set())).toBe('ios');
     });
 
-    it('refuses to guess a recent account with no push token', () => {
-        expect(inferLegacyPlatform({ firebaseUid: 'uid-3' }, RECENT, new Set())).toBe('unknown');
+    it('calls a recent account with no push token web', () => {
+        expect(inferLegacyPlatform({ firebaseUid: 'uid-3' }, RECENT, new Set())).toBe('web');
     });
 
     it('survives missing pieces', () => {
-        expect(inferLegacyPlatform({}, RECENT, new Set())).toBe('unknown');
-        expect(inferLegacyPlatform({ firebaseUid: 'uid-4' }, null, new Set())).toBe('unknown');
+        expect(inferLegacyPlatform({}, RECENT, new Set())).toBe('web');
+        expect(inferLegacyPlatform({ firebaseUid: 'uid-4' }, null, new Set())).toBe('web');
         expect(inferLegacyPlatform({ firebaseUid: 'uid-4' }, OLD, undefined)).toBe('ios');
     });
 });
