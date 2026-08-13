@@ -234,16 +234,42 @@ exports.notifyClosestValets = async (req, res) => {
                 : `${customerName} needs parking at ${
                       order.customerLocation.streetAddress
                   }. Duration: ${order.duration / 60} hours`;
+        // Device tokens live in two places and they DO drift apart: the Mongo
+        // FCMToken collection is what the app refreshes and what every other
+        // notification path reads, while this one alone read a copy in Firestore.
+        // A stale Firestore copy meant a valet kept receiving chat and account
+        // pushes while silently getting no job offers — a partial failure that
+        // looks like "nobody is taking orders" rather than a broken token.
+        // Mongo first, Firestore only as a fallback for anyone not yet migrated.
         const valetTokens = [];
         for (const item of closestValets) {
-            const userDoc = await admin
-                .firestore()
-                .collection('users')
-                .doc(item.valet.firebaseUid)
-                .get();
+            const uid = item.valet.firebaseUid;
+            if (!uid) continue;
 
-            if (userDoc.exists && userDoc.data().fcmToken) {
-                valetTokens.push(userDoc.data().fcmToken);
+            const mongoTokens = await FCMToken.find({
+                firebaseUid: uid,
+                isActive: true,
+            }).select('token');
+
+            if (mongoTokens.length > 0) {
+                mongoTokens.forEach((t) => t.token && valetTokens.push(t.token));
+                continue;
+            }
+
+            try {
+                const userDoc = await admin
+                    .firestore()
+                    .collection('users')
+                    .doc(uid)
+                    .get();
+                if (userDoc.exists && userDoc.data().fcmToken) {
+                    console.warn(
+                        `notifyClosestValets: valet ${uid} has no active Mongo token; using the Firestore copy`
+                    );
+                    valetTokens.push(userDoc.data().fcmToken);
+                }
+            } catch (err) {
+                console.error(`Firestore token lookup failed for ${uid}:`, err.message);
             }
         }
 

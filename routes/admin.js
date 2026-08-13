@@ -16,6 +16,7 @@ const {
 const valetOnboardingAdmin = require('../controllers/valetOnboardingAdminController');
 const providerRecipient = require('../controllers/providerRecipientController');
 const orderPhotoController = require('../controllers/orderPhotoController');
+const adminNotification = require('../controllers/adminNotificationController');
 const parkingNoteController = require('../controllers/parkingNoteController');
 
 // Business metrics
@@ -66,5 +67,34 @@ router.delete('/parking-photo/:id', orderPhotoController.adminDeletePhoto);
 // "Street parking rules" tab: ParkingNote sign photos.
 router.get('/parking-rule-photos', parkingNoteController.adminListParkingRulePhotos);
 router.delete('/parking-rule-photo/:id', parkingNoteController.adminDeleteParkingRulePhoto);
+
+// Push notifications (dashboard "Notifications" tab).
+// The controller and the dashboard UI both existed, but nothing ever mounted
+// these routes, so every call from the tab 404'd and the feature looked broken.
+// Paths match what adminService.js already requests.
+//
+// These are the only admin routes behind requireAdminKey (an `x-admin-key`
+// header). Everything above is unauthenticated — see the separate note about
+// that; broadcasting to every customer is not something to leave open.
+router.get(
+    '/notifications/audience-counts',
+    adminNotification.requireAdminKey,
+    adminNotification.getAudienceCounts
+);
+router.get(
+    '/notifications/history',
+    adminNotification.requireAdminKey,
+    adminNotification.getNotificationHistory
+);
+router.post(
+    '/notifications/send',
+    adminNotification.requireAdminKey,
+    adminNotification.sendAdminNotification
+);
+router.post(
+    '/notifications/run-parking-alerts',
+    adminNotification.requireAdminKey,
+    adminNotification.runParkingAlertsNow
+);
 
 module.exports = router;
