@@ -11,6 +11,21 @@ const UserSchema = new mongoose.Schema({
         sparse: true,
         unique: true,
     },
+    // Which client the account was created from. Written ONCE, when the User
+    // document is born in authController.loginUser — never on later logins, so
+    // it stays "where they signed up" and not "where they were last seen".
+    //
+    //   'ios' | 'android'  — the mobile app (sends platform + fcmToken)
+    //   'web'              — the customer web app at valetnetwork.co/park
+    //   'business_web'     — the front-desk portal at valetnetwork.co/business
+    //
+    // Accounts created before this field existed have nothing here; the admin
+    // customer list infers those (see inferLegacyPlatform in adminController).
+    // Left un-enum'd on purpose: a new client sending an unrecognised value
+    // should be normalised to 'unknown' by the controller, not 500 on save.
+    signupPlatform: {
+        type: String,
+    },
     firstName: {
         type: String,
     },

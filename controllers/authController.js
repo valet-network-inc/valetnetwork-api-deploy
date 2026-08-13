@@ -1,5 +1,6 @@
 const User = require('../models/User');
 const FCMToken = require('../models/FCMToken');
+const { resolveSignupPlatform } = require('../services/signupPlatform');
 
 // Function to generate a random 6-character code (numbers and capital letters)
 const generateReferralCode = () => {
@@ -36,6 +37,7 @@ exports.loginUser = async (req, res) => {
 
     console.log('login request body', req.body);
     const { phone, firebaseUid, fcmToken, deviceId } = req.body;
+    const signupPlatform = resolveSignupPlatform(req);
 
     try {
         let user = await User.findOne({ phone });
@@ -54,6 +56,7 @@ exports.loginUser = async (req, res) => {
                 firebaseUid,
                 verified: false,
                 isActive: true,
+                signupPlatform,
             });
             await user.save();
 

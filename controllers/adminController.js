@@ -1,6 +1,8 @@
 const Order = require('../models/Order');
 const User = require('../models/User');
 const Payment = require('../models/Payment');
+const FCMToken = require('../models/FCMToken');
+const { inferLegacyPlatform } = require('../services/signupPlatform');
 
 // Helper function to format time in hours, minutes and seconds
 const formatTime = (minutes) => {
@@ -807,16 +809,16 @@ exports.reactivateValet = async (req, res) => {
 // ==================== CUSTOMER LIST ====================
 
 // GET /api/admin/users — list all non-valet users for the dashboard's
-// Customers tab. Returns name, phone, signup date, and a totalRequests
-// count (orders the customer has placed) so the dashboard can show
-// per-customer activity.
+// Customers tab. Returns name, phone, signup date + time, the platform they
+// signed up on, and a totalRequests count (orders the customer has placed)
+// so the dashboard can show per-customer activity.
 exports.getCustomerList = async (req, res) => {
     try {
         // User has no createdAt field — signup time is the timestamp embedded in
         // the ObjectId, which is why this list showed blank dates and, because it
         // was also sorting on that missing field, was not actually in date order.
         const customers = await User.find({ isValet: { $ne: true } })
-            .select('_id firstName lastName phone isDoorman enterpriseBusinessName createdAt')
+            .select('_id firstName lastName phone isDoorman enterpriseBusinessName createdAt firebaseUid signupPlatform')
             .sort({ _id: -1 })
             .lean();
 
@@ -830,17 +832,32 @@ exports.getCustomerList = async (req, res) => {
             if (row._id) countByCustomer[row._id.toString()] = row.count;
         });
 
-        const data = customers.map((c) => ({
-            _id: c._id,
-            name: c.isDoorman
-                ? c.enterpriseBusinessName || '(Enterprise)'
-                : `${c.firstName || ''} ${c.lastName || ''}`.trim() || '(no name)',
-            phone: c.phone || '',
-            type: c.isDoorman ? 'Enterprise' : 'Customer',
-            createdAt: c.createdAt || c._id.getTimestamp(),
-            signedUpAt: c._id.getTimestamp(),
-            totalRequests: countByCustomer[c._id.toString()] || 0,
-        }));
+        // Which firebase uids ever registered a push token — the mobile-app
+        // fingerprint used to date accounts that predate `signupPlatform`.
+        const uidsWithPushTokens = new Set(
+            await FCMToken.distinct('firebaseUid')
+        );
+
+        const data = customers.map((c) => {
+            const signedUpAt = c._id.getTimestamp();
+            const recorded = c.signupPlatform;
+            return {
+                _id: c._id,
+                name: c.isDoorman
+                    ? c.enterpriseBusinessName || '(Enterprise)'
+                    : `${c.firstName || ''} ${c.lastName || ''}`.trim() || '(no name)',
+                phone: c.phone || '',
+                type: c.isDoorman ? 'Enterprise' : 'Customer',
+                createdAt: c.createdAt || signedUpAt,
+                signedUpAt,
+                platform: recorded || inferLegacyPlatform(c, signedUpAt, uidsWithPushTokens),
+                // 'recorded' — the client told us at signup.
+                // 'inferred' — worked out afterwards from push tokens / signup date,
+                //              so the dashboard can mark it as a best guess.
+                platformSource: recorded ? 'recorded' : 'inferred',
+                totalRequests: countByCustomer[c._id.toString()] || 0,
+            };
+        });
 
         res.status(200).json({ success: true, data });
     } catch (err) {
@@ -869,6 +886,90 @@ exports.getValetList = async (req, res) => {
             success: false,
             message: 'Failed to fetch valet list',
             error: err.message
+        });
+    }
+};
+
+// ==================== SERVICE REQUEST LOG ====================
+
+/**
+ * Every service request ever created, newest first, for the dashboard's
+ * "Services" tab.
+ *
+ * Two joins the UI can't do for itself: the customer's name and phone, and the
+ * assigned valet's name. Both are resolved here in two queries rather than one
+ * lookup per row.
+ *
+ * `valetsPaged` is the length of notifiedValets and is the important column.
+ * A valet is only paged once payment succeeds — the backend never dispatches on
+ * its own, the client does it after the card clears — so an abandoned checkout
+ * leaves a real-looking request that nobody was ever told about. Surfacing the
+ * count is what makes that visible instead of mysterious.
+ */
+exports.getServiceList = async (req, res) => {
+    try {
+        const orders = await Order.find({})
+            .select(
+                '_id customer valet customerLocation parkingType orderType aspMode ' +
+                'status paymentStatus totalAmount isFreeService notifiedValets createdAt'
+            )
+            .sort({ _id: -1 })
+            .lean();
+
+        const userIds = [
+            ...new Set(
+                orders
+                    .flatMap((o) => [o.customer, o.valet])
+                    .filter(Boolean)
+                    .map(String)
+            ),
+        ];
+        const users = await User.find({ _id: { $in: userIds } })
+            .select('_id firstName lastName phone isDoorman enterpriseBusinessName')
+            .lean();
+        const byId = new Map(users.map((u) => [String(u._id), u]));
+
+        const nameOf = (u) => {
+            if (!u) return '';
+            if (u.isDoorman) return u.enterpriseBusinessName || '(Enterprise)';
+            return `${u.firstName || ''} ${u.lastName || ''}`.trim();
+        };
+
+        const serviceOf = (o) => {
+            if (o.orderType === 'retrieval') return 'Retrieval';
+            if (o.aspMode) return 'Street-cleaning (ASP)';
+            if (o.parkingType === 'garage') return 'Garage';
+            return 'Street parking';
+        };
+
+        const data = orders.map((o) => {
+            const cust = byId.get(String(o.customer));
+            const valet = o.valet ? byId.get(String(o.valet)) : null;
+            return {
+                _id: o._id,
+                // Order has no reliable createdAt on older rows; the ObjectId
+                // timestamp is always correct and always present.
+                createdAt: o.createdAt || o._id.getTimestamp(),
+                customerName: nameOf(cust) || '(no name)',
+                customerPhone: cust ? cust.phone || '' : '(deleted user)',
+                service: serviceOf(o),
+                amount: (o.totalAmount || 0) / 100,
+                isFreeService: !!o.isFreeService,
+                status: o.status || 'unknown',
+                paymentStatus: o.paymentStatus || 'unknown',
+                valetName: nameOf(valet),
+                valetsPaged: Array.isArray(o.notifiedValets) ? o.notifiedValets.length : 0,
+                address: (o.customerLocation && o.customerLocation.streetAddress) || '',
+            };
+        });
+
+        res.status(200).json({ success: true, data });
+    } catch (err) {
+        console.error('Error fetching service list:', err);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to fetch service list',
+            error: err.message,
         });
     }
 };

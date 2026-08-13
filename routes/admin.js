@@ -7,7 +7,8 @@ const {
     deactivateValet,
     reactivateValet,
     getValetListWithMetrics,
-    getCustomerList
+    getCustomerList,
+    getServiceList,
 } = require('../controllers/adminController');
 const {
     listAllPayouts,
@@ -55,6 +56,8 @@ router.delete('/provider-recipients/:id', providerRecipient.remove);
 
 // Customer list (non-valet users)
 router.get('/users', getCustomerList);
+// Every service request ever created, for the "Services" tab.
+router.get('/services', getServiceList);
 
 // Payouts (manual settlement queue)
 router.get('/payouts', listAllPayouts);
