@@ -6,8 +6,10 @@
  * token and have no auth, so they are not something to build a broadcast button
  * on top of.
  *
- * Everything here is behind requireAdminKey. Every send is written to
- * NotificationLog whether it succeeds or not, so a blast is auditable.
+ * The x-admin-key gate now lives in middleware/requireAdminKey.js and is
+ * mounted on the whole /api/admin router, so these routes no longer name it
+ * individually. Every send is written to NotificationLog whether it succeeds or
+ * not, so a blast is auditable.
  */
 
 const User = require('../models/User');
@@ -21,26 +23,6 @@ const CONCURRENCY = 10;
 
 const MAX_TITLE = 120;
 const MAX_BODY = 500;
-
-/**
- * Header check. ADMIN_API_KEY lives in the server env and is typed into the
- * dashboard by the operator; it is deliberately never bundled into the
- * front-end build.
- */
-exports.requireAdminKey = (req, res, next) => {
-    const expected = process.env.ADMIN_API_KEY;
-    if (!expected) {
-        return res.status(503).json({
-            success: false,
-            message: 'ADMIN_API_KEY is not configured on the server',
-        });
-    }
-    const provided = req.get('x-admin-key');
-    if (!provided || provided !== expected) {
-        return res.status(401).json({ success: false, message: 'Unauthorized' });
-    }
-    return next();
-};
 
 /**
  * Resolve an audience to the firebaseUids that actually have a device attached.

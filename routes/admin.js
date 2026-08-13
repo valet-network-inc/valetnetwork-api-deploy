@@ -19,6 +19,17 @@ const providerRecipient = require('../controllers/providerRecipientController');
 const orderPhotoController = require('../controllers/orderPhotoController');
 const adminNotification = require('../controllers/adminNotificationController');
 const parkingNoteController = require('../controllers/parkingNoteController');
+const requireAdminKey = require('../middleware/requireAdminKey');
+
+// Everything below this line needs the `x-admin-key` header. Only the four
+// notification routes used to be gated, which left the customer list, the
+// metrics, the valet roster, the payout queue and the parking photos readable
+// by anyone who knew the URL. The dashboard sends the key on every call.
+router.use(requireAdminKey);
+
+// Cheap "is this key good?" probe for the dashboard's unlock screen. Does no
+// work beyond passing the gate above, so it can be called on every page load.
+router.get('/session', (req, res) => res.json({ success: true }));
 
 // Business metrics
 router.get('/metrics/business', getBusinessMetrics);
@@ -75,29 +86,9 @@ router.delete('/parking-rule-photo/:id', parkingNoteController.adminDeleteParkin
 // The controller and the dashboard UI both existed, but nothing ever mounted
 // these routes, so every call from the tab 404'd and the feature looked broken.
 // Paths match what adminService.js already requests.
-//
-// These are the only admin routes behind requireAdminKey (an `x-admin-key`
-// header). Everything above is unauthenticated — see the separate note about
-// that; broadcasting to every customer is not something to leave open.
-router.get(
-    '/notifications/audience-counts',
-    adminNotification.requireAdminKey,
-    adminNotification.getAudienceCounts
-);
-router.get(
-    '/notifications/history',
-    adminNotification.requireAdminKey,
-    adminNotification.getNotificationHistory
-);
-router.post(
-    '/notifications/send',
-    adminNotification.requireAdminKey,
-    adminNotification.sendAdminNotification
-);
-router.post(
-    '/notifications/run-parking-alerts',
-    adminNotification.requireAdminKey,
-    adminNotification.runParkingAlertsNow
-);
+router.get('/notifications/audience-counts', adminNotification.getAudienceCounts);
+router.get('/notifications/history', adminNotification.getNotificationHistory);
+router.post('/notifications/send', adminNotification.sendAdminNotification);
+router.post('/notifications/run-parking-alerts', adminNotification.runParkingAlertsNow);
 
 module.exports = router;
