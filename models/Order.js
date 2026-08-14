@@ -217,6 +217,28 @@ const OrderSchema = new mongoose.Schema({
     awayReminderLastKey: {
         type: String,
     },
+    // Which away service was bought: scheduled street-cleaning moves (billed
+    // per move, reconciled when the schedule is set/corrected) or a flat
+    // hold (billed per day at booking).
+    awayService: {
+        type: String,
+        enum: ['moves', 'hold'],
+    },
+    // What has actually been charged for this away order so far. The
+    // schedule reconciler charges/refunds the difference against this when
+    // the valet sets or corrects the sweep days.
+    awayPaidCents: {
+        type: Number,
+    },
+    awayBilling: {
+        status: {
+            type: String,
+            enum: ['pending_schedule', 'settled', 'charge_failed', 'refund_failed'],
+        },
+        lastDeltaCents: { type: Number },
+        at: { type: Date },
+        error: { type: String },
+    },
     // Auto-ASP scheduler idempotency key: `asp:<subscriptionId>:<NY date>:<HHMM>`.
     // The unique sparse index makes duplicate auto-bookings a DB-level
     // impossibility — a second creation attempt for the same occurrence

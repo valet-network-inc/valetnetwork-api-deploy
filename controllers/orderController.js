@@ -218,6 +218,7 @@ exports.createOrder = async (req, res) => {
         awayMode, // multi-day hold: keys collected once, returned at awayEndTime
         awayDays, // street-cleaning slots to move the car for while away
         awayEndTime, // when the customer is back — becomes asp_time (the auto-return moment)
+        awayService, // 'moves' (per-move, reconciled on schedule set) | 'hold' (per-day, paid up front)
     } = req.body;
 
     try {
@@ -390,7 +391,18 @@ exports.createOrder = async (req, res) => {
             totalAmount,
         });
 
-        if (coverage.covered || finalIsFreeService) {
+        // Away "moves" bookings with no schedule yet are billed AFTER the
+        // valet reads the signs and sets the days — nothing is due now, and
+        // the order must still be 'paid' so valets can see and accept it.
+        // Server-enforced: whatever amount the client sent is discarded.
+        const awayBillLater =
+            awayMode && awayService === 'moves' && (!awayDays || awayDays.length === 0);
+
+        if (awayBillLater) {
+            finalAmount = 0;
+            paymentStatus = 'paid';
+            console.log('Away order with no schedule — billed when the valet sets it');
+        } else if (coverage.covered || finalIsFreeService) {
             finalAmount = 0;
             paymentStatus = 'paid';
             console.log('Setting as paid due to subscription coverage or free service');
@@ -450,11 +462,18 @@ exports.createOrder = async (req, res) => {
             ...(awayMode
                 ? {
                       awayMode: true,
+                      awayService: awayService === 'hold' ? 'hold' : 'moves',
                       awayDays: (awayDays || []).map(({ weekday, hour, minute }) => ({
                           weekday,
                           hour,
                           minute,
                       })),
+                      // What's charged at booking; the schedule reconciler
+                      // trues this up when days are set or corrected.
+                      awayPaidCents: finalAmount,
+                      ...(awayBillLater
+                          ? { awayBilling: { status: 'pending_schedule', at: new Date() } }
+                          : {}),
                   }
                 : {}),
             // Subscription coverage stamp: which plan paid, and what the
@@ -2503,12 +2522,32 @@ const runAspSweep = async (io, now = new Date()) => {
 
 exports.runAspSweep = runAspSweep;
 
+// How many scheduled sweep slots land inside an away window (NY time).
+// The single pricing truth for away "moves" orders: booking, valet
+// correction, and the reconciler below all count moves this way.
+const countAwayMoves = (start, end, days) => {
+    const { nextNyOccurrence } = require('../services/nyTime');
+    let count = 0;
+    for (const day of days || []) {
+        let cursor = new Date(start.getTime() + 1000);
+        for (;;) {
+            const occ = nextNyOccurrence(day, cursor);
+            if (!occ || occ.getTime() >= end.getTime()) break;
+            count++;
+            cursor = new Date(occ.getTime() + 60 * 1000);
+        }
+    }
+    return count;
+};
+exports.countAwayMoves = countAwayMoves;
+
 // Away mode: set or correct the street-cleaning schedule on a live away
-// order. Built for the valet who reads the signs at the car — customers who
-// aren't sure of their sweep days book with an empty schedule, and whoever
-// holds the keys fills it in here. Reminders pick the new days up on the
-// next sweep tick; the reminder dedup key resets so the first new slot
-// still pings.
+// order, then TRUE UP THE BILL. Built for the valet who reads the signs at
+// the car — customers who aren't sure of their sweep days book unbilled,
+// and whoever holds the keys fills the schedule in here. What the valet
+// saves is what the customer pays: the difference against anything already
+// charged is collected from the saved card (or refunded to the original
+// payment). Reminders pick the new days up on the next sweep tick.
 exports.setAwaySchedule = async (req, res) => {
     const { orderId, awayDays } = req.body;
     try {
@@ -2539,13 +2578,135 @@ exports.setAwaySchedule = async (req, res) => {
         if (!order.awayMode) {
             return res.status(400).json({ success: false, message: 'Not an away order' });
         }
+        if (order.awayService === 'hold') {
+            return res.status(400).json({
+                success: false,
+                message: "This away order is a flat hold — it doesn't include street-cleaning moves.",
+            });
+        }
         if (['completed', 'cancelled'].includes(order.status)) {
             return res.status(400).json({ success: false, message: 'Order is closed' });
         }
 
         order.awayDays = awayDays.map(({ weekday, hour, minute }) => ({ weekday, hour, minute }));
         order.awayReminderLastKey = undefined;
+
+        // ---- billing true-up (skipped for free/test and covered orders) ----
+        let billing = null;
+        const billable =
+            !order.isFreeService &&
+            !order.coveredBySubscription &&
+            order.paymentStatus === 'paid';
+        if (billable) {
+            const PricingConfig = require('../models/PricingConfig');
+            let aspCents = 1500;
+            try {
+                aspCents = (await PricingConfig.getSingleton()).aspCents || 1500;
+            } catch (cfgErr) {
+                console.error('setAwaySchedule pricing config error:', cfgErr.message);
+            }
+            const priceCents =
+                countAwayMoves(new Date(order.pickUpTime), new Date(order.asp_time), order.awayDays) *
+                aspCents;
+            const paidCents = Number.isFinite(order.awayPaidCents)
+                ? order.awayPaidCents
+                : order.totalAmount || 0;
+            const delta = priceCents - paidCents;
+
+            if (delta === 0) {
+                order.awayBilling = { status: 'settled', lastDeltaCents: 0, at: new Date() };
+            } else if (delta > 0) {
+                // Charge the difference to the customer's saved card.
+                try {
+                    if (!stripe) throw new Error('Stripe not configured');
+                    const customer = await User.findById(order.customer).select('stripeCustomerId');
+                    if (!customer?.stripeCustomerId) throw new Error('No saved payment method on file');
+                    const pms = await stripe.paymentMethods.list({
+                        customer: customer.stripeCustomerId,
+                        type: 'card',
+                        limit: 1,
+                    });
+                    if (!pms.data.length) throw new Error('No saved card on file');
+                    const pi = await stripe.paymentIntents.create({
+                        amount: delta,
+                        currency: 'usd',
+                        customer: customer.stripeCustomerId,
+                        payment_method: pms.data[0].id,
+                        off_session: true,
+                        confirm: true,
+                        description: `Away-mode street-cleaning moves (order ${order._id})`,
+                        metadata: {
+                            type: 'away_moves',
+                            orderId: order._id.toString(),
+                            customerId: String(order.customer),
+                        },
+                    });
+                    order.paymentIntentId = order.paymentIntentId || pi.id;
+                    order.awayPaidCents = priceCents;
+                    order.totalAmount = priceCents;
+                    order.awayBilling = { status: 'settled', lastDeltaCents: delta, at: new Date() };
+                } catch (chargeErr) {
+                    console.error('Away schedule charge failed:', chargeErr.message);
+                    order.awayBilling = {
+                        status: 'charge_failed',
+                        lastDeltaCents: delta,
+                        at: new Date(),
+                        error: chargeErr.message,
+                    };
+                }
+            } else {
+                // Schedule came out cheaper than what was charged — refund
+                // the difference against the original payment.
+                try {
+                    if (order.paymentIntentId && stripe) {
+                        await stripe.refunds.create({
+                            payment_intent: order.paymentIntentId,
+                            amount: -delta,
+                        });
+                    }
+                    order.awayPaidCents = priceCents;
+                    order.totalAmount = priceCents;
+                    order.awayBilling = { status: 'settled', lastDeltaCents: delta, at: new Date() };
+                } catch (refundErr) {
+                    console.error('Away schedule refund failed:', refundErr.message);
+                    order.awayBilling = {
+                        status: 'refund_failed',
+                        lastDeltaCents: delta,
+                        at: new Date(),
+                        error: refundErr.message,
+                    };
+                }
+            }
+            billing = order.awayBilling;
+        }
+
         await order.save();
+
+        // Tell the customer their schedule (and bill) is set — best-effort.
+        try {
+            const customer = await User.findById(order.customer).select('firebaseUid');
+            if (customer?.firebaseUid) {
+                const { sendPushNotification } = require('./notificationController');
+                const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+                const daysLabel = order.awayDays
+                    .map((d) => `${dayNames[d.weekday]} ${d.hour}:${String(d.minute).padStart(2, '0')}`)
+                    .join(', ');
+                const billLine =
+                    billing?.status === 'settled' && billing.lastDeltaCents > 0
+                        ? ` You've been charged $${(billing.lastDeltaCents / 100).toFixed(2)}.`
+                        : billing?.status === 'settled' && billing.lastDeltaCents < 0
+                        ? ` $${(-billing.lastDeltaCents / 100).toFixed(2)} is on its way back to your card.`
+                        : '';
+                await sendPushNotification(
+                    customer.firebaseUid,
+                    'Sweep schedule set',
+                    `Your valet set the street-cleaning schedule: ${daysLabel}.${billLine}`,
+                    { orderId: String(order._id), type: 'AWAY_SCHEDULE_SET' }
+                );
+            }
+        } catch (pushErr) {
+            console.error('Away schedule push failed:', pushErr.message);
+        }
 
         if (req.io) {
             req.io.to(String(order.customer)).emit('orderUpdated', {
@@ -2554,7 +2715,7 @@ exports.setAwaySchedule = async (req, res) => {
             });
         }
 
-        res.status(200).json({ success: true, order });
+        res.status(200).json({ success: true, order, billing });
     } catch (err) {
         console.error('setAwaySchedule error:', err);
         res.status(500).json({

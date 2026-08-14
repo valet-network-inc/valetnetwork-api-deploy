@@ -845,6 +845,129 @@ describe('away mode + advance scheduling', () => {
         expect(blocked.statusCode).toBe(400);
     });
 
+    it('an away moves booking with no schedule is created unbilled ($0/paid, pending_schedule)', async () => {
+        const user = await makeCustomer();
+        const res = await createOrderVia(
+            user,
+            awayBody({ awayDays: [], awayService: 'moves', totalAmount: 4500 })
+        );
+        expect(res.statusCode).toBe(200);
+        const o = res.body.order;
+        expect(o.totalAmount).toBe(0); // client-sent amount discarded
+        expect(o.paymentStatus).toBe('paid'); // valets must see it
+        expect(o.awayBilling.status).toBe('pending_schedule');
+        expect(o.awayPaidCents).toBe(0);
+    });
+
+    it('countAwayMoves counts occurrences strictly inside the window', () => {
+        const { nyWallTimeToInstant } = require('../services/nyTime');
+        const start = nyWallTimeToInstant(2026, 8, 15, 9, 0); // Sat Aug 15
+        const end = nyWallTimeToInstant(2026, 8, 24, 9, 0); // Mon Aug 24
+        expect(orderController.countAwayMoves(start, end, [{ weekday: 2, hour: 9, minute: 0 }])).toBe(1); // Tue Aug 18
+        expect(
+            orderController.countAwayMoves(start, end, [
+                { weekday: 2, hour: 9, minute: 0 },
+                { weekday: 5, hour: 9, minute: 0 },
+            ])
+        ).toBe(2); // + Fri Aug 21
+        expect(orderController.countAwayMoves(start, end, [])).toBe(0);
+    });
+
+    it('reconciler: schedule cheaper than what was charged refunds down (no-PI path adjusts totals)', async () => {
+        const user = await makeCustomer();
+        const order = await Order.create({
+            customer: user._id,
+            customerLocation: HOME,
+            paymentMethod: 'card',
+            duration: 7 * 24 * 60,
+            pickUpTime: new Date(Date.now() + DAY_MS),
+            totalAmount: 3000,
+            awayPaidCents: 3000,
+            status: 'accepted',
+            paymentStatus: 'paid',
+            orderType: 'parking',
+            serviceType: 'park-and-hold',
+            aspMode: true,
+            awayMode: true,
+            awayService: 'moves',
+            awayDays: [],
+            asp_time: new Date(Date.now() + 8 * DAY_MS),
+        });
+
+        const res = mockRes();
+        await orderController.setAwaySchedule(
+            { body: { orderId: order._id.toString(), awayDays: [{ weekday: 2, hour: 9, minute: 0 }] }, io: mockIo() },
+            res
+        );
+        expect(res.statusCode).toBe(200);
+        const fresh = await Order.findById(order._id);
+        // one Tuesday in the window → $15; $30 was charged → settled down
+        expect(fresh.totalAmount).toBe(1500);
+        expect(fresh.awayPaidCents).toBe(1500);
+        expect(fresh.awayBilling.status).toBe('settled');
+        expect(fresh.awayBilling.lastDeltaCents).toBe(-1500);
+    });
+
+    it('reconciler: schedule dearer than what was charged records charge_failed when no card rail exists', async () => {
+        const user = await makeCustomer();
+        const order = await Order.create({
+            customer: user._id,
+            customerLocation: HOME,
+            paymentMethod: 'card',
+            duration: 7 * 24 * 60,
+            pickUpTime: new Date(Date.now() + DAY_MS),
+            totalAmount: 0,
+            awayPaidCents: 0,
+            status: 'accepted',
+            paymentStatus: 'paid',
+            orderType: 'parking',
+            serviceType: 'park-and-hold',
+            aspMode: true,
+            awayMode: true,
+            awayService: 'moves',
+            awayDays: [],
+            awayBilling: { status: 'pending_schedule', at: new Date() },
+            asp_time: new Date(Date.now() + 8 * DAY_MS),
+        });
+
+        const res = mockRes();
+        await orderController.setAwaySchedule(
+            { body: { orderId: order._id.toString(), awayDays: [{ weekday: 2, hour: 9, minute: 0 }] }, io: mockIo() },
+            res
+        );
+        expect(res.statusCode).toBe(200);
+        const fresh = await Order.findById(order._id);
+        expect(fresh.awayDays).toHaveLength(1); // schedule saved regardless
+        expect(fresh.awayBilling.status).toBe('charge_failed'); // stripe absent in tests
+        expect(fresh.totalAmount).toBe(0); // nothing charged
+    });
+
+    it('setAwaySchedule rejects flat-hold away orders', async () => {
+        const user = await makeCustomer();
+        const order = await Order.create({
+            customer: user._id,
+            customerLocation: HOME,
+            paymentMethod: 'card',
+            duration: 7 * 24 * 60,
+            pickUpTime: new Date(Date.now() + DAY_MS),
+            totalAmount: 7000,
+            status: 'pending',
+            paymentStatus: 'paid',
+            orderType: 'parking',
+            serviceType: 'park-and-hold',
+            aspMode: true,
+            awayMode: true,
+            awayService: 'hold',
+            asp_time: new Date(Date.now() + 8 * DAY_MS),
+        });
+        const res = mockRes();
+        await orderController.setAwaySchedule(
+            { body: { orderId: order._id.toString(), awayDays: [{ weekday: 2, hour: 9, minute: 0 }] }, io: mockIo() },
+            res
+        );
+        expect(res.statusCode).toBe(400);
+    });
+
     it('setAwaySchedule lets the valet fill in the days later and resets the reminder dedup', async () => {
         const user = await makeCustomer();
         const order = await Order.create({
