@@ -845,6 +845,49 @@ describe('away mode + advance scheduling', () => {
         expect(blocked.statusCode).toBe(400);
     });
 
+    it('setAwaySchedule lets the valet fill in the days later and resets the reminder dedup', async () => {
+        const user = await makeCustomer();
+        const order = await Order.create({
+            customer: user._id,
+            customerLocation: HOME,
+            paymentMethod: 'card',
+            duration: 7 * 24 * 60,
+            pickUpTime: new Date(Date.now() + DAY_MS),
+            totalAmount: 3000,
+            status: 'pending',
+            paymentStatus: 'paid',
+            orderType: 'parking',
+            serviceType: 'park-and-hold',
+            aspMode: true,
+            awayMode: true,
+            awayDays: [],
+            awayReminderLastKey: 'stale',
+            asp_time: new Date(Date.now() + 8 * DAY_MS),
+        });
+
+        const res = mockRes();
+        await orderController.setAwaySchedule(
+            { body: { orderId: order._id.toString(), awayDays: [{ weekday: 2, hour: 9, minute: 0 }] }, io: mockIo() },
+            res
+        );
+        expect(res.statusCode).toBe(200);
+        const fresh = await Order.findById(order._id);
+        expect(fresh.awayDays).toHaveLength(1);
+        expect(fresh.awayReminderLastKey).toBeFalsy();
+
+        // Guards: non-away and bad days are rejected.
+        const plain = await Order.create({
+            customer: user._id, customerLocation: HOME, paymentMethod: 'card',
+            duration: 60, pickUpTime: new Date(), totalAmount: 1000,
+            status: 'pending', paymentStatus: 'paid',
+        });
+        const bad = mockRes();
+        await orderController.setAwaySchedule(
+            { body: { orderId: plain._id.toString(), awayDays: [] }, io: mockIo() }, bad
+        );
+        expect(bad.statusCode).toBe(400);
+    });
+
     it('sweep sends one deduped move reminder per occurrence for parked away orders, and no return leg before the end', async () => {
         const user = await makeCustomer();
         const valet = await makeCustomer({ isValet: true, isActive: true });

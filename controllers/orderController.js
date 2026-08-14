@@ -2503,6 +2503,68 @@ const runAspSweep = async (io, now = new Date()) => {
 
 exports.runAspSweep = runAspSweep;
 
+// Away mode: set or correct the street-cleaning schedule on a live away
+// order. Built for the valet who reads the signs at the car — customers who
+// aren't sure of their sweep days book with an empty schedule, and whoever
+// holds the keys fills it in here. Reminders pick the new days up on the
+// next sweep tick; the reminder dedup key resets so the first new slot
+// still pings.
+exports.setAwaySchedule = async (req, res) => {
+    const { orderId, awayDays } = req.body;
+    try {
+        if (!orderId || !Array.isArray(awayDays)) {
+            return res.status(400).json({
+                success: false,
+                message: 'orderId and awayDays are required',
+            });
+        }
+        for (const d of awayDays) {
+            if (
+                !d ||
+                !Number.isInteger(d.weekday) || d.weekday < 0 || d.weekday > 6 ||
+                !Number.isInteger(d.hour) || d.hour < 0 || d.hour > 23 ||
+                !Number.isInteger(d.minute) || d.minute < 0 || d.minute > 59
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'each away day needs weekday 0-6, hour 0-23, minute 0-59',
+                });
+            }
+        }
+
+        const order = await Order.findById(orderId);
+        if (!order) {
+            return res.status(404).json({ success: false, message: 'Order not found' });
+        }
+        if (!order.awayMode) {
+            return res.status(400).json({ success: false, message: 'Not an away order' });
+        }
+        if (['completed', 'cancelled'].includes(order.status)) {
+            return res.status(400).json({ success: false, message: 'Order is closed' });
+        }
+
+        order.awayDays = awayDays.map(({ weekday, hour, minute }) => ({ weekday, hour, minute }));
+        order.awayReminderLastKey = undefined;
+        await order.save();
+
+        if (req.io) {
+            req.io.to(String(order.customer)).emit('orderUpdated', {
+                type: 'ORDER_UPDATE',
+                order,
+            });
+        }
+
+        res.status(200).json({ success: true, order });
+    } catch (err) {
+        console.error('setAwaySchedule error:', err);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to set away schedule',
+            error: err.message,
+        });
+    }
+};
+
 // Manual HTTP trigger (admin/debug); the interval in server.js is the real caller.
 exports.checkAspOrders = async (req, res) => {
     try {

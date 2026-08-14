@@ -16,6 +16,7 @@ const {
     calculateConversationDistances,
     verifyOTP,
     checkAspOrders,
+    setAwaySchedule,
     generateReturnKeyOtp,
     checkKeyTagAvailability,
     cancelOrder,
@@ -51,6 +52,7 @@ router.post('/updateCarLocation', updateCarLocation);
 router.post('/verifyOTP', verifyOTP);
 router.post('/calculateConversationDistances', calculateConversationDistances);
 router.post('/checkAspOrders', checkAspOrders);
+router.post('/setAwaySchedule', setAwaySchedule);
 router.post('/return_key', generateReturnKeyOtp);
 router.post('/cancelOrder', cancelOrder);
 router.post('/valetCancelOrder', valetCancelOrder);
