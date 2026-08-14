@@ -1,38 +1,26 @@
 const express = require('express');
 const router = express.Router();
 const {
+    getPlans,
     createSubscription,
-    generateReferralCode,
     getSubscriptionStatus,
-    processSubscriptionBilling,
-    processDoormanPayouts,
     cancelSubscription,
-    getActiveSubscriptionCount,
-    getReferredSubscriptions,
+    resumeSubscription,
+    updateSchedule,
+    getPrefill,
 } = require('../controllers/subscriptionController');
 
-// Create a new subscription
+// Subscriptions v2 (Stripe Billing). The pre-v2 doorman-referral routes
+// (/generate-referral, /process-billing, /process-payouts, /referred, /count)
+// are gone — /process-billing and /process-payouts were unauthenticated
+// money-moving endpoints and nothing shipped ever called them.
+
+router.get('/plans', getPlans);
 router.post('/create', createSubscription);
-
-// Generate referral code for doorman
-router.post('/generate-referral', generateReferralCode);
-
-// Get subscription status
 router.get('/status/:userId', getSubscriptionStatus);
-
-// Process subscription billing (admin/scheduled endpoint)
-router.post('/process-billing', processSubscriptionBilling);
-
-// Process doorman payouts (admin/scheduled endpoint)
-router.post('/process-payouts', processDoormanPayouts);
-
-// Cancel subscription
-router.delete('/cancel/:subscriptionId', cancelSubscription);
-
-// Get total number of active subscriptions
-router.get('/count', getActiveSubscriptionCount);
-
-// Get all subscriptions referred by a doorman
-router.get('/referred/:doormanId', getReferredSubscriptions);
+router.post('/cancel', cancelSubscription);
+router.post('/resume', resumeSubscription);
+router.put('/schedule', updateSchedule);
+router.get('/prefill/:userId', getPrefill);
 
 module.exports = router;

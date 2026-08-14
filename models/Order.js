@@ -185,6 +185,23 @@ const OrderSchema = new mongoose.Schema({
         type: mongoose.Schema.Types.ObjectId,
         ref: 'Order', // Links parking order to its retrieval order
     },
+    // Subscriptions v2: set when a plan entitlement made this order $0.
+    // listPriceCents preserves what the order would have cost at per-use
+    // rates — the usage side of the subscriber's value indicator.
+    coveredBySubscription: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'Subscription',
+    },
+    listPriceCents: {
+        type: Number,
+    },
+    // Auto-ASP scheduler idempotency key: `asp:<subscriptionId>:<NY date>:<HHMM>`.
+    // The unique sparse index makes duplicate auto-bookings a DB-level
+    // impossibility — a second creation attempt for the same occurrence
+    // throws E11000 no matter how many scheduler ticks race.
+    autoBookKey: {
+        type: String,
+    },
     // When the valet closed the park out ("Swipe to End Order"). This is what
     // takes the job off their screen — the key handoff alone doesn't, because
     // the swipe still has to happen after it. Older clients signal this by
@@ -372,5 +389,11 @@ OrderSchema.set('toJSON', {
         return ret;
     },
 });
+
+// The scheduler's duplicate-order guarantee (sparse: only auto-booked orders
+// carry the key) plus the two lookups every scheduler/coverage query makes.
+OrderSchema.index({ autoBookKey: 1 }, { unique: true, sparse: true });
+OrderSchema.index({ customer: 1, status: 1 });
+OrderSchema.index({ coveredBySubscription: 1, createdAt: -1 }, { sparse: true });
 
 module.exports = mongoose.model('Order', OrderSchema);

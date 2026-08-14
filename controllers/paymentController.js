@@ -8,8 +8,33 @@ const stripe = process.env.STRIPE_API_KEY ? stripeModule(process.env.STRIPE_API_
 const User = require('../models/User');
 const axios = require('axios');
 const admin = require('firebase-admin');
+const {
+    applyStripeSubscriptionEvent,
+    SUBSCRIPTION_EVENT_TYPES,
+} = require('./subscriptionController');
 
 const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL;
+
+// Is this PaymentIntent the charge behind a Stripe Billing invoice
+// (subscription purchase/renewal)? Those carry none of our order metadata.
+// On the acacia-pinned webhook the payload has `invoice` directly; if the
+// field is absent (endpoint on a newer API version where the link moved),
+// re-fetch through the pinned SDK, whose response shape we control.
+async function isSubscriptionInvoicePI(paymentIntent) {
+    if (paymentIntent.invoice) return true;
+    if (paymentIntent.metadata?.orderId || paymentIntent.metadata?.conversationId) {
+        return false; // our own metadata — definitely an order/guest PI
+    }
+    if (paymentIntent.invoice === undefined && stripe) {
+        try {
+            const fresh = await stripe.paymentIntents.retrieve(paymentIntent.id);
+            return !!fresh.invoice;
+        } catch (err) {
+            console.error('isSubscriptionInvoicePI refetch failed:', err.message);
+        }
+    }
+    return false;
+}
 
 // Helper function to send Slack notification
 const sendSlackNotification = async (title, message, details = {}) => {
@@ -305,8 +330,11 @@ exports.updatePaymentStatus = async (req, res) => {
                     });
                 }
 
-                // Extract payment details from Stripe
-                const chargeDetails = paymentIntent.charges.data[0];
+                // Extract payment details from Stripe. On API 2025-02-24
+                // (stripe-node 17) PaymentIntent no longer carries `charges`
+                // — guard so a missing charge degrades to sparse details
+                // instead of a 500 on every mobile "paid" report.
+                const chargeDetails = paymentIntent.charges?.data?.[0];
                 const updateData = {
                     paymentStatus: 'paid',
                     paymentIntentId,
@@ -476,8 +504,9 @@ exports.getPaymentStatus = async (req, res) => {
                 if (stripePayment.status === 'succeeded' && guestPayment.status !== 'succeeded') {
                     console.log('Payment confirmed as succeeded, updating GuestPayment status');
                     
-                    // Extract charge details from Stripe
-                    const chargeDetails = stripePayment.charges.data[0];
+                    // Extract charge details from Stripe (absent on API
+                    // 2025-02-24 — see updatePaymentStatus note).
+                    const chargeDetails = stripePayment.charges?.data?.[0];
                     
                     guestPayment = await GuestPayment.findOneAndUpdate(
                         { conversationId },
@@ -558,7 +587,10 @@ exports.handleStripeWebhook = async (req, res) => {
     try {
         let event;
 
-        // Try to verify signature if secret is configured
+        // Signature verification FAILS CLOSED. The old fall-through that
+        // processed unverified bodies would let anyone forge
+        // payment_intent.succeeded (mark orders paid) and — now that
+        // invoice.paid grants subscription entitlements — free plans.
         if (webhookSecret && sig) {
             try {
                 // req.body should be a Buffer from bodyParser.raw()
@@ -568,8 +600,6 @@ exports.handleStripeWebhook = async (req, res) => {
                     body = JSON.stringify(body);
                 }
 
-                console.log('Webhook body type:', typeof body, 'is Buffer:', Buffer.isBuffer(body));
-
                 event = stripe.webhooks.constructEvent(
                     body,
                     sig,
@@ -577,23 +607,18 @@ exports.handleStripeWebhook = async (req, res) => {
                 );
                 console.log('Stripe webhook signature verified');
             } catch (signatureError) {
-                console.warn('Signature verification failed:', signatureError.message);
-                console.log('Processing webhook without signature verification');
-                
-                // If signature verification fails, use the body as-is (for testing)
-                if (typeof req.body === 'string') {
-                    event = JSON.parse(req.body);
-                } else {
-                    event = req.body;
-                }
+                console.warn('Webhook signature verification failed:', signatureError.message);
+                return res.status(400).json({
+                    success: false,
+                    message: 'Webhook signature verification failed',
+                });
             }
         } else {
-            // No signature verification configured, use body as-is
-            if (typeof req.body === 'string') {
-                event = JSON.parse(req.body);
-            } else {
-                event = req.body;
-            }
+            console.warn('Webhook rejected: missing stripe-signature header or STRIPE_WEBHOOK_SECRET');
+            return res.status(400).json({
+                success: false,
+                message: 'Webhook signature required',
+            });
         }
 
         // Validate event object
@@ -607,6 +632,23 @@ exports.handleStripeWebhook = async (req, res) => {
 
         console.log('Stripe webhook event received:', event.type);
 
+        // Subscriptions v2: Billing lifecycle events route to the
+        // subscription appliers (idempotent; safe to replay).
+        if (SUBSCRIPTION_EVENT_TYPES.includes(event.type)) {
+            try {
+                const result = await applyStripeSubscriptionEvent(event);
+                console.log('Subscription event applied:', event.type, result);
+            } catch (subErr) {
+                console.error('Subscription event error:', event.type, subErr);
+                // 500 so Stripe retries — these events carry entitlement state.
+                return res.status(500).json({
+                    success: false,
+                    message: 'Failed to apply subscription event',
+                });
+            }
+            return res.status(200).json({ success: true, message: 'Webhook processed successfully' });
+        }
+
         // Handle payment_intent.succeeded event
         if (event.type === 'payment_intent.succeeded') {
             if (!event.data || !event.data.object) {
@@ -618,6 +660,19 @@ exports.handleStripeWebhook = async (req, res) => {
             }
 
             const paymentIntent = event.data.object;
+
+            // Subscription-invoice PaymentIntents carry no order metadata and
+            // MUST NOT fall through to the guest-payment matchers below — the
+            // "most recent pending GuestPayment" fallback would mark someone
+            // else's checkout paid. Billing state is handled by invoice.paid.
+            if (await isSubscriptionInvoicePI(paymentIntent)) {
+                console.log('Subscription invoice payment intent — handled via invoice.paid:', paymentIntent.id);
+                return res.status(200).json({
+                    success: true,
+                    message: 'Webhook processed successfully',
+                });
+            }
+
             let conversationId = paymentIntent.metadata?.conversationId;
             let orderId = paymentIntent.metadata?.orderId;
 
@@ -842,6 +897,18 @@ exports.handleStripeWebhook = async (req, res) => {
             }
 
             const paymentIntent = event.data.object;
+
+            // Same guard as the succeeded branch: a failed subscription
+            // invoice PI is Billing's problem (invoice.payment_failed), not
+            // an order/guest payment failure.
+            if (await isSubscriptionInvoicePI(paymentIntent)) {
+                console.log('Subscription invoice payment failure — handled via invoice.payment_failed:', paymentIntent.id);
+                return res.status(200).json({
+                    success: true,
+                    message: 'Webhook processed successfully',
+                });
+            }
+
             let conversationId = paymentIntent.metadata?.conversationId;
             let orderId = paymentIntent.metadata?.orderId;
 

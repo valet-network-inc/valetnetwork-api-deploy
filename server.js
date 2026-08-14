@@ -250,6 +250,47 @@ server.listen(PORT, () => {
     } catch (err) {
         console.error('Failed to register photo-expiry cron:', err.message);
     }
+
+    // Background job: ASP sweep — valet reminders 10 min before asp_time and
+    // the automatic return order at asp_time. The old EC2 box ran this on an
+    // interval; the Render migration lost it, so manual street-cleaning moves
+    // stopped auto-returning. See orderController.runAspSweep.
+    if (process.env.ASP_SWEEP_ENABLED === 'false') {
+        console.warn('ASP sweep DISABLED via ASP_SWEEP_ENABLED=false — ASP orders will not auto-return.');
+    } else {
+        try {
+            const { runAspSweep } = require('./controllers/orderController');
+            setInterval(() => {
+                runAspSweep(io).catch((e) =>
+                    console.error('runAspSweep interval error:', e.message)
+                );
+            }, 60 * 1000);
+            console.log('ASP sweep cron registered (runs every 60s)');
+        } catch (err) {
+            console.error('Failed to register ASP sweep cron:', err.message);
+        }
+    }
+
+    // Background job: auto-ASP subscription scheduler — books the covered
+    // street-cleaning move for every active subscriber ~45 min before their
+    // scheduled sweep. Idempotent via Order.autoBookKey (unique index); never
+    // fires for lapsed/past_due/cancelled subscriptions; orders are $0 so
+    // there is nothing to double-charge. See services/subscriptionScheduler.js.
+    if (process.env.SUBS_SCHEDULER_ENABLED === 'false') {
+        console.warn('Subscription scheduler DISABLED via SUBS_SCHEDULER_ENABLED=false — auto-ASP moves will not book.');
+    } else {
+        try {
+            const { tick } = require('./services/subscriptionScheduler');
+            setInterval(() => {
+                tick({ io }).catch((e) =>
+                    console.error('subscriptionScheduler interval error:', e.message)
+                );
+            }, 60 * 1000);
+            console.log('Subscription scheduler registered (runs every 60s)');
+        } catch (err) {
+            console.error('Failed to register subscription scheduler:', err.message);
+        }
+    }
 });
 
 server.on('error', (err) => {

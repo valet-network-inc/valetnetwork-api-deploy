@@ -3,6 +3,7 @@ dotenv.config({ path: `.env.${process.env.NODE_ENV}` });
 const Order = require('../models/Order');
 const User = require('../models/User');
 const Event = require('../models/Event');
+const subscriptionService = require('../services/subscriptionService');
 const axios = require('axios');
 const stripeModule = require('stripe');
 const stripe = process.env.STRIPE_API_KEY ? stripeModule(process.env.STRIPE_API_KEY) : null;
@@ -15,6 +16,18 @@ const stripe = process.env.STRIPE_API_KEY ? stripeModule(process.env.STRIPE_API_
 const OTP_EXPIRY_ORDER_CREATION = 30 * 24 * 60 * 60 * 1000; // 30 days
 const OTP_EXPIRY_RETURN_KEY = 30 * 24 * 60 * 60 * 1000; // 30 days
 const OTP_EXPIRY_PARKING_LOCATION = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+// What a job is worth for valet pay. Subscription-covered orders charge the
+// customer $0 but carry the per-use value in listPriceCents — the valet is
+// paid from that, exactly as if the customer had paid per-use. Event-code
+// free orders stay unpaid (unchanged behavior).
+const valetPayBaseCents = (order) =>
+    order.totalAmount > 0
+        ? order.totalAmount
+        : order.coveredBySubscription && order.listPriceCents > 0
+        ? order.listPriceCents
+        : 0;
+exports.valetPayBaseCents = valetPayBaseCents;
 
 // --- Retrieval lifecycle -----------------------------------------------------
 //
@@ -244,7 +257,7 @@ exports.createOrder = async (req, res) => {
             }
         }
 
-        const hasSubscription = req.hasSubscription;
+        const subscription = req.subscription || null;
         let isEventValid = false;
         let validatedEvent = null;
         let finalIsFreeService = isFreeService || false;
@@ -290,21 +303,49 @@ exports.createOrder = async (req, res) => {
             }
         }
 
-        // Determine final amount based on subscription, event code, or regular pricing
+        // Determine final amount based on subscription coverage, event code,
+        // or regular pricing.
         let finalAmount = totalAmount || 0;
         let paymentStatus = 'pending';
+        let coverage = { covered: false };
+
+        // Subscription coverage applies to parking orders only (retrieval
+        // legs are priced by createRetrievalOrder), never stacks on an event
+        // code, and never covers an order carrying the Car Watch add-on —
+        // zeroing the order would hand out the paid add-on too, so those
+        // bookings charge normally and the free park stays available.
+        if (
+            subscription &&
+            !finalIsFreeService &&
+            !carWatch &&
+            (orderType || 'parking') === 'parking'
+        ) {
+            coverage = await subscriptionService.evaluateParkCoverage(subscription, {
+                aspMode: !!aspMode,
+                lat: customerLocation && customerLocation.lat,
+                lng: customerLocation && customerLocation.lng,
+                // Server-priced: the recorded per-use value must not come
+                // from the client's totalAmount (it feeds the valet's pay and
+                // the value indicator).
+                listPriceCents: await subscriptionService.parkListPriceCents({
+                    aspMode: !!aspMode,
+                    serviceType: finalServiceType,
+                }),
+            });
+            console.log('Subscription coverage decision:', coverage.reason);
+        }
 
         console.log('Payment determination:', {
-            hasSubscription,
+            covered: coverage.covered,
             finalIsFreeService,
             paymentIntentId,
             totalAmount,
         });
 
-        if (hasSubscription || finalIsFreeService) {
+        if (coverage.covered || finalIsFreeService) {
             finalAmount = 0;
             paymentStatus = 'paid';
-            console.log('Setting as paid due to subscription or free service');
+            console.log('Setting as paid due to subscription coverage or free service');
         } else if (paymentIntentId) {
             // Payment intent exists, mark as pending until confirmed
             paymentStatus = 'pending';
@@ -335,7 +376,14 @@ exports.createOrder = async (req, res) => {
             status: 'pending',
             paymentStatus: paymentStatus,
             orderType: orderType || 'parking',
-            paymentIntentId: paymentIntentId || undefined,
+            // Never attach a PaymentIntent to a $0 order: cancel paths issue
+            // full refunds against order.paymentIntentId without verifying it
+            // ever charged for THIS order, so an attacker-supplied (or stray)
+            // intent on a covered/free order becomes someone's refund.
+            paymentIntentId:
+                coverage.covered || finalIsFreeService
+                    ? undefined
+                    : paymentIntentId || undefined,
             eventCode: eventCode ? eventCode.toUpperCase() : undefined,
             isFreeService: finalIsFreeService,
             serviceType: finalServiceType,
@@ -343,6 +391,14 @@ exports.createOrder = async (req, res) => {
             carWatchAmount: Number.isFinite(carWatchAmount) ? carWatchAmount : 0,
             aspMode: aspMode || false,
             asp_time: aspTime,
+            // Subscription coverage stamp: which plan paid, and what the
+            // order would have cost per-use (the value indicator's usage side).
+            ...(coverage.covered
+                ? {
+                      coveredBySubscription: subscription._id,
+                      listPriceCents: coverage.listPriceCents || totalAmount || 0,
+                  }
+                : {}),
             // Enterprise-only end-customer details (shown to valet instead of the enterprise's own name)
             ...(endCustomerName ? { endCustomerName } : {}),
             ...(endCustomerPhone ? { endCustomerPhone } : {}),
@@ -390,14 +446,15 @@ exports.createOrder = async (req, res) => {
             }
         }
 
-        if (hasSubscription) {
+        if (coverage.covered) {
             // Emit socket events and return response
             req.io.emit('newOrder', order);
             req.io.to(customer).emit('orderUpdated', order);
 
             return res.status(201).json({
                 success: true,
-                message: 'Order created with subscription discount',
+                message: 'Order covered by subscription',
+                coveredBySubscription: true,
                 order,
             });
         }
@@ -900,7 +957,7 @@ exports.updateOrder = async (req, res) => {
                     linkedParking &&
                     !linkedParking.creditedValet &&
                     linkedParking.valet &&
-                    linkedParking.totalAmount > 0
+                    valetPayBaseCents(linkedParking) > 0
                 ) {
                     const VALET_CUT = 0.7;
                     const parkingValetId =
@@ -910,10 +967,11 @@ exports.updateOrder = async (req, res) => {
                     // Park-and-retrieve: parking is $10 of the $13 total.
                     // The other $3 is for retrieval (credited separately
                     // when the retrieval order's own credit hook fires).
+                    const linkedPayBase = valetPayBaseCents(linkedParking);
                     const parkingPortion =
                         linkedParking.serviceType === 'park-and-hold'
-                            ? Math.max(0, linkedParking.totalAmount - 300)
-                            : linkedParking.totalAmount;
+                            ? Math.max(0, linkedPayBase - 300)
+                            : linkedPayBase;
                     const valetCutCents = Math.floor(parkingPortion * VALET_CUT);
                     await User.findByIdAndUpdate(parkingValetId, {
                         $inc: {
@@ -968,7 +1026,7 @@ exports.updateOrder = async (req, res) => {
         if (
             !order.creditedValet &&
             order.valet &&
-            order.totalAmount > 0 &&
+            valetPayBaseCents(order) > 0 &&
             order.serviceType === 'park-and-hold' &&
             order.orderType === 'parking' &&
             ['parked'].includes(updates.status)
@@ -976,7 +1034,7 @@ exports.updateOrder = async (req, res) => {
             const VALET_CUT = 0.7;
             const parkingPortion = Math.max(
                 0,
-                order.totalAmount - PARK_AND_HOLD_RETRIEVAL_CENTS
+                valetPayBaseCents(order) - PARK_AND_HOLD_RETRIEVAL_CENTS
             );
             const valetCutCents = Math.floor(parkingPortion * VALET_CUT);
             const valetId =
@@ -1015,14 +1073,14 @@ exports.updateOrder = async (req, res) => {
             updates.status === 'completed' &&
             !order.creditedValet &&
             order.valet &&
-            order.totalAmount > 0
+            valetPayBaseCents(order) > 0
         ) {
             const VALET_CUT = 0.7;
             const valetId =
                 typeof order.valet === 'object'
                     ? order.valet._id
                     : order.valet;
-            const valetCutCents = Math.floor(order.totalAmount * VALET_CUT);
+            const valetCutCents = Math.floor(valetPayBaseCents(order) * VALET_CUT);
             try {
                 await User.findByIdAndUpdate(valetId, {
                     $inc: {
@@ -1185,7 +1243,10 @@ exports.createRetrievalOrder = async (req, res) => {
         const customerDoc = await User.findById(customer).select('isDoorman');
         const isEnterpriseRequester = !!customerDoc?.isDoorman;
 
-        const hasSubscription = req.hasSubscription;
+        // Retrieval legs don't take subscription coverage of their own —
+        // linked retrievals are already $0/pre-paid below, which is exactly
+        // what "free park + retrieval" needs (the covered PARK is the free
+        // one; its return ride was always free once linked).
         const isFreeService = originalOrder.isFreeService || false;
         const eventCode = originalOrder.eventCode;
         const serviceType = originalOrder.serviceType || 'standard';
@@ -1209,12 +1270,12 @@ exports.createRetrievalOrder = async (req, res) => {
         } else if (originalOrderId) {
             totalAmount = 0;
             finalIsFreeService = true;
-        } else if (hasSubscription || isFreeService) {
+        } else if (isFreeService) {
             totalAmount = 0;
         }
 
-        // If not free service and no subscription, ensure payment is verified
-        if (!hasSubscription && !finalIsFreeService && !paymentIntentId) {
+        // If not free service, ensure payment is verified
+        if (!finalIsFreeService && !paymentIntentId) {
             return res.status(400).json({
                 success: false,
                 message: 'Payment verification required for retrieval order',
@@ -1253,7 +1314,7 @@ exports.createRetrievalOrder = async (req, res) => {
             status: 'pending', // Start as pending for valet to accept
             paymentMethod: paymentMethod || originalOrder.paymentMethod,
             totalAmount,
-            paymentStatus: (hasSubscription || finalIsFreeService) ? 'paid' : 'paid',
+            paymentStatus: 'paid',
             paymentIntentId,
             linkedOrderId: originalOrderId,
             eventCode,
@@ -1306,7 +1367,7 @@ exports.createRetrievalOrder = async (req, res) => {
             isEnterpriseRequester &&
             !originalOrder.creditedValet &&
             originalOrder.valet &&
-            originalOrder.totalAmount > 0
+            valetPayBaseCents(originalOrder) > 0
         ) {
             const VALET_CUT = 0.7;
             const parkingValetId =
@@ -1316,13 +1377,11 @@ exports.createRetrievalOrder = async (req, res) => {
             // For park-and-retrieve, $3 of the $13 was for the retrieval
             // valet — strip that out so the parking valet only gets credit
             // for the parking portion (70% × $10 = $7, not 70% × $13).
+            const enterprisePayBase = valetPayBaseCents(originalOrder);
             const parkingPortion =
                 originalOrder.serviceType === 'park-and-hold'
-                    ? Math.max(
-                          0,
-                          originalOrder.totalAmount - 300
-                      )
-                    : originalOrder.totalAmount;
+                    ? Math.max(0, enterprisePayBase - 300)
+                    : enterprisePayBase;
             const valetCutCents = Math.floor(parkingPortion * VALET_CUT);
             try {
                 await User.findByIdAndUpdate(parkingValetId, {
@@ -2008,12 +2067,15 @@ exports.calculateConversationDistances = async (req, res) => {
     }
 };
 
+// Subscriptions v2: attach the customer's live subscription (or null) for
+// the per-order coverage decision inside createOrder. The pre-v2 behavior —
+// a blanket req.hasSubscription that zeroed EVERY order for a subscriber —
+// is retired; entitlements are now per-tier and per-usage, decided by
+// subscriptionService.evaluateParkCoverage.
 exports.validateSubscriptionForOrder = async (req, res, next) => {
     const { customer } = req.body;
 
     try {
-        console.log('Validating subscription for customer:', customer);
-        
         if (!customer) {
             return res.status(400).json({
                 success: false,
@@ -2021,11 +2083,7 @@ exports.validateSubscriptionForOrder = async (req, res, next) => {
             });
         }
 
-        // Get user with subscription info
-        const user = await User.findById(customer).populate(
-            'activeSubscription'
-        );
-
+        const user = await User.findById(customer);
         if (!user) {
             console.log('User not found with ID:', customer);
             return res.status(404).json({
@@ -2034,20 +2092,8 @@ exports.validateSubscriptionForOrder = async (req, res, next) => {
             });
         }
 
-        console.log('User found:', user._id, 'hasSubscription:', !!user.activeSubscription);
-
-        // Check if user has active subscription (must be active AND not expired)
-        const hasSubscription = !!(
-            user.activeSubscription && 
-            user.activeSubscription.active &&
-            user.activeSubscription.endDate > new Date()
-        );
-
-        // Add subscription info to request for later use
-        req.hasSubscription = hasSubscription;
         req.user = user;
-
-        console.log('Subscription validation completed, hasSubscription:', hasSubscription);
+        req.subscription = await subscriptionService.getActiveSubscription(customer);
         next();
     } catch (err) {
         console.error('Subscription validation error:', err);
@@ -2137,10 +2183,13 @@ exports.generateReturnKeyOtp = async (req, res) => {
 };
 
 // Check ASP orders and handle notifications and automatic retrieval order creation
-exports.checkAspOrders = async (req, res) => {
-    try {
-        const now = new Date();
-        
+// Core ASP sweep pass — valet reminder pushes 10 min before asp_time, and
+// the automatic return order at asp_time. Shared by the server interval
+// (server.js, ASP_SWEEP_ENABLED gate) and the manual HTTP trigger below.
+// The old EC2 deployment ran this on an interval; the Render migration lost
+// that caller, which silently killed ASP auto-returns until now.
+const runAspSweep = async (io, now = new Date()) => {
+    {
         // Find all ASP orders that are parked and have asp_time set
         const aspOrders = await Order.find({
             aspMode: true,
@@ -2181,8 +2230,8 @@ exports.checkAspOrders = async (req, res) => {
                     }
 
                     // Also send Socket.IO notification for real-time updates
-                    if (req.io && order.valet) {
-                        req.io.to(order.valet._id.toString()).emit('aspNotification', {
+                    if (io && order.valet) {
+                        io.to(order.valet._id.toString()).emit('aspNotification', {
                             orderId: order._id,
                             message: 'Your ASP service will end in 10 minutes. Please prepare to move the car back to the original location.',
                             type: 'ASP_REMINDER',
@@ -2205,6 +2254,11 @@ exports.checkAspOrders = async (req, res) => {
 
                 // Check if asp_time has been reached - create automatic retrieval order
                 if (now >= aspTime && !order.linkedOrderId) {
+                    if (!order.valet) {
+                        // A parked ASP order with no valet on record shouldn't
+                        // exist; skip it rather than crash the whole sweep.
+                        continue;
+                    }
                     // Check if valet has any active orders
                     const valetActiveOrder = await Order.findOne({
                         valet: order.valet._id,
@@ -2255,8 +2309,40 @@ exports.checkAspOrders = async (req, res) => {
                             }
                         };
 
-                        const retrievalOrder = new Order(retrievalOrderData);
-                        await retrievalOrder.save();
+                        // DB-level dedup for the return leg: one LIVE child
+                        // per parent, enforced by the unique sparse
+                        // autoBookKey index no matter how many sweep passes
+                        // race. A cancelled child (valet backed out, then
+                        // auto-cancel reaped it and restored the parent) must
+                        // not satisfy the dedup — release its key and mint a
+                        // fresh leg, or the parent gets re-linked to a dead
+                        // order and the car never comes back.
+                        retrievalOrderData.autoBookKey = `aspreturn:${order._id}`;
+
+                        let retrievalOrder = new Order(retrievalOrderData);
+                        try {
+                            await retrievalOrder.save();
+                        } catch (saveErr) {
+                            if (saveErr && saveErr.code === 11000) {
+                                const holder = await Order.findOne({
+                                    autoBookKey: `aspreturn:${order._id}`,
+                                });
+                                if (holder && holder.status !== 'cancelled') {
+                                    retrievalOrder = holder;
+                                } else if (holder) {
+                                    await Order.updateOne(
+                                        { _id: holder._id },
+                                        { $unset: { autoBookKey: 1 } }
+                                    );
+                                    retrievalOrder = new Order(retrievalOrderData);
+                                    await retrievalOrder.save();
+                                } else {
+                                    throw saveErr;
+                                }
+                            } else {
+                                throw saveErr;
+                            }
+                        }
 
                         // Update original order to link to retrieval and mark as completed
                         order.linkedOrderId = retrievalOrder._id;
@@ -2268,12 +2354,12 @@ exports.checkAspOrders = async (req, res) => {
                         await order.save();
 
                         // Emit socket events
-                        if (req.io) {
-                            req.io.emit('newOrder', retrievalOrder);
-                            req.io.to(order.customer._id.toString()).emit('orderUpdated', retrievalOrder);
-                            
+                        if (io) {
+                            io.emit('newOrder', retrievalOrder);
+                            io.to(order.customer._id.toString()).emit('orderUpdated', retrievalOrder);
+
                             // Notify valet about automatic retrieval order
-                            req.io.to(order.valet._id.toString()).emit('newRetrievalRequest', {
+                            io.to(order.valet._id.toString()).emit('newRetrievalRequest', {
                                 order: retrievalOrder,
                                 message: 'Automatic retrieval order created for ASP service completion',
                                 isAutomatic: true,
@@ -2302,18 +2388,29 @@ exports.checkAspOrders = async (req, res) => {
             }
         }
 
+        return results;
+    }
+};
+
+exports.runAspSweep = runAspSweep;
+
+// Manual HTTP trigger (admin/debug); the interval in server.js is the real caller.
+exports.checkAspOrders = async (req, res) => {
+    try {
+        const now = new Date();
+        const results = await runAspSweep(req.io, now);
         res.status(200).json({
             success: true,
             message: 'ASP orders checked successfully',
             data: results,
-            timestamp: now
+            timestamp: now,
         });
     } catch (err) {
         console.error('ASP order check error:', err);
         res.status(500).json({
             success: false,
             message: 'Failed to check ASP orders',
-            error: err.message
+            error: err.message,
         });
     }
 };
@@ -2549,6 +2646,10 @@ exports.autoCancelStaleOrders = async (io) => {
         const stale = await Order.find({
             status: 'pending',
             createdAt: { $lt: cutoff },
+            // A scheduled order (auto-ASP books ~45 min ahead; "pick a time"
+            // bookings too) isn't stale until its pickup time has also been
+            // missed by 30 minutes. Don't cancel the future.
+            pickUpTime: { $lt: cutoff },
         });
         if (stale.length === 0) return { cancelled: 0 };
 
