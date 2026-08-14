@@ -5,7 +5,7 @@ const {
     createSubscription,
     getSubscriptionStatus,
     cancelSubscription,
-    resumeSubscription,
+    changePlan,
     updateSchedule,
     getPrefill,
 } = require('../controllers/subscriptionController');
@@ -19,7 +19,7 @@ router.get('/plans', getPlans);
 router.post('/create', createSubscription);
 router.get('/status/:userId', getSubscriptionStatus);
 router.post('/cancel', cancelSubscription);
-router.post('/resume', resumeSubscription);
+router.post('/change', changePlan);
 router.put('/schedule', updateSchedule);
 router.get('/prefill/:userId', getPrefill);
 

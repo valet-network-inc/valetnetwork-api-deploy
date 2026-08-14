@@ -16,8 +16,12 @@ const CATALOG = [
         productKey: 'vn_sub_street_cleaning',
         name: 'Street-cleaning moves',
         prices: [
+            // Legacy flat 2-move prices (kept; unused after per-move launch)
             { lookupKey: 'vn_street_cleaning_weekly', amount: 3000, interval: 'week' },
             { lookupKey: 'vn_street_cleaning_monthly', amount: 10000, interval: 'month' },
+            // Per-move prices, bought with quantity = moves/week (1 or 2)
+            { lookupKey: 'vn_street_move_weekly', amount: 1500, interval: 'week' },
+            { lookupKey: 'vn_street_move_monthly', amount: 5000, interval: 'month' },
         ],
     },
     {

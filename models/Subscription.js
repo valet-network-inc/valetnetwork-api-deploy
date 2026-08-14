@@ -40,6 +40,14 @@ const SubscriptionSchema = new mongoose.Schema(
             type: Number,
             required: true,
         },
+        // street_cleaning only: how many covered moves per week was bought
+        // (Stripe quantity). Also caps the weekly covered-move count.
+        movesPerWeek: {
+            type: Number,
+            min: 1,
+            max: 2,
+            default: 2,
+        },
         stripeCustomerId: {
             type: String,
         },
@@ -86,11 +94,15 @@ const SubscriptionSchema = new mongoose.Schema(
                 default: 'onboarding',
             },
         },
-        // Where the free daily park+retrieval applies for home_garage.
+        // The FIXED SPOT where the free daily park+retrieval applies for the
+        // Fixed garage tier. Changeable once every 30 days.
         homeAddress: {
             streetAddress: { type: String },
             lat: { type: Number },
             lng: { type: Number },
+        },
+        homeAddressChangedAt: {
+            type: Date,
         },
         // Every settled Stripe invoice, for the value indicator's "what you
         // paid" side. Usage lives on Order.coveredBySubscription.

@@ -18,24 +18,27 @@ const PLANS = {
     street_cleaning: {
         tier: 'street_cleaning',
         name: 'Street cleaning moves',
-        blurb: 'Your car moves itself for street cleaning. Twice a week, automatically.',
+        blurb: 'Your car moves itself for street cleaning — as often as your block needs.',
         features: [
-            'Two street-cleaning moves a week, booked automatically',
+            'Pick 1 or 2 covered moves a week to match your sign',
             'Valet takes the car, waits out the sweep, parks it back',
             'You never touch the app on cleaning day',
         ],
-        weekly: { amountCents: 3000, lookupKey: 'vn_street_cleaning_weekly' },
-        monthly: { amountCents: 10000, lookupKey: 'vn_street_cleaning_monthly' },
+        // Priced PER WEEKLY MOVE via Stripe quantity: 1 move = $15/wk or
+        // $50/mo, 2 moves = $30/wk or $100/mo (weekly stays 30% of monthly).
+        perMove: true,
+        weekly: { amountCents: 1500, lookupKey: 'vn_street_move_weekly' },
+        monthly: { amountCents: 5000, lookupKey: 'vn_street_move_monthly' },
         rank: 1,
     },
     home_garage: {
         tier: 'home_garage',
-        name: 'Home garage',
-        blurb: 'Everything in Street cleaning, plus a free park & retrieval every day at home.',
+        name: 'Fixed garage',
+        blurb: 'Everything in Street cleaning, plus a free park & retrieval every day at your fixed spot.',
         features: [
             'Everything in Street cleaning moves',
-            'First park & retrieval of the day is free at your home address',
-            'Like a garage on your own block — without the garage',
+            'Pick one fixed spot — first park & retrieval there is free every day',
+            'The spot can be changed once a month',
         ],
         weekly: { amountCents: 7500, lookupKey: 'vn_home_garage_weekly' },
         monthly: { amountCents: 25000, lookupKey: 'vn_home_garage_monthly' },

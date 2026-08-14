@@ -97,7 +97,7 @@ async function evaluateParkCoverage(sub, { aspMode, lat, lng, listPriceCents }, 
 
     if (aspMode) {
         const used = await aspMovesUsedThisWeek(sub, now);
-        if (used >= ASP_MOVES_PER_WEEK) {
+        if (used >= (sub.movesPerWeek || ASP_MOVES_PER_WEEK)) {
             return { covered: false, reason: 'weekly_asp_limit_reached' };
         }
         return { covered: true, listPriceCents, reason: 'asp_move_covered' };
@@ -145,7 +145,7 @@ async function buildStatusPayload(sub, now = new Date()) {
     const plan = getPlan(sub.tier);
     const entitled = isEntitled(sub, now);
 
-    const [usageAgg, aspUsed, parksUsed] = await Promise.all([
+    const [usageAgg, periodUsageAgg, aspUsed, parksUsed] = await Promise.all([
         Order.aggregate([
             {
                 $match: {
@@ -154,6 +154,18 @@ async function buildStatusPayload(sub, now = new Date()) {
                 },
             },
             { $group: { _id: null, cents: { $sum: { $ifNull: ['$listPriceCents', 0] } }, count: { $sum: 1 } } },
+        ]),
+        // Usage inside the CURRENT billing period — what a cancel-now refund
+        // would be computed against.
+        Order.aggregate([
+            {
+                $match: {
+                    coveredBySubscription: sub._id,
+                    status: { $ne: 'cancelled' },
+                    ...(sub.currentPeriodStart ? { createdAt: { $gte: sub.currentPeriodStart } } : {}),
+                },
+            },
+            { $group: { _id: null, cents: { $sum: { $ifNull: ['$listPriceCents', 0] } } } },
         ]),
         entitled ? aspMovesUsedThisWeek(sub, now) : 0,
         entitled ? freeParksUsedToday(sub, now) : 0,
@@ -176,7 +188,16 @@ async function buildStatusPayload(sub, now = new Date()) {
         homeAddress: sub.homeAddress,
         nextAspMove: entitled ? nextAspMove(sub, now) : null,
         aspMovesUsedThisWeek: aspUsed,
-        aspMovesPerWeek: ASP_MOVES_PER_WEEK,
+        aspMovesPerWeek: sub.movesPerWeek || ASP_MOVES_PER_WEEK,
+        movesPerWeek: sub.movesPerWeek || ASP_MOVES_PER_WEEK,
+        homeAddressChangedAt: sub.homeAddressChangedAt,
+        // What a cancel-right-now refund would look like: the period's
+        // payment minus usage priced at per-use rates.
+        periodUsageCents: periodUsageAgg.length ? periodUsageAgg[0].cents : 0,
+        refundIfCancelledCents: Math.max(
+            0,
+            (sub.amountCents || 0) - (periodUsageAgg.length ? periodUsageAgg[0].cents : 0)
+        ),
         freeParkAvailableToday:
             entitled && tierRank(sub.tier) >= tierRank('home_garage') && parksUsed === 0,
         valueIndicator: {

@@ -1089,7 +1089,7 @@ describe('status payload', () => {
         expect(payload.valueIndicator.usageCents).toBe(2800);
         expect(payload.valueIndicator.paidCents).toBe(7500);
         expect(payload.valueIndicator.usageCount).toBe(2);
-        expect(payload.tierName).toBe('Home garage');
+        expect(payload.tierName).toBe('Fixed garage');
         expect(payload.nextAspMove).toBeTruthy();
         expect(payload.aspMovesPerWeek).toBe(2);
     });
@@ -1117,6 +1117,88 @@ describe('status payload', () => {
 
         payload = await subscriptionService.buildStatusPayload(sub);
         expect(payload.freeParkAvailableToday).toBe(false);
+    });
+
+    it('a 1-move/week plan caps covered ASP moves at 1', async () => {
+        const user = await makeCustomer();
+        const sub = await makeSub(user, {
+            tier: 'street_cleaning',
+            amountCents: 1500,
+            movesPerWeek: 1,
+        });
+        const first = await createOrderVia(
+            user,
+            parkBody({ aspMode: true, serviceType: 'park-and-hold', totalAmount: 1500 }),
+            sub
+        );
+        expect(first.body.order.totalAmount).toBe(0);
+        await Order.findByIdAndUpdate(first.body.order._id, { status: 'completed' });
+        const second = await createOrderVia(
+            user,
+            parkBody({ aspMode: true, serviceType: 'park-and-hold', totalAmount: 1500 }),
+            sub
+        );
+        expect(second.body.order.paymentStatus).toBe('pending'); // over the 1/week cap
+    });
+
+    it('cancel is immediate and reports usage-based refund math (no Stripe in tests)', async () => {
+        const user = await makeCustomer();
+        const sub = await makeSub(user, {
+            tier: 'valet_anywhere',
+            amountCents: 30000,
+            currentPeriodStart: new Date(Date.now() - 5 * 24 * 60 * 60 * 1000),
+        });
+        await User.findByIdAndUpdate(user._id, { activeSubscription: sub._id });
+        // 5 covered daily park-and-retrievals at $13 list = $65 used.
+        for (let i = 0; i < 5; i++) {
+            await Order.create({
+                customer: user._id,
+                customerLocation: HOME,
+                paymentMethod: 'card',
+                duration: 120,
+                pickUpTime: new Date(Date.now() - i * 24 * 60 * 60 * 1000),
+                totalAmount: 0,
+                status: 'completed',
+                paymentStatus: 'paid',
+                orderType: 'parking',
+                serviceType: 'park-and-hold',
+                coveredBySubscription: sub._id,
+                listPriceCents: 1300,
+            });
+        }
+
+        const res = mockRes();
+        await subscriptionController.cancelSubscription(
+            { body: { userId: user._id.toString() } },
+            res
+        );
+        expect(res.statusCode).toBe(200);
+        expect(res.body.usedCents).toBe(6500); // $65 kept
+        expect(res.body.refund.requestedCents).toBe(23500); // $235 back
+
+        const fresh = await Subscription.findById(sub._id);
+        expect(fresh.status).toBe('cancelled');
+        expect((await User.findById(user._id)).activeSubscription).toBeFalsy();
+    });
+
+    it('the fixed spot can only change once every 30 days', async () => {
+        const user = await makeCustomer();
+        await makeSub(user, {
+            homeAddress: { streetAddress: 'A St', lat: 40.6, lng: -73.9 },
+            homeAddressChangedAt: new Date(Date.now() - 5 * 24 * 60 * 60 * 1000),
+        });
+        const res = mockRes();
+        await subscriptionController.updateSchedule(
+            {
+                body: {
+                    userId: user._id.toString(),
+                    homeAddress: { streetAddress: 'B St', lat: 40.7, lng: -73.8 },
+                },
+            },
+            res
+        );
+        expect(res.statusCode).toBe(400);
+        expect(res.body.message).toMatch(/once a month/);
     });
 
     it('street_cleaning tier never advertises a free park', async () => {

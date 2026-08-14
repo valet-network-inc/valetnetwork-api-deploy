@@ -107,18 +107,44 @@ exports.getPlans = async (req, res) => {
             name: p.name,
             blurb: p.blurb,
             features: p.features,
+            // Per-move plans are bought with quantity = moves/week (1-2);
+            // amounts here are PER MOVE for those.
+            perMove: !!p.perMove,
             weekly: { amountCents: p.weekly.amountCents },
             monthly: { amountCents: p.monthly.amountCents },
             // $30/wk ≈ $130/mo vs $100/mo — same ratio on every tier.
             monthlySavesPct: 23,
         }));
-    res.status(200).json({ success: true, plans });
+    res.status(200).json({
+        success: true,
+        plans,
+        cancelPolicy:
+            'Cancel anytime — you are refunded for services not rendered, priced at regular per-park rates.',
+    });
 };
 
+// Resolve the Stripe item config + local amount for a plan choice.
+// street_cleaning is priced per weekly move (quantity 1-2); other tiers are
+// flat (quantity 1).
+async function resolvePlanPurchase(tier, interval, movesPerWeek) {
+    const plan = getPlan(tier);
+    const price = priceFor(tier, interval);
+    if (!plan || !price) return null;
+    const quantity = plan.perMove ? (movesPerWeek === 1 ? 1 : 2) : 1;
+    const priceId = await resolvePriceId(price.lookupKey);
+    return {
+        plan,
+        quantity,
+        priceId,
+        amountCents: price.amountCents * quantity,
+        movesPerWeek: plan.perMove ? quantity : 2,
+    };
+}
+
 // POST /api/subscription/create
-// { userId, tier, interval, aspSchedule, homeAddress?, promoCode? }
+// { userId, tier, interval, movesPerWeek?, aspSchedule, homeAddress?, promoCode? }
 exports.createSubscription = async (req, res) => {
-    const { userId, tier, interval, aspSchedule, homeAddress, promoCode } = req.body;
+    const { userId, tier, interval, aspSchedule, homeAddress, promoCode, movesPerWeek } = req.body;
 
     try {
         if (!stripe) {
@@ -130,15 +156,20 @@ exports.createSubscription = async (req, res) => {
         if (!userId || !tier || !interval) {
             return res.status(400).json({ success: false, message: 'userId, tier and interval are required' });
         }
-        const plan = getPlan(tier);
-        const price = priceFor(tier, interval);
-        if (!plan || !price) {
+        const purchase = await resolvePlanPurchase(tier, interval, movesPerWeek);
+        if (!purchase) {
             return res.status(400).json({ success: false, message: 'Unknown tier or interval' });
         }
 
         const scheduleError = validateAspSchedule(aspSchedule);
         if (scheduleError) {
             return res.status(400).json({ success: false, message: scheduleError });
+        }
+        if (aspSchedule.days.length > purchase.movesPerWeek) {
+            return res.status(400).json({
+                success: false,
+                message: `Your plan covers ${purchase.movesPerWeek} move${purchase.movesPerWeek === 1 ? '' : 's'} a week — pick at most that many days.`,
+            });
         }
         if (tier === 'home_garage') {
             const homeError = validateAddress(homeAddress, 'homeAddress');
@@ -178,7 +209,7 @@ exports.createSubscription = async (req, res) => {
         }
 
         const stripeCustomerId = await ensureStripeCustomer(user);
-        const priceId = await resolvePriceId(price.lookupKey);
+        const priceId = purchase.priceId;
 
         // Test/promo hook: a promo code matching the env-configured value
         // attaches its coupon (e.g. a 100%-off coupon for E2E runs against
@@ -200,7 +231,7 @@ exports.createSubscription = async (req, res) => {
 
         const stripeSub = await stripe.subscriptions.create({
             customer: stripeCustomerId,
-            items: [{ price: priceId }],
+            items: [{ price: priceId, quantity: purchase.quantity }],
             payment_behavior: 'default_incomplete',
             payment_settings: {
                 save_default_payment_method: 'on_subscription',
@@ -215,7 +246,8 @@ exports.createSubscription = async (req, res) => {
             tier,
             interval,
             status: 'incomplete',
-            amountCents: price.amountCents,
+            amountCents: purchase.amountCents,
+            movesPerWeek: purchase.movesPerWeek,
             stripeCustomerId,
             stripeSubscriptionId: stripeSub.id,
             stripePriceId: priceId,
@@ -266,7 +298,7 @@ exports.createSubscription = async (req, res) => {
             clientSecret: paymentIntent.client_secret,
             customerId: stripeCustomerId,
             customerEphemeralKeySecret: ephemeralKey.secret,
-            amountCents: price.amountCents,
+            amountCents: purchase.amountCents,
         });
     } catch (err) {
         console.error('createSubscription error:', err);
@@ -335,7 +367,27 @@ exports.getSubscriptionStatus = async (req, res) => {
     }
 };
 
+// Usage inside the current billing period, priced at per-use rates.
+async function periodUsageCents(sub) {
+    const agg = await Order.aggregate([
+        {
+            $match: {
+                coveredBySubscription: sub._id,
+                status: { $ne: 'cancelled' },
+                ...(sub.currentPeriodStart ? { createdAt: { $gte: sub.currentPeriodStart } } : {}),
+            },
+        },
+        { $group: { _id: null, cents: { $sum: { $ifNull: ['$listPriceCents', 0] } } } },
+    ]);
+    return agg.length ? agg[0].cents : 0;
+}
+
 // POST /api/subscription/cancel  { userId }
+//
+// Cancel is IMMEDIATE and refunds services not rendered: the customer keeps
+// paying only for what they actually used, priced at per-use rates, and the
+// rest of the period's payment goes back to their card. ($300 plan, 5 daily
+// park-and-retrievals used, cancel → $65 kept, $235 refunded.)
 exports.cancelSubscription = async (req, res) => {
     const { userId } = req.body;
     try {
@@ -347,18 +399,67 @@ exports.cancelSubscription = async (req, res) => {
             return res.status(404).json({ success: false, message: 'No subscription to cancel' });
         }
 
+        const usedCents = await periodUsageCents(sub);
+        const paidCents = sub.amountCents || 0;
+        const refundCents = Math.max(0, Math.min(paidCents, paidCents - usedCents));
+
+        let refund = { requestedCents: refundCents, status: 'none' };
         if (stripe && sub.stripeSubscriptionId) {
-            await stripe.subscriptions.update(sub.stripeSubscriptionId, {
-                cancel_at_period_end: true,
-            });
+            // Refund against the period's paid invoice, then cancel at Stripe.
+            if (refundCents > 0) {
+                try {
+                    const invoices = await stripe.invoices.list({
+                        subscription: sub.stripeSubscriptionId,
+                        status: 'paid',
+                        limit: 1,
+                    });
+                    const inv = invoices.data[0];
+                    const piId =
+                        inv &&
+                        (typeof inv.payment_intent === 'string'
+                            ? inv.payment_intent
+                            : inv.payment_intent?.id);
+                    if (piId && (inv.amount_paid || 0) >= refundCents) {
+                        await stripe.refunds.create({ payment_intent: piId, amount: refundCents });
+                        refund.status = 'refunded';
+                    } else if ((inv?.amount_paid || 0) === 0) {
+                        // Promo/$0 period — nothing was paid, nothing to refund.
+                        refund = { requestedCents: 0, status: 'none' };
+                    } else {
+                        refund.status = 'failed';
+                        refund.error = 'No refundable payment found for this period';
+                    }
+                } catch (refundErr) {
+                    console.error('Cancel refund failed:', refundErr.message);
+                    refund.status = 'failed';
+                    refund.error = refundErr.message;
+                }
+            }
+            try {
+                await stripe.subscriptions.cancel(sub.stripeSubscriptionId);
+            } catch (cancelErr) {
+                // Already canceled at Stripe is fine; anything else is logged
+                // but the local cancel still proceeds (webhook would confirm).
+                console.error('Stripe cancel error:', cancelErr.message);
+            }
         }
-        sub.cancelAtPeriodEnd = true;
+
+        sub.status = 'cancelled';
+        sub.cancelledAt = new Date();
         await sub.save();
+        await User.findOneAndUpdate(
+            { _id: sub.user, activeSubscription: sub._id },
+            { $unset: { activeSubscription: 1 } }
+        );
 
         res.status(200).json({
             success: true,
-            message: 'Subscription will end at the close of the current period.',
-            subscription: await buildStatusPayload(sub),
+            message:
+                refund.status === 'refunded'
+                    ? `Cancelled — $${(refundCents / 100).toFixed(2)} is on its way back to your card.`
+                    : 'Cancelled. You pay regular rates per park from now on.',
+            usedCents,
+            refund,
         });
     } catch (err) {
         console.error('cancelSubscription error:', err);
@@ -370,37 +471,88 @@ exports.cancelSubscription = async (req, res) => {
     }
 };
 
-// POST /api/subscription/resume  { userId }
-exports.resumeSubscription = async (req, res) => {
-    const { userId } = req.body;
+// POST /api/subscription/change  { userId, tier, interval, movesPerWeek?, homeAddress? }
+//
+// Seamless upgrade/downgrade: swaps the Stripe price in place with immediate
+// proration (the saved card is charged or credited the difference), then
+// mirrors the new plan locally. No new payment sheet needed.
+exports.changePlan = async (req, res) => {
+    const { userId, tier, interval, movesPerWeek, homeAddress } = req.body;
     try {
+        if (!stripe) {
+            return res.status(503).json({ success: false, message: 'Payment service unavailable' });
+        }
         const sub = await Subscription.findOne({
             user: userId,
             status: { $in: ['active', 'past_due'] },
-            cancelAtPeriodEnd: true,
         });
         if (!sub) {
-            return res.status(404).json({ success: false, message: 'No cancelled subscription to resume' });
+            return res.status(404).json({ success: false, message: 'No subscription to change' });
         }
 
-        if (stripe && sub.stripeSubscriptionId) {
-            await stripe.subscriptions.update(sub.stripeSubscriptionId, {
-                cancel_at_period_end: false,
+        const purchase = await resolvePlanPurchase(
+            tier || sub.tier,
+            interval || sub.interval,
+            movesPerWeek ?? sub.movesPerWeek
+        );
+        if (!purchase) {
+            return res.status(400).json({ success: false, message: 'Unknown tier or interval' });
+        }
+
+        // Moving into Fixed garage needs the fixed spot.
+        const targetTier = tier || sub.tier;
+        if (targetTier === 'home_garage' && !sub.homeAddress?.streetAddress && !homeAddress) {
+            const homeError = validateAddress(homeAddress, 'homeAddress');
+            return res.status(400).json({ success: false, message: homeError });
+        }
+        if (homeAddress) {
+            const homeError = validateAddress(homeAddress, 'homeAddress');
+            if (homeError) return res.status(400).json({ success: false, message: homeError });
+        }
+        // Schedule can't exceed the new plan's weekly moves.
+        if ((sub.aspSchedule?.days?.length || 0) > purchase.movesPerWeek) {
+            return res.status(400).json({
+                success: false,
+                message: `Your schedule has ${sub.aspSchedule.days.length} days but the new plan covers ${purchase.movesPerWeek}/week — trim the schedule first.`,
             });
         }
-        sub.cancelAtPeriodEnd = false;
+
+        const stripeSub = await stripe.subscriptions.retrieve(sub.stripeSubscriptionId);
+        const itemId = stripeSub.items.data[0].id;
+        const updated = await stripe.subscriptions.update(sub.stripeSubscriptionId, {
+            items: [{ id: itemId, price: purchase.priceId, quantity: purchase.quantity }],
+            proration_behavior: 'always_invoice',
+            payment_behavior: 'allow_incomplete',
+            metadata: { userId: String(sub.user), tier: targetTier, interval: interval || sub.interval },
+        });
+
+        sub.tier = targetTier;
+        sub.interval = interval || sub.interval;
+        sub.amountCents = purchase.amountCents;
+        sub.movesPerWeek = purchase.movesPerWeek;
+        sub.stripePriceId = purchase.priceId;
+        if (homeAddress) {
+            sub.homeAddress = homeAddress;
+            sub.homeAddressChangedAt = sub.homeAddressChangedAt || new Date();
+        }
+        if (updated.current_period_end) {
+            sub.currentPeriodEnd = new Date(updated.current_period_end * 1000);
+        }
+        if (updated.current_period_start) {
+            sub.currentPeriodStart = new Date(updated.current_period_start * 1000);
+        }
         await sub.save();
 
         res.status(200).json({
             success: true,
-            message: 'Subscription resumed.',
+            message: 'Plan updated — the difference is settled on your card automatically.',
             subscription: await buildStatusPayload(sub),
         });
     } catch (err) {
-        console.error('resumeSubscription error:', err);
+        console.error('changePlan error:', err);
         res.status(500).json({
             success: false,
-            message: 'Failed to resume subscription',
+            message: 'Failed to change plan',
             error: err.message,
         });
     }
@@ -423,11 +575,37 @@ exports.updateSchedule = async (req, res) => {
             if (scheduleError) {
                 return res.status(400).json({ success: false, message: scheduleError });
             }
+            const cap = sub.movesPerWeek || 2;
+            if (aspSchedule.days.length > cap) {
+                return res.status(400).json({
+                    success: false,
+                    message: `Your plan covers ${cap} move${cap === 1 ? '' : 's'} a week — pick at most that many days.`,
+                });
+            }
             sub.aspSchedule = { ...aspSchedule, source: 'edited' };
         }
         if (homeAddress) {
             const homeError = validateAddress(homeAddress, 'homeAddress');
             if (homeError) return res.status(400).json({ success: false, message: homeError });
+            // The Fixed garage spot moves once every 30 days — that's the
+            // deal. First set is free; each change starts the clock.
+            const changed =
+                sub.homeAddress?.streetAddress &&
+                (sub.homeAddress.streetAddress !== homeAddress.streetAddress ||
+                    sub.homeAddress.lat !== homeAddress.lat);
+            if (changed) {
+                const lockUntil = sub.homeAddressChangedAt
+                    ? sub.homeAddressChangedAt.getTime() + 30 * 24 * 60 * 60 * 1000
+                    : 0;
+                if (Date.now() < lockUntil) {
+                    const days = Math.ceil((lockUntil - Date.now()) / (24 * 60 * 60 * 1000));
+                    return res.status(400).json({
+                        success: false,
+                        message: `Your fixed spot can change once a month — next change in ${days} day${days === 1 ? '' : 's'}.`,
+                    });
+                }
+                sub.homeAddressChangedAt = new Date();
+            }
             sub.homeAddress = homeAddress;
         }
         await sub.save();
