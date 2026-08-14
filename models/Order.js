@@ -195,6 +195,28 @@ const OrderSchema = new mongoose.Schema({
     listPriceCents: {
         type: Number,
     },
+    // Away mode (2026-08-14): a multi-day park-and-hold. Keys are collected
+    // once at the start (standard collect OTP), held for the whole window,
+    // and returned at asp_time — which for away orders is the customer's
+    // RETURN date, so the existing sweep job's auto-return machinery closes
+    // it out with the return-key OTP. awayDays holds the street-cleaning
+    // slots to move the car for while they're gone (empty = just hold it);
+    // awayReminderLastKey dedupes the valet's per-occurrence move reminders.
+    awayMode: {
+        type: Boolean,
+        default: false,
+    },
+    awayDays: [
+        {
+            _id: false,
+            weekday: { type: Number, min: 0, max: 6 }, // 0 = Sunday
+            hour: { type: Number, min: 0, max: 23 },
+            minute: { type: Number, min: 0, max: 59 },
+        },
+    ],
+    awayReminderLastKey: {
+        type: String,
+    },
     // Auto-ASP scheduler idempotency key: `asp:<subscriptionId>:<NY date>:<HHMM>`.
     // The unique sparse index makes duplicate auto-bookings a DB-level
     // impossibility — a second creation attempt for the same occurrence

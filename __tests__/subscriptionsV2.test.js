@@ -767,6 +767,121 @@ describe('runAspSweep return-leg dedup', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Away mode + advance scheduling (2026-08-14 follow-up)
+// ---------------------------------------------------------------------------
+
+describe('away mode + advance scheduling', () => {
+    const DAY_MS = 24 * 60 * 60 * 1000;
+
+    const awayBody = (overrides = {}) => ({
+        customerLocation: HOME,
+        duration: 7 * 24 * 60,
+        pickUpTime: new Date(Date.now() + 2 * DAY_MS).toISOString(),
+        awayEndTime: new Date(Date.now() + 9 * DAY_MS).toISOString(),
+        totalAmount: 3000,
+        orderType: 'parking',
+        serviceType: 'park-and-hold',
+        awayMode: true,
+        awayDays: [{ weekday: 2, hour: 9, minute: 0 }],
+        ...overrides,
+    });
+
+    it('creates an away order: asp_time = return date, aspMode forced on', async () => {
+        const user = await makeCustomer();
+        const res = await createOrderVia(user, awayBody());
+        expect(res.statusCode).toBe(200);
+        const o = res.body.order;
+        expect(o.awayMode).toBe(true);
+        expect(o.aspMode).toBe(true);
+        expect(o.awayDays).toHaveLength(1);
+        expect(new Date(o.asp_time).getTime()).toBe(new Date(o.pickUpTime).getTime() + 7 * DAY_MS);
+        expect(o.paymentStatus).toBe('pending');
+        expect(o.totalAmount).toBe(3000);
+    });
+
+    it('rejects an away order whose return is before/too close to pickup, or beyond 30 days', async () => {
+        const user = await makeCustomer();
+        const tooShort = await createOrderVia(
+            user,
+            awayBody({ awayEndTime: new Date(Date.now() + 2 * DAY_MS + 60 * 60 * 1000).toISOString() })
+        );
+        expect(tooShort.statusCode).toBe(400);
+        const tooLong = await createOrderVia(
+            user,
+            awayBody({ awayEndTime: new Date(Date.now() + 40 * DAY_MS).toISOString() })
+        );
+        expect(tooLong.statusCode).toBe(400);
+    });
+
+    it('away orders are never subscription-covered', async () => {
+        const user = await makeCustomer();
+        const sub = await makeSub(user);
+        const res = await createOrderVia(user, awayBody(), sub);
+        expect(res.statusCode).toBe(200);
+        expect(res.body.order.paymentStatus).toBe('pending');
+        expect(res.body.order.coveredBySubscription).toBeFalsy();
+    });
+
+    it('a far-future scheduled order does not block a new booking; a near one does', async () => {
+        const user = await makeCustomer();
+        await Order.create({
+            customer: user._id,
+            customerLocation: HOME,
+            paymentMethod: 'card',
+            duration: 90,
+            pickUpTime: new Date(Date.now() + 3 * DAY_MS),
+            totalAmount: 0,
+            status: 'pending',
+            paymentStatus: 'paid',
+            orderType: 'parking',
+            aspMode: true,
+        });
+        const ok = await createOrderVia(user, parkBody());
+        expect(ok.statusCode).toBe(200);
+
+        // The new order (starting now) DOES block a follow-up.
+        await Order.findByIdAndUpdate(ok.body.order._id, { paymentStatus: 'paid' });
+        const blocked = await createOrderVia(user, parkBody());
+        expect(blocked.statusCode).toBe(400);
+    });
+
+    it('sweep sends one deduped move reminder per occurrence for parked away orders, and no return leg before the end', async () => {
+        const user = await makeCustomer();
+        const valet = await makeCustomer({ isValet: true, isActive: true });
+        const now = new Date();
+        const { nyClock } = require('../services/nyTime');
+        const c = nyClock(new Date(now.getTime() + 5 * 60 * 1000)); // occurrence ~5 min out
+        await Order.create({
+            customer: user._id,
+            customerLocation: HOME,
+            paymentMethod: 'card',
+            duration: 7 * 24 * 60,
+            pickUpTime: new Date(now.getTime() - 2 * DAY_MS),
+            totalAmount: 3000,
+            status: 'parked',
+            paymentStatus: 'paid',
+            orderType: 'parking',
+            serviceType: 'park-and-hold',
+            aspMode: true,
+            awayMode: true,
+            awayDays: [{ weekday: c.weekday, hour: c.hour, minute: c.minute }],
+            asp_time: new Date(now.getTime() + 5 * DAY_MS),
+            valet: valet._id,
+            aspNotificationSent: true,
+        });
+
+        const first = await orderController.runAspSweep(mockIo(), now);
+        expect(first.notificationsSent.filter((n) => String(n.message).includes('Away move'))).toHaveLength(1);
+
+        const second = await orderController.runAspSweep(mockIo(), new Date(now.getTime() + 60 * 1000));
+        expect(second.notificationsSent.filter((n) => String(n.message).includes('Away move'))).toHaveLength(0);
+
+        // No return leg minted — the away window is still open.
+        expect(await Order.countDocuments({ orderType: 'retrieval' })).toBe(0);
+    });
+});
+
+// ---------------------------------------------------------------------------
 // Status payload
 // ---------------------------------------------------------------------------
 

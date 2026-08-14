@@ -215,6 +215,9 @@ exports.createOrder = async (req, res) => {
         endCustomerName,
         endCustomerPhone,
         vehicle, // { licensePlate, color?, model?, keyTagNumber? } — optional at create time
+        awayMode, // multi-day hold: keys collected once, returned at awayEndTime
+        awayDays, // street-cleaning slots to move the car for while away
+        awayEndTime, // when the customer is back — becomes asp_time (the auto-return moment)
     } = req.body;
 
     try {
@@ -241,10 +244,18 @@ exports.createOrder = async (req, res) => {
         const isEnterpriseCustomer = !!customerDoc?.isDoorman;
 
         if (!isEnterpriseCustomer) {
+            // A booking scheduled well into the future (advance ASP move,
+            // away-mode start) must not lock the customer out of parking
+            // today — only orders that are live now, or starting within 6
+            // hours, block a new one.
+            const soonCutoff = new Date(Date.now() + 6 * 60 * 60 * 1000);
             const activeOrder = await Order.findOne({
                 customer,
-                status: { $in: ['pending', 'accepted', 'in_progress', 'parked'] },
-                paymentStatus: 'paid'
+                paymentStatus: 'paid',
+                $or: [
+                    { status: { $in: ['accepted', 'in_progress', 'parked'] } },
+                    { status: 'pending', pickUpTime: { $lte: soonCutoff } },
+                ],
             });
 
             if (activeOrder) {
@@ -314,10 +325,47 @@ exports.createOrder = async (req, res) => {
         // code, and never covers an order carrying the Car Watch add-on —
         // zeroing the order would hand out the paid add-on too, so those
         // bookings charge normally and the free park stays available.
+        // Away-mode input checks: the return moment is load-bearing (it
+        // becomes asp_time, which drives the auto-return), so reject
+        // nonsense before anything is saved.
+        if (awayMode) {
+            const start = new Date(pickUpTime).getTime();
+            const end = new Date(awayEndTime || 0).getTime();
+            if (!Number.isFinite(end) || end <= start + 2 * 60 * 60 * 1000) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'awayEndTime must be at least 2 hours after pickUpTime',
+                });
+            }
+            if (end - start > 30 * 24 * 60 * 60 * 1000) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Away mode is capped at 30 days',
+                });
+            }
+            for (const d of awayDays || []) {
+                if (
+                    !d ||
+                    !Number.isInteger(d.weekday) || d.weekday < 0 || d.weekday > 6 ||
+                    !Number.isInteger(d.hour) || d.hour < 0 || d.hour > 23 ||
+                    !Number.isInteger(d.minute) || d.minute < 0 || d.minute > 59
+                ) {
+                    return res.status(400).json({
+                        success: false,
+                        message: 'each away day needs weekday 0-6, hour 0-23, minute 0-59',
+                    });
+                }
+            }
+        }
+
+        // Away orders are priced per-move/per-day and are never covered by a
+        // subscription (the weekly-cap math is meaningless across a
+        // multi-week hold).
         if (
             subscription &&
             !finalIsFreeService &&
             !carWatch &&
+            !awayMode &&
             (orderType || 'parking') === 'parking'
         ) {
             coverage = await subscriptionService.evaluateParkCoverage(subscription, {
@@ -361,9 +409,15 @@ exports.createOrder = async (req, res) => {
         const otpCreatedAt = new Date();
         const otpExpiresAt = new Date(otpCreatedAt.getTime() + OTP_EXPIRY_ORDER_CREATION);
 
-        // Calculate ASP time (1.5 hours from pickup time)
+        // asp_time is "when the car comes back automatically": for a normal
+        // street-cleaning move that's pickup + 1.5h; for away mode it's the
+        // day the customer returns.
         const pickupTimeMs = new Date(pickUpTime).getTime();
-        const aspTime = aspMode ? new Date(pickupTimeMs + 1.5 * 60 * 60 * 1000) : null;
+        const aspTime = awayMode
+            ? new Date(awayEndTime)
+            : aspMode
+            ? new Date(pickupTimeMs + 1.5 * 60 * 60 * 1000)
+            : null;
 
         const orderData = {
             customer,
@@ -389,8 +443,20 @@ exports.createOrder = async (req, res) => {
             serviceType: finalServiceType,
             carWatch: !!carWatch,
             carWatchAmount: Number.isFinite(carWatchAmount) ? carWatchAmount : 0,
-            aspMode: aspMode || false,
+            // Away orders ride the aspMode machinery (sweep reminders +
+            // auto-return at asp_time) whatever service was picked.
+            aspMode: awayMode ? true : aspMode || false,
             asp_time: aspTime,
+            ...(awayMode
+                ? {
+                      awayMode: true,
+                      awayDays: (awayDays || []).map(({ weekday, hour, minute }) => ({
+                          weekday,
+                          hour,
+                          minute,
+                      })),
+                  }
+                : {}),
             // Subscription coverage stamp: which plan paid, and what the
             // order would have cost per-use (the value indicator's usage side).
             ...(coverage.covered
@@ -2208,6 +2274,49 @@ const runAspSweep = async (io, now = new Date()) => {
             try {
                 const aspTime = new Date(order.asp_time);
                 const tenMinutesBeforeAsp = new Date(aspTime.getTime() - 10 * 60 * 1000);
+
+                // Away mode: while the car is parked and the customer is
+                // gone, remind the valet to move it for each scheduled
+                // street-cleaning slot. Keys are already with the valet, so
+                // this is a push + done — no customer interaction, no new
+                // orders. Deduped per occurrence via awayReminderLastKey.
+                if (order.awayMode && order.awayDays && order.awayDays.length > 0 && order.valet) {
+                    const { nextNyOccurrence, nyDateKey } = require('../services/nyTime');
+                    for (const day of order.awayDays) {
+                        const occ = nextNyOccurrence(day, new Date(now.getTime() - 10 * 60 * 1000));
+                        if (!occ) continue;
+                        const distanceMs = occ.getTime() - now.getTime();
+                        if (distanceMs > 15 * 60 * 1000 || distanceMs < -10 * 60 * 1000) continue;
+                        if (occ.getTime() >= aspTime.getTime()) continue; // return day — normal flow handles it
+                        const key = `${nyDateKey(occ)}:${day.hour}:${day.minute}`;
+                        if (order.awayReminderLastKey === key) continue;
+                        try {
+                            const { sendPushNotification } = require('./notificationController');
+                            await sendPushNotification(
+                                order.valet.firebaseUid,
+                                'Street cleaning — move the car',
+                                `Away-mode car at ${order.customerLocation?.streetAddress || 'the saved address'}: sweep starts soon. Move it, then re-park after.`,
+                                { orderId: order._id.toString(), type: 'AWAY_MOVE_REMINDER' }
+                            );
+                        } catch (pushErr) {
+                            console.error('Away move push failed:', pushErr.message);
+                        }
+                        if (io) {
+                            io.to(order.valet._id.toString()).emit('aspNotification', {
+                                orderId: order._id,
+                                message: 'Away-mode car: street cleaning starts soon — move and re-park it.',
+                                type: 'AWAY_MOVE_REMINDER',
+                            });
+                        }
+                        order.awayReminderLastKey = key;
+                        await order.save();
+                        results.notificationsSent.push({
+                            orderId: order._id,
+                            valetId: order.valet._id,
+                            message: `Away move reminder (${key})`,
+                        });
+                    }
+                }
                 
                 // Check if we should send notification (10 minutes before asp_time)
                 if (now >= tenMinutesBeforeAsp && now < aspTime && !order.aspNotificationSent) {
