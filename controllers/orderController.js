@@ -2537,6 +2537,60 @@ const runAspSweep = async (io, now = new Date()) => {
 
 exports.runAspSweep = runAspSweep;
 
+// --- Away charge ledger ------------------------------------------------
+// An away order can be paid in two charges: the $1 deposit at booking and
+// the balance once the valet sets the schedule. Refunds must be able to
+// reach both, so they walk this ledger newest-first instead of assuming a
+// single PaymentIntent.
+
+// The ledger, seeding the deposit from the order if it isn't recorded yet.
+// Safe to call before the first balance charge — at that point awayPaidCents
+// is still exactly what the deposit charged.
+const awayChargeLedger = (order) => {
+    const ledger = (order.awayCharges || []).map((c) => ({
+        paymentIntentId: c.paymentIntentId,
+        amountCents: c.amountCents || 0,
+        refundedCents: c.refundedCents || 0,
+        at: c.at,
+    }));
+    if (!ledger.length && order.paymentIntentId && (order.awayPaidCents || 0) > 0) {
+        ledger.push({
+            paymentIntentId: order.paymentIntentId,
+            amountCents: order.awayPaidCents,
+            refundedCents: 0,
+            at: order.createdAt,
+        });
+    }
+    return ledger;
+};
+
+// Refund `cents` across an away order's charges, newest first. Returns what
+// was actually refunded; the caller decides what a shortfall means.
+const refundAwayCharges = async (order, cents) => {
+    if (!stripe || cents <= 0) return { refundedCents: 0, ledger: awayChargeLedger(order) };
+    const ledger = awayChargeLedger(order);
+    let remaining = cents;
+    let refunded = 0;
+    for (let i = ledger.length - 1; i >= 0 && remaining > 0; i--) {
+        const entry = ledger[i];
+        const available = Math.max(0, (entry.amountCents || 0) - (entry.refundedCents || 0));
+        if (!entry.paymentIntentId || available <= 0) continue;
+        const take = Math.min(available, remaining);
+        try {
+            await stripe.refunds.create({ payment_intent: entry.paymentIntentId, amount: take });
+            entry.refundedCents = (entry.refundedCents || 0) + take;
+            remaining -= take;
+            refunded += take;
+        } catch (err) {
+            console.error(
+                `Away refund failed on ${entry.paymentIntentId} for ${take}c:`,
+                err.message
+            );
+        }
+    }
+    return { refundedCents: refunded, shortfallCents: cents - refunded, ledger };
+};
+
 // How many scheduled sweep slots land inside an away window (NY time).
 // The single pricing truth for away "moves" orders: booking, valet
 // correction, and the reconciler below all count moves this way.
@@ -2656,6 +2710,16 @@ exports.setAwaySchedule = async (req, res) => {
                             customerId: String(order.customer),
                         },
                     });
+                    // Ledger the balance charge alongside the deposit (seeded
+                    // here on first reconciliation) so refunds can reach both.
+                    const ledger = awayChargeLedger(order);
+                    ledger.push({
+                        paymentIntentId: pi.id,
+                        amountCents: delta,
+                        refundedCents: 0,
+                        at: new Date(),
+                    });
+                    order.awayCharges = ledger;
                     order.paymentIntentId = order.paymentIntentId || pi.id;
                     order.awayPaidCents = priceCents;
                     order.totalAmount = priceCents;
@@ -2670,17 +2734,19 @@ exports.setAwaySchedule = async (req, res) => {
                     };
                 }
             } else {
-                // Schedule came out cheaper than what was charged — refund
-                // the difference against the original payment.
+                // Schedule came out cheaper than what was charged — hand the
+                // difference back across the charges that took it (the
+                // balance charge first, then the deposit).
                 try {
-                    if (order.paymentIntentId && stripe) {
-                        await stripe.refunds.create({
-                            payment_intent: order.paymentIntentId,
-                            amount: -delta,
-                        });
-                    }
+                    const result = await refundAwayCharges(order, -delta);
+                    order.awayCharges = result.ledger;
                     order.awayPaidCents = priceCents;
                     order.totalAmount = priceCents;
+                    if (result.shortfallCents > 0 && stripe) {
+                        throw new Error(
+                            `only ${result.refundedCents}c of ${-delta}c could be refunded`
+                        );
+                    }
                     order.awayBilling = { status: 'settled', lastDeltaCents: delta, at: new Date() };
                 } catch (refundErr) {
                     console.error('Away schedule refund failed:', refundErr.message);
@@ -2821,7 +2887,32 @@ exports.cancelOrder = async (req, res) => {
         // the order should still be cancelled so the valet doesn't show up. Any failed refund
         // can be handled manually from the Stripe dashboard.
         let refundResult = null;
-        if (order.paymentStatus === 'paid' && order.paymentIntentId && stripe) {
+        if (order.paymentStatus === 'paid' && order.awayMode && stripe) {
+            // Away orders can hold two charges (deposit + the balance the
+            // valet's schedule triggered). Give back everything they took,
+            // not just the PaymentIntent on the order.
+            try {
+                const owed = order.awayPaidCents ?? order.totalAmount ?? 0;
+                const result = await refundAwayCharges(order, owed);
+                order.awayCharges = result.ledger;
+                refundResult = {
+                    amount: result.refundedCents,
+                    status: result.shortfallCents > 0 ? 'partial' : 'succeeded',
+                };
+                if (result.shortfallCents > 0) {
+                    console.error(
+                        'Away cancel refund short by',
+                        result.shortfallCents,
+                        'cents on order',
+                        orderId
+                    );
+                }
+                console.log('Away refund issued for cancelled order:', orderId, result.refundedCents);
+            } catch (refundErr) {
+                console.error('Away refund failed for cancelled order:', orderId, refundErr.message);
+                refundResult = { error: refundErr.message };
+            }
+        } else if (order.paymentStatus === 'paid' && order.paymentIntentId && stripe) {
             try {
                 const refund = await stripe.refunds.create({
                     payment_intent: order.paymentIntentId,

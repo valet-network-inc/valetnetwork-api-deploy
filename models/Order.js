@@ -230,6 +230,19 @@ const OrderSchema = new mongoose.Schema({
     awayPaidCents: {
         type: Number,
     },
+    // Every charge taken for an away order, oldest first: the $1 deposit,
+    // then whatever the valet's schedule added. Refunds walk this ledger —
+    // paymentIntentId alone only points at the deposit, so refunding it
+    // would strand the larger balance charge.
+    awayCharges: [
+        {
+            _id: false,
+            paymentIntentId: { type: String },
+            amountCents: { type: Number },
+            refundedCents: { type: Number, default: 0 },
+            at: { type: Date },
+        },
+    ],
     awayBilling: {
         status: {
             type: String,
