@@ -48,6 +48,45 @@ const RETRIEVAL_LIVE_STATUSES = [
     'in_progress',
 ];
 
+// --- What still sits on a valet's plate --------------------------------------
+//
+// A valet can hold several jobs at once, so "am I busy" is a count, not a
+// yes/no. `hasActiveOrder` (what the app lists) and `acceptOrder` (the
+// concurrency cap) both read this one query so the two can never disagree
+// about which orders count as open.
+//
+//   • 'accepted' / 'in_progress' — actively driving / on the job.
+//   • 'parked' for non-Enterprise, but only until the valet closes the job out
+//     with "Swipe to End Order" (`parkClosedAt`). Gating on the key-handoff
+//     stamp instead took the order off their screen one step early and
+//     stranded it with nobody able to move it.
+//   • Enterprise dispatches: valet is free as soon as parking completes (front
+//     desk holds keys), so 'parked' is excluded for Enterprise.
+const valetActiveOrderQuery = (valetId) => ({
+    valet: valetId,
+    paymentStatus: 'paid',
+    $or: [
+        { status: { $in: ['accepted', 'in_progress', 'in-progress'] } },
+        {
+            status: 'parked',
+            parkClosedAt: { $exists: false },
+            $or: [
+                { endCustomerName: { $exists: false } },
+                { endCustomerName: '' },
+                { endCustomerName: null },
+            ],
+        },
+    ],
+});
+
+// Safety valve against one valet hoovering the whole board — not a queue depth
+// we expect anyone to hit. Set VALET_MAX_ACTIVE_ORDERS to another number to
+// widen it, or to 0 for no cap at all.
+const valetMaxActiveOrders = () => {
+    const parsed = Number.parseInt(process.env.VALET_MAX_ACTIVE_ORDERS ?? '5', 10);
+    return Number.isFinite(parsed) ? parsed : 5;
+};
+
 /**
  * Has the retrieval valet physically taken the keys?
  *
@@ -654,8 +693,30 @@ exports.acceptOrder = async (req, res) => {
             });
         }
 
+        // Concurrency cap. A valet holding other live jobs is fine — that's the
+        // point — but past the cap they're told to close one out first. The
+        // accepted order itself is excluded so a retry after a flaky response
+        // can't count the same job twice.
+        const maxActive = valetMaxActiveOrders();
+        if (maxActive > 0) {
+            const openJobs = await Order.countDocuments({
+                ...valetActiveOrderQuery(valetId),
+                _id: { $ne: orderId },
+            });
+
+            if (openJobs >= maxActive) {
+                return res.status(409).json({
+                    success: false,
+                    code: 'VALET_AT_CAPACITY',
+                    message: `You already have ${openJobs} jobs open. Finish one before taking another.`,
+                    openJobs,
+                    maxActiveOrders: maxActive,
+                });
+            }
+        }
+
         const acceptedAt = new Date();
-        
+
         // Get order to calculate pickup distance
         const existingOrder = await Order.findById(orderId);
         if (!existingOrder) {
@@ -785,70 +846,45 @@ exports.hasActiveOrder = async (req, res) => {
     const { userId, isValet } = req.query;
 
     try {
-        // Valet's "active" set:
-        //   • 'accepted' / 'in_progress' — actively driving / on the job.
-        //   • 'parked' for non-Enterprise, but ONLY until the keys are back
-        //     with the customer. The valet's last duty on a park is walking
-        //     them over; `otpVerifiedTimes.returnKey` is stamped when that
-        //     handoff is verified, and at that point the job is off their
-        //     screen. A later return trip is a separate retrieval order that
-        //     any valet can pick up.
-        //   • Enterprise dispatches: valet is free as soon as parking
-        //     completes (front desk holds keys), so 'parked' is excluded
-        //     for Enterprise.
-        const query =
-            isValet === 'true'
-                ? {
-                      valet: userId,
-                      paymentStatus: 'paid',
-                      $or: [
-                          {
-                              status: {
-                                  $in: ['accepted', 'in_progress', 'in-progress'],
-                              },
-                          },
-                          {
-                              status: 'parked',
-                              // The valet keeps the job until THEY close it out,
-                              // not merely until the keys change hands. Gating
-                              // this on the key-handoff stamp took the order off
-                              // their screen the instant the customer's OTP
-                              // verified — one step before "Swipe to End Order" —
-                              // and stranded the order with nobody able to move
-                              // it. `parkClosedAt` is stamped by that swipe.
-                              parkClosedAt: { $exists: false },
-                              $or: [
-                                  { endCustomerName: { $exists: false } },
-                                  { endCustomerName: '' },
-                                  { endCustomerName: null },
-                              ],
-                          },
-                      ],
-                  }
-                : {
-                      customer: userId,
-                      status: {
-                          $in: ['pending', 'accepted', 'in_progress', 'parked'],
-                      },
-                      paymentStatus: 'paid',
-                      // A park the valet has closed out is NOT "in flight" to
-                      // this endpoint, and never has been: it used to sit on a
-                      // status this query didn't list, so the customer app
-                      // learned to find it in the orders list instead and shows
-                      // it as the keys-held ticket. Keep that shape. Answering
-                      // with it here hands shipped builds a case they have
-                      // never seen from this endpoint, and their home screen
-                      // renders the keys-held ticket for a frame and then
-                      // replaces it with the generic in-progress one.
-                      parkClosedAt: { $exists: false },
-                  };
+        // Valet's "active" set is `valetActiveOrderQuery` — see the comment on
+        // it. A valet can hold several of these at once.
+        const valetSide = isValet === 'true';
+        const query = valetSide
+            ? valetActiveOrderQuery(userId)
+            : {
+                  customer: userId,
+                  status: {
+                      $in: ['pending', 'accepted', 'in_progress', 'parked'],
+                  },
+                  paymentStatus: 'paid',
+                  // A park the valet has closed out is NOT "in flight" to
+                  // this endpoint, and never has been: it used to sit on a
+                  // status this query didn't list, so the customer app
+                  // learned to find it in the orders list instead and shows
+                  // it as the keys-held ticket. Keep that shape. Answering
+                  // with it here hands shipped builds a case they have
+                  // never seen from this endpoint, and their home screen
+                  // renders the keys-held ticket for a frame and then
+                  // replaces it with the generic in-progress one.
+                  parkClosedAt: { $exists: false },
+              };
 
-        const activeOrder = await Order.findOne(query);
+        // Valets get the whole set; customers are still held to one order at a
+        // time by `createOrder`, so that side keeps its single-document read.
+        //
+        // `activeOrder` stays on the payload and is the oldest of the set:
+        // builds already on phones only ever expected one order here, and
+        // oldest-first means the job they see doesn't jump the moment a newer
+        // one is accepted.
+        const activeOrders = valetSide
+            ? await Order.find(query).sort({ acceptedAt: 1, createdAt: 1 })
+            : [await Order.findOne(query)].filter(Boolean);
 
         res.status(200).json({
             success: true,
-            hasActiveOrder: !!activeOrder,
-            activeOrder,
+            hasActiveOrder: activeOrders.length > 0,
+            activeOrder: activeOrders[0] || null,
+            activeOrders,
         });
     } catch (err) {
         console.error(err);
@@ -2402,16 +2438,13 @@ const runAspSweep = async (io, now = new Date()) => {
                         // exist; skip it rather than crash the whole sweep.
                         continue;
                     }
-                    // Check if valet has any active orders
-                    const valetActiveOrder = await Order.findOne({
-                        valet: order.valet._id,
-                        status: { $in: ['accepted', 'in_progress', 'parked'] },
-                        paymentStatus: 'paid',
-                        _id: { $ne: order._id } // Exclude the current order
-                    });
-
-                    // Only create retrieval order if valet has no other active orders
-                    if (!valetActiveOrder) {
+                    // This used to bail out if the valet had any other live
+                    // order, which meant a busy valet's ASP car was never
+                    // moved and nobody was told — the sweep just logged and
+                    // walked away. Valets carry several jobs now, and this
+                    // leg is theirs by definition (they're holding the keys),
+                    // so it always gets minted.
+                    {
                         // Generate OTP for the retrieval order
                         const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
                         const otpCreatedAt = new Date();
@@ -2518,8 +2551,6 @@ const runAspSweep = async (io, now = new Date()) => {
                             customerId: order.customer._id,
                             message: 'Automatic retrieval order created at ASP time'
                         });
-                    } else {
-                        console.log(`Valet ${order.valet._id} has active orders, skipping automatic retrieval order creation for ASP order ${order._id}`);
                     }
                 }
             } catch (orderError) {
