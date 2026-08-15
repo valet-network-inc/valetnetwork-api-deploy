@@ -399,6 +399,33 @@ exports.createOrder = async (req, res) => {
             awayMode && awayService === 'moves' && (!awayDays || awayDays.length === 0);
 
         if (awayBillLater) {
+            // Bill-later needs a card ON FILE BEFORE booking — the charge
+            // fires unattended when the valet sets the schedule, so "no
+            // card" must be caught here, not discovered at charge time.
+            // 402 + code lets the app open the save-a-card sheet and retry.
+            if (stripe) {
+                let hasCard = false;
+                try {
+                    const custId = req.user?.stripeCustomerId;
+                    if (custId) {
+                        const pms = await stripe.paymentMethods.list({
+                            customer: custId,
+                            type: 'card',
+                            limit: 1,
+                        });
+                        hasCard = pms.data.length > 0;
+                    }
+                } catch (cardErr) {
+                    console.error('Card check failed:', cardErr.message);
+                }
+                if (!hasCard) {
+                    return res.status(402).json({
+                        success: false,
+                        code: 'card_required',
+                        message: 'Save a card first — you are only charged once your valet sets the schedule.',
+                    });
+                }
+            }
             finalAmount = 0;
             paymentStatus = 'paid';
             console.log('Away order with no schedule — billed when the valet sets it');
