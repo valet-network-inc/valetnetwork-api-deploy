@@ -13,6 +13,12 @@ const stripe = process.env.STRIPE_API_KEY ? stripeModule(process.env.STRIPE_API_
 // const OTP_EXPIRY_RETURN_KEY = 4 * 60 * 60 * 1000; // 4 hours
 // const OTP_EXPIRY_PARKING_LOCATION = 4 * 60 * 60 * 1000; // 4 hours
 
+// Deposit taken when an away booking's price can't be known yet (the valet
+// still has to read the sign). Charged at booking, credited against the
+// final price. Stripe's USD minimum charge is $0.50, so $1 is the smallest
+// round amount that always goes through.
+const AWAY_DEPOSIT_CENTS = 100;
+
 const OTP_EXPIRY_ORDER_CREATION = 30 * 24 * 60 * 60 * 1000; // 30 days
 const OTP_EXPIRY_RETURN_KEY = 30 * 24 * 60 * 60 * 1000; // 30 days
 const OTP_EXPIRY_PARKING_LOCATION = 30 * 24 * 60 * 60 * 1000; // 30 days
@@ -391,44 +397,23 @@ exports.createOrder = async (req, res) => {
             totalAmount,
         });
 
-        // Away "moves" bookings with no schedule yet are billed AFTER the
-        // valet reads the signs and sets the days — nothing is due now, and
-        // the order must still be 'paid' so valets can see and accept it.
+        // Away "moves" bookings with no schedule yet take a $1 deposit now
+        // and the balance once the valet reads the sign and sets the days.
+        // The deposit is what makes the later charge safe: it proves the
+        // card works and — via createPaymentIntent's setup_future_usage —
+        // saves it for the off-session balance. It counts toward the final
+        // price, so one move is $15 total ($1 now, $14 then).
         // Server-enforced: whatever amount the client sent is discarded.
         const awayBillLater =
-            awayMode && awayService === 'moves' && (!awayDays || awayDays.length === 0);
+            awayMode &&
+            awayService === 'moves' &&
+            (!awayDays || awayDays.length === 0) &&
+            !finalIsFreeService;
 
         if (awayBillLater) {
-            // Bill-later needs a card ON FILE BEFORE booking — the charge
-            // fires unattended when the valet sets the schedule, so "no
-            // card" must be caught here, not discovered at charge time.
-            // 402 + code lets the app open the save-a-card sheet and retry.
-            if (stripe) {
-                let hasCard = false;
-                try {
-                    const custId = req.user?.stripeCustomerId;
-                    if (custId) {
-                        const pms = await stripe.paymentMethods.list({
-                            customer: custId,
-                            type: 'card',
-                            limit: 1,
-                        });
-                        hasCard = pms.data.length > 0;
-                    }
-                } catch (cardErr) {
-                    console.error('Card check failed:', cardErr.message);
-                }
-                if (!hasCard) {
-                    return res.status(402).json({
-                        success: false,
-                        code: 'card_required',
-                        message: 'Save a card first — you are only charged once your valet sets the schedule.',
-                    });
-                }
-            }
-            finalAmount = 0;
-            paymentStatus = 'paid';
-            console.log('Away order with no schedule — billed when the valet sets it');
+            finalAmount = AWAY_DEPOSIT_CENTS;
+            paymentStatus = 'pending'; // the normal PaymentIntent flow charges it
+            console.log('Away order with no schedule — $1 deposit now, balance when the valet sets it');
         } else if (coverage.covered || finalIsFreeService) {
             finalAmount = 0;
             paymentStatus = 'paid';
@@ -495,8 +480,11 @@ exports.createOrder = async (req, res) => {
                           hour,
                           minute,
                       })),
-                      // What's charged at booking; the schedule reconciler
-                      // trues this up when days are set or corrected.
+                      // What the booking charge covers (the $1 deposit for
+                      // bill-later, the full price otherwise). The reconciler
+                      // credits it against the final price. Safe to stamp
+                      // before the charge confirms: reconciliation only runs
+                      // on orders that reached paymentStatus 'paid'.
                       awayPaidCents: finalAmount,
                       ...(awayBillLater
                           ? { awayBilling: { status: 'pending_schedule', at: new Date() } }
@@ -3005,10 +2993,17 @@ exports.autoCancelStaleOrders = async (io) => {
         const stale = await Order.find({
             status: 'pending',
             createdAt: { $lt: cutoff },
-            // A scheduled order (auto-ASP books ~45 min ahead; "pick a time"
-            // bookings too) isn't stale until its pickup time has also been
-            // missed by 30 minutes. Don't cancel the future.
-            pickUpTime: { $lt: cutoff },
+            $or: [
+                // A scheduled order (auto-ASP books ~45 min ahead; "pick a
+                // time" and away bookings too) isn't stale until its pickup
+                // time has also been missed by 30 minutes. Don't cancel the
+                // future...
+                { pickUpTime: { $lt: cutoff } },
+                // ...unless it was never paid for. That's an abandoned
+                // checkout whatever date it claims, and leaving it pending
+                // forever would litter the customer's list.
+                { paymentStatus: { $ne: 'paid' } },
+            ],
         });
         if (stale.length === 0) return { cancelled: 0 };
 

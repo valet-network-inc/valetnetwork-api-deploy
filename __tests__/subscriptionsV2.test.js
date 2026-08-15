@@ -641,6 +641,24 @@ describe('autoCancelStaleOrders with future pickups', () => {
         expect((await Order.findById(order._id)).status).toBe('pending');
     });
 
+    it('cancels an UNPAID future-dated order — an abandoned checkout is stale whatever its pickup', async () => {
+        const user = await makeCustomer();
+        const order = await Order.create(
+            staleBase(user, {
+                pickUpTime: new Date(Date.now() + 3 * 24 * 60 * 60 * 1000),
+                paymentStatus: 'pending',
+                totalAmount: 100,
+            })
+        );
+        await Order.collection.updateOne(
+            { _id: order._id },
+            { $set: { createdAt: new Date(Date.now() - 45 * 60 * 1000) } }
+        );
+
+        await orderController.autoCancelStaleOrders(mockIo());
+        expect((await Order.findById(order._id)).status).toBe('cancelled');
+    });
+
     it('still cancels a pending order whose pickup passed 30+ minutes ago', async () => {
         const user = await makeCustomer();
         const order = await Order.create(
@@ -845,7 +863,7 @@ describe('away mode + advance scheduling', () => {
         expect(blocked.statusCode).toBe(400);
     });
 
-    it('an away moves booking with no schedule is created unbilled ($0/paid, pending_schedule)', async () => {
+    it('an away moves booking with no schedule takes a $1 deposit, not the client amount', async () => {
         const user = await makeCustomer();
         const res = await createOrderVia(
             user,
@@ -853,10 +871,61 @@ describe('away mode + advance scheduling', () => {
         );
         expect(res.statusCode).toBe(200);
         const o = res.body.order;
-        expect(o.totalAmount).toBe(0); // client-sent amount discarded
-        expect(o.paymentStatus).toBe('paid'); // valets must see it
+        expect(o.totalAmount).toBe(100); // client-sent amount discarded, $1 deposit
+        expect(o.paymentStatus).toBe('pending'); // normal PaymentIntent flow charges it
         expect(o.awayBilling.status).toBe('pending_schedule');
-        expect(o.awayPaidCents).toBe(0);
+        expect(o.awayPaidCents).toBe(100); // credited against the final price
+    });
+
+    it('a free-code away booking still skips the deposit entirely', async () => {
+        const Event = require('../models/Event');
+        await Event.create({
+            code: 'AWAYFREE',
+            name: 'test',
+            type: 'temporary',
+            isActive: true,
+            serviceType: 'standard',
+            validFrom: new Date(Date.now() - 1000),
+            validUntil: new Date(Date.now() + 86400000),
+        });
+        const user = await makeCustomer();
+        const res = await createOrderVia(
+            user,
+            awayBody({ awayDays: [], awayService: 'moves', eventCode: 'AWAYFREE' })
+        );
+        expect(res.body.order.totalAmount).toBe(0);
+        expect(res.body.order.paymentStatus).toBe('paid');
+    });
+
+    it('the deposit is credited: 1 move ($15) bills the $14 balance, not $15 again', async () => {
+        const user = await makeCustomer();
+        const order = await Order.create({
+            customer: user._id,
+            customerLocation: HOME,
+            paymentMethod: 'card',
+            duration: 7 * 24 * 60,
+            pickUpTime: new Date(Date.now() + DAY_MS),
+            totalAmount: 100,
+            awayPaidCents: 100, // the $1 deposit already charged
+            status: 'accepted',
+            paymentStatus: 'paid',
+            orderType: 'parking',
+            serviceType: 'park-and-hold',
+            aspMode: true,
+            awayMode: true,
+            awayService: 'moves',
+            awayDays: [],
+            awayBilling: { status: 'pending_schedule', at: new Date() },
+            asp_time: new Date(Date.now() + 8 * DAY_MS),
+        });
+
+        const res = mockRes();
+        await orderController.setAwaySchedule(
+            { body: { orderId: order._id.toString(), awayDays: [{ weekday: 2, hour: 9, minute: 0 }] }, io: mockIo() },
+            res
+        );
+        // One Tuesday in the window = $15 owed, $1 already paid -> $14 balance.
+        expect(res.body.billing.lastDeltaCents).toBe(1400);
     });
 
     it('countAwayMoves counts occurrences strictly inside the window', () => {
