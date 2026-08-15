@@ -132,15 +132,27 @@ const buildStoragePath = (orderId, type, mimeType, originalFilename) => {
 
 /**
  * POST /api/order/:orderId/photos
- * Multipart form: { type, capturedLat?, capturedLng? } + file field "file"
+ * Multipart form: { type, source?, capturedLat?, capturedLng? } + file field "file"
  *
- * Returns: { success, photo: { id, type, viewUrl, capturedAt } }
+ * Returns: { success, photo: { id, type, source, viewUrl, capturedAt } }
  */
 exports.uploadPhoto = async (req, res) => {
     try {
         const { orderId } = req.params;
-        const { type, capturedLat, capturedLng, valetId } = req.body;
+        const { type, capturedLat, capturedLng, valetId, source } = req.body;
         const file = req.file;
+
+        // Multipart fields arrive as strings, always. The old
+        // `typeof capturedLat === 'number'` test could therefore never be
+        // true, so no photo ever stored a capture location — the field has
+        // been silently empty since it was added. Parse instead.
+        const lat = Number.parseFloat(capturedLat);
+        const lng = Number.parseFloat(capturedLng);
+        const hasCoords = Number.isFinite(lat) && Number.isFinite(lng);
+
+        // Anything that isn't explicitly 'library' is treated as a camera
+        // capture — that matches every client that predates the field.
+        const photoSource = source === 'library' ? 'library' : 'camera';
 
         // -- Validation
         if (!orderId || !type || !file || !valetId) {
@@ -199,10 +211,11 @@ exports.uploadPhoto = async (req, res) => {
             storagePath,
             mimeType: file.mimetype,
             fileSize: file.size,
+            source: photoSource,
+            // A library pick has no trustworthy location, so the app sends
+            // none. Guard here too rather than trusting the client.
             capturedAtLocation:
-                typeof capturedLat === 'number' && typeof capturedLng === 'number'
-                    ? { lat: capturedLat, lng: capturedLng }
-                    : undefined,
+                photoSource === 'camera' && hasCoords ? { lat, lng } : undefined,
         });
 
         // -- Surface a fresh signed URL the mobile can show immediately
@@ -223,6 +236,7 @@ exports.uploadPhoto = async (req, res) => {
             photo: {
                 id: photo._id,
                 type: photo.type,
+                source: photo.source,
                 viewUrl,
                 capturedAt: photo.capturedAt,
             },
@@ -270,6 +284,7 @@ exports.listPhotos = async (req, res) => {
             photos.map(async (p) => ({
                 id: p._id,
                 type: p.type,
+                source: p.source || 'camera',
                 viewUrl: await firebaseStorage.getSignedUrl(p.storagePath, SIGNED_URL_MINUTES),
                 capturedAt: p.capturedAt,
                 capturedAtLocation: p.capturedAtLocation,
@@ -335,11 +350,15 @@ exports.adminListParkingPhotos = async (req, res) => {
                     photosForOrder.map(async (p) => ({
                         id: p._id,
                         type: p.type,
+                        // Support needs this most of all — it's the tab they
+                        // open when a customer disputes damage.
+                        source: p.source || 'camera',
                         viewUrl: await firebaseStorage.getSignedUrl(
                             p.storagePath,
                             SIGNED_URL_MINUTES
                         ),
                         capturedAt: p.capturedAt,
+                        capturedAtLocation: p.capturedAtLocation,
                         expiresAt: p.expiresAt,
                     }))
                 );

@@ -50,7 +50,23 @@ const OrderPhotoSchema = new mongoose.Schema({
     mimeType: { type: String, required: true },        // 'image/jpeg' typically
     fileSize: { type: Number },                         // bytes
 
-    // Captured server-side metadata for support / audit
+    // Where the image came from. A photo taken in-app is evidence of the
+    // car's condition at a known time and place; one picked out of the
+    // valet's library is not — it could be from any day, anywhere. In a
+    // damage dispute the two can't be weighed the same, so record which.
+    //
+    // 'camera' is the default because every photo uploaded before this
+    // field existed was camera-only — the app had no other option.
+    source: {
+        type: String,
+        enum: ['camera', 'library'],
+        default: 'camera',
+    },
+
+    // Captured server-side metadata for support / audit.
+    // `capturedAtLocation` is only meaningful for 'camera' photos; the app
+    // sends nothing for a library pick rather than stamping it with wherever
+    // the valet happened to be standing when they chose it.
     capturedAt: { type: Date, default: Date.now },
     capturedAtLocation: {
         lat: { type: Number },
