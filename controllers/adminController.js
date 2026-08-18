@@ -2,7 +2,7 @@ const Order = require('../models/Order');
 const User = require('../models/User');
 const Payment = require('../models/Payment');
 const FCMToken = require('../models/FCMToken');
-const { inferLegacyPlatform } = require('../services/signupPlatform');
+const { displayPlatform } = require('../services/signupPlatform');
 
 // Helper function to format time in hours, minutes and seconds
 const formatTime = (minutes) => {
@@ -810,8 +810,8 @@ exports.reactivateValet = async (req, res) => {
 
 // GET /api/admin/users — list all non-valet users for the dashboard's
 // Customers tab. Returns name, phone, signup date + time, the platform they
-// signed up on, and a totalRequests count (orders the customer has placed)
-// so the dashboard can show per-customer activity.
+// are on, and a totalRequests count (orders the customer has placed) so the
+// dashboard can show per-customer activity.
 exports.getCustomerList = async (req, res) => {
     try {
         // User has no createdAt field — signup time is the timestamp embedded in
@@ -832,8 +832,10 @@ exports.getCustomerList = async (req, res) => {
             if (row._id) countByCustomer[row._id.toString()] = row.count;
         });
 
-        // Which firebase uids ever registered a push token — the mobile-app
-        // fingerprint used to date accounts that predate `signupPlatform`.
+        // Which firebase uids ever registered a push token. Only the mobile
+        // app registers one, so this is the app fingerprint `displayPlatform`
+        // runs on — both for accounts that predate `signupPlatform` and for
+        // ones that were born on the web and later moved to the app.
         const uidsWithPushTokens = new Set(
             await FCMToken.distinct('firebaseUid')
         );
@@ -850,10 +852,13 @@ exports.getCustomerList = async (req, res) => {
                 type: c.isDoorman ? 'Enterprise' : 'Customer',
                 createdAt: c.createdAt || signedUpAt,
                 signedUpAt,
-                platform: recorded || inferLegacyPlatform(c, signedUpAt, uidsWithPushTokens),
-                // 'recorded' — the client told us at signup.
-                // 'inferred' — worked out afterwards from push tokens / signup date,
-                //              so the dashboard can mark it as a best guess.
+                platform: displayPlatform(c, signedUpAt, uidsWithPushTokens),
+                // Whether a signup platform was ever stored for this row —
+                // 'inferred' is what makes the dashboard draw a dashed outline.
+                // It is NOT a claim that `platform` above equals what was
+                // stored: a recorded 'web' account that has since registered a
+                // push token reports 'ios' and stays 'recorded', because the
+                // token is proof rather than a guess.
                 platformSource: recorded ? 'recorded' : 'inferred',
                 totalRequests: countByCustomer[c._id.toString()] || 0,
             };

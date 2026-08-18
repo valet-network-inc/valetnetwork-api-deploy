@@ -115,9 +115,49 @@ const inferLegacyPlatform = (customer, signedUpAt, uidsWithPushTokens) => {
     return 'web';
 };
 
+/**
+ * What the Customers tab should show for an account **today**.
+ *
+ * `signupPlatform` answers "where was this row born" and is frozen on purpose,
+ * so a customer who started on /park and later installed the app reads 'web'
+ * forever. Rishi's call 2026-08-18: the column should say iPhone for anyone who
+ * is actually on the app, whichever client happened to create the row.
+ *
+ * A push token is the proof. Only the mobile app registers one — both web
+ * clients deliberately send none — so a token under this account's firebase uid
+ * means the app ran on a real device as them. Only iOS has ever shipped, so app
+ * evidence resolves to 'ios'.
+ *
+ * Front-desk accounts keep 'business_web'. That is a different product surface,
+ * and the app is simply how a doorman uses it, so flipping them would empty the
+ * Business bucket without telling anyone anything new.
+ *
+ * With no token this falls back to the recorded value, then to the legacy guess.
+ *
+ * @param {{ firebaseUid?: string, signupPlatform?: string }} customer
+ * @param {Date} signedUpAt
+ * @param {Set<string>} uidsWithPushTokens
+ * @returns {'ios'|'android'|'web'|'business_web'}
+ */
+const displayPlatform = (customer, signedUpAt, uidsWithPushTokens) => {
+    const recorded = customer && customer.signupPlatform;
+
+    const hasApp = !!(
+        customer &&
+        customer.firebaseUid &&
+        uidsWithPushTokens &&
+        uidsWithPushTokens.has(customer.firebaseUid)
+    );
+
+    if (hasApp && recorded !== 'business_web') return 'ios';
+
+    return recorded || inferLegacyPlatform(customer, signedUpAt, uidsWithPushTokens);
+};
+
 module.exports = {
     resolveSignupPlatform,
     inferLegacyPlatform,
+    displayPlatform,
     PLATFORM_ALIASES,
     WEB_SIGNUP_EPOCH,
 };

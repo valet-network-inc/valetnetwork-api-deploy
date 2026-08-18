@@ -1,6 +1,7 @@
 const {
     resolveSignupPlatform,
     inferLegacyPlatform,
+    displayPlatform,
 } = require('../services/signupPlatform');
 
 // Real user agents, so the regexes are checked against what actually arrives
@@ -110,5 +111,69 @@ describe('inferLegacyPlatform', () => {
         expect(inferLegacyPlatform({}, RECENT, new Set())).toBe('web');
         expect(inferLegacyPlatform({ firebaseUid: 'uid-4' }, null, new Set())).toBe('web');
         expect(inferLegacyPlatform({ firebaseUid: 'uid-4' }, OLD, undefined)).toBe('ios');
+    });
+});
+
+describe('displayPlatform — what the Customers tab shows today', () => {
+    const OLD = new Date('2026-05-01T12:00:00.000Z');   // before any web client
+    const RECENT = new Date('2026-08-12T12:00:00.000Z'); // after both shipped
+    const ON_APP = new Set(['uid-app']);
+
+    // The whole point of the override: signup origin is frozen, so without this
+    // a customer who came in through /park and later installed the app reads
+    // 'web' forever. Brent Lukowski, 2026-08-18, is the case that found it.
+    it('says ios when a web signup has since registered a push token', () => {
+        expect(
+            displayPlatform(
+                { firebaseUid: 'uid-app', signupPlatform: 'web' },
+                RECENT,
+                ON_APP
+            )
+        ).toBe('ios');
+    });
+
+    it('leaves a web signup alone while it has no push token', () => {
+        expect(
+            displayPlatform(
+                { firebaseUid: 'uid-browser', signupPlatform: 'web' },
+                RECENT,
+                ON_APP
+            )
+        ).toBe('web');
+    });
+
+    it('keeps front-desk accounts on business_web even with the app installed', () => {
+        expect(
+            displayPlatform(
+                { firebaseUid: 'uid-app', signupPlatform: 'business_web' },
+                RECENT,
+                ON_APP
+            )
+        ).toBe('business_web');
+    });
+
+    it('passes an app signup straight through', () => {
+        expect(
+            displayPlatform(
+                { firebaseUid: 'uid-app', signupPlatform: 'ios' },
+                RECENT,
+                ON_APP
+            )
+        ).toBe('ios');
+    });
+
+    it('still falls back to the legacy guess when nothing was recorded', () => {
+        // no token, recent — the only remaining way in is a browser
+        expect(displayPlatform({ firebaseUid: 'uid-browser' }, RECENT, ON_APP)).toBe('web');
+        // no token, but older than either web client
+        expect(displayPlatform({ firebaseUid: 'uid-browser' }, OLD, ON_APP)).toBe('ios');
+        // token, nothing recorded
+        expect(displayPlatform({ firebaseUid: 'uid-app' }, RECENT, ON_APP)).toBe('ios');
+    });
+
+    it('survives missing pieces', () => {
+        expect(displayPlatform({}, RECENT, ON_APP)).toBe('web');
+        expect(displayPlatform({ firebaseUid: 'uid-app' }, RECENT, undefined)).toBe('web');
+        expect(displayPlatform(null, RECENT, ON_APP)).toBe('web');
     });
 });
