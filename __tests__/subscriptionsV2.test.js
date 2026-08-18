@@ -814,7 +814,11 @@ describe('away mode + advance scheduling', () => {
         expect(o.awayDays).toHaveLength(1);
         expect(new Date(o.asp_time).getTime()).toBe(new Date(o.pickUpTime).getTime() + 7 * DAY_MS);
         expect(o.paymentStatus).toBe('pending');
-        expect(o.totalAmount).toBe(3000);
+        // Server-priced, not the 3000 the fixture posts. The window is 7 days
+        // and the schedule has one weekly slot, so it is ONE move at aspCents.
+        // The old code billed the client's number here while setAwaySchedule
+        // reconciled against countAwayMoves — booking $30, refunding $15.
+        expect(o.totalAmount).toBe(1500);
     });
 
     it('rejects an away order whose return is before/too close to pickup, or beyond 30 days', async () => {

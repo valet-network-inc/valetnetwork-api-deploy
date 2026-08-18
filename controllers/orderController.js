@@ -4,6 +4,7 @@ const Order = require('../models/Order');
 const User = require('../models/User');
 const Event = require('../models/Event');
 const subscriptionService = require('../services/subscriptionService');
+const orderPricing = require('../services/orderPricing');
 const axios = require('axios');
 const stripeModule = require('stripe');
 const stripe = process.env.STRIPE_API_KEY ? stripeModule(process.env.STRIPE_API_KEY) : null;
@@ -18,6 +19,24 @@ const stripe = process.env.STRIPE_API_KEY ? stripeModule(process.env.STRIPE_API_
 // final price. Stripe's USD minimum charge is $0.50, so $1 is the smallest
 // round amount that always goes through.
 const AWAY_DEPOSIT_CENTS = 100;
+
+// A client quoting a different price than the server computed is either a
+// stale app reading old prices or someone editing the request. Both want a
+// human, so it goes to Slack when SLACK_WEBHOOK_URL is set. Fire-and-forget:
+// alerting must never be able to fail a booking.
+const notifyPriceMismatch = ({ customer, clientCents, serverCents, basis }) => {
+    const url = process.env.SLACK_WEBHOOK_URL;
+    if (!url) return;
+    const money = (c) => `$${(c / 100).toFixed(2)}`;
+    axios
+        .post(url, {
+            text:
+                `:rotating_light: Price mismatch on createOrder — charged the server price.\n` +
+                `customer \`${customer}\` · ${basis}\n` +
+                `client said ${money(clientCents)}, server says ${money(serverCents)}`,
+        })
+        .catch((err) => console.error('Slack price-mismatch alert failed:', err.message));
+};
 
 const OTP_EXPIRY_ORDER_CREATION = 30 * 24 * 60 * 60 * 1000; // 30 days
 const OTP_EXPIRY_RETURN_KEY = 30 * 24 * 60 * 60 * 1000; // 30 days
@@ -317,7 +336,11 @@ exports.createOrder = async (req, res) => {
         const subscription = req.subscription || null;
         let isEventValid = false;
         let validatedEvent = null;
-        let finalIsFreeService = isFreeService || false;
+        // Free service is decided here, never by the caller. This used to read
+        // `isFreeService || false`, so a client could post `isFreeService: true`
+        // and zero its own order — no event code, no subscription, no auth. A
+        // valid event code below is the only thing that turns it on.
+        let finalIsFreeService = false;
         let finalServiceType = serviceType || 'standard';
 
         // Validate event code if provided
@@ -362,7 +385,55 @@ exports.createOrder = async (req, res) => {
 
         // Determine final amount based on subscription coverage, event code,
         // or regular pricing.
-        let finalAmount = totalAmount || 0;
+        //
+        // The price is computed here from the customer's choices. It used to be
+        // `totalAmount || 0` — whatever the app posted went to Stripe verbatim,
+        // so an unauthenticated caller could park for 50 cents, and the same
+        // field feeds valetPayBaseCents, so an inflated one paid a valet 70% of
+        // an invented number. The client's figure is now only checked against
+        // ours, never charged.
+        const quote = await orderPricing.priceOrderCents({
+            orderType,
+            serviceType: finalServiceType,
+            aspMode,
+            carWatch,
+            duration,
+            awayMode,
+            awayService,
+            awayDays,
+            pickUpTime,
+            awayEndTime,
+        });
+
+        let finalAmount = quote.amountCents;
+        const quotedByClient = Number.isFinite(Number(totalAmount))
+            ? Math.round(Number(totalAmount))
+            : null;
+
+        // A mismatch means the customer saw a different number than we are
+        // about to charge. We charge ours, and say so loudly — a stale app
+        // reading old prices and a tampered request look identical from here,
+        // and both want a human.
+        if (quotedByClient !== null && quotedByClient !== finalAmount) {
+            console.warn('PRICE MISMATCH — charging server price', {
+                customer,
+                clientCents: quotedByClient,
+                serverCents: finalAmount,
+                basis: quote.basis,
+                orderType: orderType || 'parking',
+                serviceType: finalServiceType,
+                aspMode: !!aspMode,
+                carWatch: !!carWatch,
+                duration,
+            });
+            notifyPriceMismatch({
+                customer,
+                clientCents: quotedByClient,
+                serverCents: finalAmount,
+                basis: quote.basis,
+            });
+        }
+
         let paymentStatus = 'pending';
         let coverage = { covered: false };
 
@@ -505,7 +576,9 @@ exports.createOrder = async (req, res) => {
             isFreeService: finalIsFreeService,
             serviceType: finalServiceType,
             carWatch: !!carWatch,
-            carWatchAmount: Number.isFinite(carWatchAmount) ? carWatchAmount : 0,
+            // Server-derived, like totalAmount: the client's carWatchAmount is
+            // part of the same money record and was equally unchecked.
+            carWatchAmount: quote.carWatchCents,
             // Away orders ride the aspMode machinery (sweep reminders +
             // auto-return at asp_time) whatever service was picked.
             aspMode: awayMode ? true : aspMode || false,
