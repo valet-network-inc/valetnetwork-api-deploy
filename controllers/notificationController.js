@@ -76,9 +76,8 @@ exports.sendNotification = async (req, res) => {
                         title,
                         body,
                     },
-                    'content-available': 1,
                     'mutable-content': 1,
-                    sound: 'default',
+                    sound: 'valet-bell.caf',
                     badge: 1,
                 },
             },
@@ -300,9 +299,8 @@ exports.notifyClosestValets = async (req, res) => {
                             title,
                             body,
                         },
-                        'content-available': 1,
                         'mutable-content': 1,
-                        sound: 'default',
+                        sound: 'valet-bell.caf',
                         badge: 1,
                     },
                 },
@@ -378,7 +376,17 @@ exports.notifyClosestValets = async (req, res) => {
 };
 
 // Helper function to send push notification to a single user
-exports.sendPushNotification = async (firebaseUid, title, body, data = {}, directFcmToken = null) => {
+exports.sendPushNotification = async (
+    firebaseUid,
+    title,
+    body,
+    data = {},
+    directFcmToken = null,
+    sound = null
+) => {
+    // Bundled as ios/ValetNYC/valet-bell.caf. iOS falls back to silence if the
+    // file is missing from the bundle, so the two ship together.
+    const soundName = sound || 'valet-bell.caf';
     try {
         console.log('sendPushNotification called with firebaseUid:', firebaseUid, 'directFcmToken:', directFcmToken ? 'provided' : 'not provided');
         
@@ -429,9 +437,8 @@ exports.sendPushNotification = async (firebaseUid, title, body, data = {}, direc
                                     title,
                                     body,
                                 },
-                                'content-available': 1,
                                 'mutable-content': 1,
-                                sound: 'default',
+                                sound: soundName,
                                 badge: 1,
                             },
                         },
