@@ -20,6 +20,7 @@ const providerRecipient = require('../controllers/providerRecipientController');
 const orderPhotoController = require('../controllers/orderPhotoController');
 const adminNotification = require('../controllers/adminNotificationController');
 const parkingNoteController = require('../controllers/parkingNoteController');
+const aspSuspensionAdmin = require('../controllers/aspSuspensionAdminController');
 const requireAdminKey = require('../middleware/requireAdminKey');
 
 // Everything below this line needs the `x-admin-key` header. Only the four
@@ -27,6 +28,17 @@ const requireAdminKey = require('../middleware/requireAdminKey');
 // metrics, the valet roster, the payout queue and the parking photos readable
 // by anyone who knew the URL. The dashboard sends the key on every call.
 router.use(requireAdminKey);
+
+// --- NYC alternate-side suspension calendar ---------------------------
+// Paste the year's .ics (or the text out of the DOT PDF) once, then add snow
+// days as the city calls them. Both the free reminder and the subscription
+// scheduler read this, so an empty calendar means we confidently tell people
+// to move their car on Thanksgiving.
+router.get('/asp-suspensions', aspSuspensionAdmin.list);
+router.post('/asp-suspensions', aspSuspensionAdmin.create);
+router.post('/asp-suspensions/import', aspSuspensionAdmin.import);
+router.post('/asp-suspensions/check-311', aspSuspensionAdmin.check);
+router.delete('/asp-suspensions/:date', aspSuspensionAdmin.remove);
 
 // Cheap "is this key good?" probe for the dashboard's unlock screen. Does no
 // work beyond passing the gate above, so it can be called on every page load.

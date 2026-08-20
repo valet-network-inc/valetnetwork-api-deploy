@@ -174,6 +174,7 @@ app.use('/api/street-parking', require('./routes/streetParking'));
 app.use('/api/payment', require('./routes/payment'));
 app.use('/api/notification', require('./routes/notification'));
 app.use('/api/subscription', require('./routes/subscription'));
+app.use('/api/cleaning-schedule', require('./routes/cleaningSchedule'));
 app.use('/api/event', require('./routes/eventRoutes'));
 app.use('/api/key-transfer', require('./routes/keyTransfer'));
 app.use('/api/location', require('./routes/location'));

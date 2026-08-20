@@ -277,6 +277,54 @@ const UserSchema = new mongoose.Schema({
         error: { type: String },             // populated only on failure
         _id: false,
     }],
+
+    // --- Street-cleaning schedule (the free alarm) -----------------------
+    //
+    // Owned by the PERSON, not by a subscription. This is deliberate: the
+    // reminder is free and exists with or without a plan, the subscription
+    // scheduler reads its days from here, and cancelling a plan therefore
+    // leaves the reminders running instead of dropping the customer off a
+    // cliff. `Subscription.aspSchedule` is now a mirror kept for the admin
+    // dashboard and for older documents; this field is the source of truth.
+    cleaningSchedule: {
+        address: {
+            streetAddress: { type: String },
+            lat: { type: Number },
+            lng: { type: Number },
+        },
+        // Same shape as Subscription.aspSchedule.days so the two can be
+        // copied across without translation. 0 = Sunday (JS convention).
+        days: [
+            {
+                _id: false,
+                weekday: { type: Number, min: 0, max: 6 },
+                hour: { type: Number, min: 0, max: 23 },
+                minute: { type: Number, min: 0, max: 59 },
+            },
+        ],
+        // How long before the sweep the customer wants waking. The app
+        // schedules a LOCAL notification off this, so it fires with no
+        // network and costs nothing.
+        reminderLeadMin: { type: Number, default: 60 },
+        status: {
+            type: String,
+            enum: ['active', 'paused'],
+            default: 'active',
+        },
+        // null while paused means "until I turn it back on".
+        pausedUntil: { type: Date, default: null },
+        source: {
+            type: String,
+            enum: ['manual', 'from_orders', 'subscription'],
+            default: 'manual',
+        },
+        updatedAt: { type: Date },
+    },
+
+    // Set when a customer waves away the "we already know your cleaning day"
+    // suggestion. Without this the prompt would come back every launch, which
+    // is exactly the kind of nagging that gets an app deleted.
+    cleaningScheduleSuggestionDismissedAt: { type: Date },
 });
 
 module.exports = mongoose.model('User', UserSchema);

@@ -15,6 +15,13 @@
 //      bookings count against it).
 //   5. A subscriber with any live order is skipped and retried next tick
 //      until the window closes — the car is already in our care.
+//   6. Days the city has suspended are never booked, and the customer is
+//      credited that day's share of the plan instead.
+//
+// The days themselves come from `User.cleaningSchedule` — the schedule belongs
+// to the person, not the plan, so the free reminder and the paid move can
+// never disagree. `Subscription.aspSchedule` remains as a fallback for any
+// document written before that move.
 //
 // An occurrence fires inside [sweepStart - LEAD, sweepStart + LATE_GRACE].
 // The order's pickUpTime is sweepStart - PICKUP_HEADSTART so the valet has
@@ -32,6 +39,8 @@ const {
 } = require('./subscriptionService');
 const { ASP_MOVES_PER_WEEK } = require('./subscriptionPlans');
 const { nyDateKey, nextNyOccurrence } = require('./nyTime');
+const { getSuspension } = require('./aspSuspensions');
+const { creditSuspendedDay } = require('./subscriptionCredits');
 
 const LEAD_MS = 45 * 60 * 1000; // start trying 45 min before the sweep
 const LATE_GRACE_MS = 5 * 60 * 1000; // stop trying 5 min after it starts
@@ -102,9 +111,23 @@ async function bookOccurrence(sub, day, occurrence, { io, notify, now }) {
     const used = await aspMovesUsedThisWeek(sub, now);
     if (used >= ASP_MOVES_PER_WEEK) return { key, outcome: 'weekly_cap_reached' };
 
-    const address = sub.aspSchedule && sub.aspSchedule.address;
+    const address = scheduleFor(sub).address;
     if (!address || typeof address.lat !== 'number' || typeof address.lng !== 'number') {
         return { key, outcome: 'no_schedule_address' };
+    }
+
+    // The city suspends alternate side ~40 days a year. Dispatching on one of
+    // those costs a valet fee for a move nobody needed, so skip it and hand
+    // the customer back that day's share of what they paid.
+    //
+    // Note the fail direction: getSuspension() returns null on any error, so a
+    // database blip books the move rather than skipping it. Booking needlessly
+    // costs us one fee; skipping wrongly costs the customer a $65 ticket, which
+    // is the one thing the plan exists to prevent.
+    const suspension = await getSuspension(nyDateKey(occurrence));
+    if (suspension) {
+        await creditSuspendedDay(sub, occurrence, suspension);
+        return { key, outcome: 'suspended', reason: suspension.reason };
     }
 
     const pickUpTime = new Date(occurrence.getTime() - PICKUP_HEADSTART_MS);
@@ -197,17 +220,55 @@ async function bookOccurrence(sub, day, occurrence, { io, notify, now }) {
 
 // One scheduler pass. Runs every minute from server.js; `now` and `notify`
 // are injectable for tests.
+/**
+ * The days this subscription should book, read from the customer's own
+ * schedule and falling back to the copy stored on the subscription.
+ *
+ * Attached to the sub as `_resolvedSchedule` by the tick so bookOccurrence can
+ * see the same answer without a second query.
+ */
+function scheduleFor(sub) {
+    return sub._resolvedSchedule || sub.aspSchedule || { days: [] };
+}
+
 async function tick({ io = null, now = new Date(), notify = null } = {}) {
     const results = [];
     try {
-        const subs = await Subscription.find({
-            status: 'active',
-            'aspSchedule.days.0': { $exists: true },
-        });
+        // Anyone active — schedule presence is checked per subscriber below,
+        // because it may live on the user rather than on the subscription.
+        const subs = await Subscription.find({ status: 'active' });
+
+        const User = require('../models/User');
 
         for (const sub of subs) {
             if (!isEntitled(sub, now)) continue; // stale period → webhook lag or lapse; never book
-            for (const day of sub.aspSchedule.days) {
+
+            // User.cleaningSchedule wins; the subscription's copy is the
+            // fallback for documents written before the schedule moved.
+            let resolved = null;
+            try {
+                const owner = await User.findById(sub.user).select('cleaningSchedule').lean();
+                const cs = owner && owner.cleaningSchedule;
+                if (cs && (cs.days || []).length) {
+                    // A customer who paused their schedule paused their moves.
+                    const paused =
+                        cs.status === 'paused' &&
+                        (!cs.pausedUntil || new Date(cs.pausedUntil) > now);
+                    if (paused) {
+                        results.push({ subscriptionId: sub._id, outcome: 'schedule_paused' });
+                        continue;
+                    }
+                    resolved = cs;
+                }
+            } catch (err) {
+                console.error('Auto-ASP: could not read user schedule, falling back:', err.message);
+            }
+            sub._resolvedSchedule = resolved || sub.aspSchedule;
+
+            const days = (sub._resolvedSchedule && sub._resolvedSchedule.days) || [];
+            if (!days.length) continue;
+
+            for (const day of days) {
                 try {
                     const occurrence = dueOccurrence(day, now);
                     if (!occurrence) continue;
@@ -231,6 +292,7 @@ async function tick({ io = null, now = new Date(), notify = null } = {}) {
 
 module.exports = {
     tick,
+    scheduleFor,
     dueOccurrence,
     occurrenceKey,
     bookOccurrence,

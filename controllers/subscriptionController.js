@@ -20,6 +20,7 @@
 const dotenv = require('dotenv');
 dotenv.config({ path: `.env.${process.env.NODE_ENV}` });
 const Subscription = require('../models/Subscription');
+const { adoptFromSubscription } = require('../services/cleaningSchedule');
 const User = require('../models/User');
 const Order = require('../models/Order');
 const stripeModule = require('stripe');
@@ -261,6 +262,12 @@ exports.createSubscription = async (req, res) => {
             ...(homeAddress ? { homeAddress } : {}),
         });
         await sub.save();
+
+        // The schedule belongs to the person, not to the plan. Someone who
+        // subscribes without ever touching the home screen still ends up with
+        // a free street-cleaning alarm on the same days — and it keeps firing
+        // if they later cancel.
+        await adoptFromSubscription(userId, sub.aspSchedule);
 
         const invoice = stripeSub.latest_invoice;
         const paymentIntent = invoice && typeof invoice === 'object' ? invoice.payment_intent : null;
@@ -583,6 +590,8 @@ exports.updateSchedule = async (req, res) => {
                 });
             }
             sub.aspSchedule = { ...aspSchedule, source: 'edited' };
+            // Same record, edited from the other end.
+            await adoptFromSubscription(userId, sub.aspSchedule);
         }
         if (homeAddress) {
             const homeError = validateAddress(homeAddress, 'homeAddress');
@@ -625,12 +634,34 @@ exports.updateSchedule = async (req, res) => {
 };
 
 // GET /api/subscription/prefill/:userId
-// Seed the onboarding form from the customer's most recent manual
-// street-cleaning booking, when one exists. Customer input always wins —
-// this only pre-fills the form for confirmation/editing.
+// Seed the onboarding form so the subscription wizard's days step arrives
+// pre-answered.
+//
+// The customer's own cleaning schedule is the answer whenever it exists —
+// they set it on the home screen and it is the same record the scheduler
+// books against, so the wizard should be confirming it rather than asking
+// again. Guessing from an old booking is now only the fallback for someone
+// who has never set one.
 exports.getPrefill = async (req, res) => {
     const { userId } = req.params;
     try {
+        const owner = await User.findById(userId).select('cleaningSchedule').lean();
+        const cs = owner && owner.cleaningSchedule;
+        if (cs && (cs.days || []).length && cs.address) {
+            return res.status(200).json({
+                success: true,
+                prefill: {
+                    address: cs.address,
+                    // `day` kept for the existing app build, which reads a
+                    // single day; `days` is the full schedule.
+                    day: cs.days[0],
+                    days: cs.days,
+                    reminderLeadMin: cs.reminderLeadMin ?? 60,
+                    source: 'cleaning_schedule',
+                },
+            });
+        }
+
         const lastAsp = await Order.findOne({
             customer: userId,
             aspMode: true,
