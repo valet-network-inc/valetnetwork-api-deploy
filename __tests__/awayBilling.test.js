@@ -111,7 +111,14 @@ const bookAndPayDeposit = async (user) => {
             pickUpTime: new Date(Date.now() + DAY_MS).toISOString(),
             awayMode: true,
             awayService: 'moves',
-            awayEndTime: new Date(Date.now() + 9 * DAY_MS).toISOString(),
+            // Exactly seven days, so each weekday falls inside the trip
+            // ONCE no matter which day the suite runs. The window used to be
+            // eight days, which meant one of the two chosen sweep days landed
+            // twice on some dates and once on others — the assertions below
+            // hardcode the price of one Tuesday and one Friday, so the suite
+            // passed Monday and failed Thursday. countAwayMoves was right the
+            // whole time; the fixture was ambiguous.
+            awayEndTime: new Date(Date.now() + 8 * DAY_MS).toISOString(),
             awayDays: [],
             totalAmount: 4500, // client guess — server must ignore it
             orderType: 'parking',

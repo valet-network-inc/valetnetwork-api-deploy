@@ -25,7 +25,7 @@ const User = require('../models/User');
 const Order = require('../models/Order');
 const stripeModule = require('stripe');
 const stripe = process.env.STRIPE_API_KEY ? stripeModule(process.env.STRIPE_API_KEY) : null;
-const { PLANS, getPlan, priceFor } = require('../services/subscriptionPlans');
+const { PLANS, getPlan, priceFor , SUSPENSION_GUARANTEE } = require('../services/subscriptionPlans');
 const {
     isEntitled,
     buildStatusPayload,
@@ -119,6 +119,8 @@ exports.getPlans = async (req, res) => {
     res.status(200).json({
         success: true,
         plans,
+        suspensionGuarantee: SUSPENSION_GUARANTEE,
+
         cancelPolicy:
             'Cancel anytime — you are refunded for services not rendered, priced at regular per-park rates.',
     });
