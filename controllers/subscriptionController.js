@@ -1126,6 +1126,16 @@ async function applyInvoicePaid(invoice) {
     if (stripeSub && ['canceled', 'incomplete_expired'].includes(stripeSub.status)) {
         return applySubscriptionUpdated(stripeSub, true);
     }
+    // A free month opens with a $0 invoice that Stripe marks paid on the
+    // spot. That invoice is not a customer agreeing to anything: until a card
+    // is behind the plan, an abandoned payment sheet would otherwise buy a
+    // month of valet service with one tap and no way to charge for month two.
+    if (sub.status === 'incomplete' && stripeSub && stripeSub.status === 'trialing') {
+        const ready = await ensureTrialPaymentMethod(stripeSub, { sub });
+        if (!ready) {
+            return { handled: true, subscriptionId: sub._id, ignored: 'trial_awaiting_card' };
+        }
+    }
     await activateLocal(sub, invoice, stripeSub);
     return { handled: true, subscriptionId: sub._id };
 }
@@ -1187,6 +1197,15 @@ async function applySubscriptionUpdated(stripeSub, isDeletion = false) {
             stripeSub = await stripe.subscriptions.retrieve(stripeSub.id);
         } catch (err) {
             console.error('subscription.updated: refetch failed', stripeSub.id, err.message);
+        }
+    }
+
+    // Same rule as invoice.paid: a trial that has never had a card behind it
+    // stays incomplete, however Stripe describes it.
+    if (!isDeletion && sub.status === 'incomplete' && stripeSub.status === 'trialing') {
+        const ready = await ensureTrialPaymentMethod(stripeSub, { sub });
+        if (!ready) {
+            return { handled: true, subscriptionId: sub._id, ignored: 'trial_awaiting_card' };
         }
     }
 
