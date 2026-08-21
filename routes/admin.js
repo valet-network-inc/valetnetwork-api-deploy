@@ -21,6 +21,7 @@ const orderPhotoController = require('../controllers/orderPhotoController');
 const adminNotification = require('../controllers/adminNotificationController');
 const parkingNoteController = require('../controllers/parkingNoteController');
 const aspSuspensionAdmin = require('../controllers/aspSuspensionAdminController');
+const adminSubscription = require('../controllers/adminSubscriptionController');
 const requireAdminKey = require('../middleware/requireAdminKey');
 
 // Everything below this line needs the `x-admin-key` header. Only the four
@@ -82,6 +83,13 @@ router.delete('/provider-recipients/:id', providerRecipient.remove);
 router.get('/users', getCustomerList);
 // Every service request ever created, for the "Services" tab.
 router.get('/services', getServiceList);
+
+// --- Subscribers ------------------------------------------------------
+// Every plan ever bought, with the customer joined in and the roll-ups the
+// console would otherwise recompute per filter. Stripe knows the billing;
+// this is the only place the billing, the schedule, the covered orders and
+// the suspension credits sit on one row.
+router.get('/subscriptions', adminSubscription.getSubscriptionOverview);
 // Where paying customers stop — built from server-side stamps only.
 router.get('/checkout-funnel', getCheckoutFunnel);
 
