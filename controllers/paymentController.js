@@ -10,6 +10,7 @@ const axios = require('axios');
 const admin = require('firebase-admin');
 const {
     applyStripeSubscriptionEvent,
+    applyTrialCardCheckPaid,
     SUBSCRIPTION_EVENT_TYPES,
 } = require('./subscriptionController');
 
@@ -660,6 +661,18 @@ exports.handleStripeWebhook = async (req, res) => {
             }
 
             const paymentIntent = event.data.object;
+
+            // A free month's dollar card check belongs to a subscription, not
+            // to an order. It must never reach the guest-payment matchers
+            // below, and paying it is what starts the plan.
+            if (paymentIntent.metadata && paymentIntent.metadata.purpose === 'trial_card_check') {
+                const result = await applyTrialCardCheckPaid(paymentIntent);
+                console.log('Trial card check paid:', paymentIntent.id, JSON.stringify(result));
+                return res.status(200).json({
+                    success: true,
+                    message: 'Webhook processed successfully',
+                });
+            }
 
             // Subscription-invoice PaymentIntents carry no order metadata and
             // MUST NOT fall through to the guest-payment matchers below — the

@@ -38,6 +38,12 @@ const {
 } = require('../services/subscriptionPromos');
 const { nyClock } = require('../services/nyTime');
 
+// A free month needs a card behind it, and an app build that can only open a
+// payment sheet cannot save a card without charging something. Stripe's floor
+// is 50 cents; a dollar is the same nominal check the away-mode deposit uses,
+// and it goes straight back the moment the plan starts.
+const TRIAL_CARD_CHECK_CENTS = 100;
+
 // Must match the version paymentController/extensionController use — the
 // mobile PaymentSheet's saved-card listing breaks on a mismatch.
 const EPHEMERAL_KEY_API_VERSION = '2024-06-20';
@@ -129,13 +135,27 @@ async function savedPaymentMethodId(stripeCustomerId) {
 // sheet's SetupIntent instead. Stripe attaches it to the customer; this makes
 // it the subscription's card so the first real invoice has something to
 // charge. Returns true once the plan has a card behind it.
-async function ensureTrialPaymentMethod(stripeSub, { allowSavedCard = false } = {}) {
+async function ensureTrialPaymentMethod(stripeSub, { sub = null, allowSavedCard = false } = {}) {
     if (!stripe || !stripeSub) return false;
     if (stripeSub.default_payment_method) return true;
     let pmId = null;
     const psi = stripeSub.pending_setup_intent;
     if (psi && typeof psi === 'object' && psi.status === 'succeeded' && psi.payment_method) {
         pmId = typeof psi.payment_method === 'string' ? psi.payment_method : psi.payment_method.id;
+    }
+    // The dollar card check: its card is the one the customer just entered.
+    if (!pmId && sub && sub.trialDepositPaymentIntentId) {
+        try {
+            const deposit = await stripe.paymentIntents.retrieve(sub.trialDepositPaymentIntentId);
+            if (deposit.status === 'succeeded' && deposit.payment_method) {
+                pmId =
+                    typeof deposit.payment_method === 'string'
+                        ? deposit.payment_method
+                        : deposit.payment_method.id;
+            }
+        } catch (err) {
+            console.error('trial deposit lookup failed:', err.message);
+        }
     }
     // Falling back to a card on file only makes sense while the customer is
     // still in the purchase they started. A card they save weeks later on
@@ -153,6 +173,27 @@ async function ensureTrialPaymentMethod(stripeSub, { allowSavedCard = false } = 
     } catch (err) {
         console.error('ensureTrialPaymentMethod error:', err.message);
         return false;
+    }
+}
+
+// The dollar card check goes back as soon as the free month is running. Best
+// effort by design: a refund that fails must never stop the plan from
+// starting, and the next status call tries again.
+async function refundTrialDeposit(sub) {
+    if (!stripe || !sub || !sub.trialDepositPaymentIntentId || sub.trialDepositRefundedAt) return;
+    try {
+        await stripe.refunds.create({ payment_intent: sub.trialDepositPaymentIntentId });
+        sub.trialDepositRefundedAt = new Date();
+        await sub.save();
+        console.log(`Refunded trial card check for subscription ${sub._id}`);
+    } catch (err) {
+        // Already refunded on Stripe's side is a success as far as we care.
+        if (err && err.code === 'charge_already_refunded') {
+            sub.trialDepositRefundedAt = new Date();
+            await sub.save();
+            return;
+        }
+        console.error('refundTrialDeposit error:', err.message);
     }
 }
 
@@ -356,19 +397,11 @@ exports.createSubscription = async (req, res) => {
         }
         const isTrial = !!promo && promo.kind === 'free_trial';
 
-        // A free month still needs a card behind it for the month after. If
-        // one is already saved from a park, the plan starts with no sheet at
-        // all; otherwise the app confirms a SetupIntent. An app build too old
-        // to present a setup sheet is told to update rather than being handed
-        // a trial that can never convert.
+        // A free month still needs a card behind it for the month after. A
+        // card already saved from a park starts the plan with no sheet at
+        // all; otherwise the customer enters one — as a SetupIntent where the
+        // app can present that, and as a refunded dollar where it cannot.
         const trialCardId = isTrial ? await savedPaymentMethodId(stripeCustomerId) : null;
-        if (isTrial && !trialCardId && !supportsSetupIntent) {
-            return res.status(400).json({
-                success: false,
-                message:
-                    'Update the app from the App Store to start your free month — this version cannot add a card without a charge.',
-            });
-        }
 
         const stripeSub = await stripe.subscriptions.create({
             customer: stripeCustomerId,
@@ -451,30 +484,65 @@ exports.createSubscription = async (req, res) => {
                     subscription: await buildStatusPayload(sub),
                 });
             }
-            const setupIntent = stripeSub.pending_setup_intent;
-            const setupSecret =
-                setupIntent && typeof setupIntent === 'object' ? setupIntent.client_secret : null;
-            if (!setupSecret) {
-                return res.status(500).json({
-                    success: false,
-                    message: `Free month started but no card step available (status ${stripeSub.status})`,
-                });
-            }
             const trialEphemeralKey = await stripe.ephemeralKeys.create(
                 { customer: stripeCustomerId },
                 { apiVersion: EPHEMERAL_KEY_API_VERSION }
             );
+            const setupIntent = stripeSub.pending_setup_intent;
+            const setupSecret =
+                supportsSetupIntent && setupIntent && typeof setupIntent === 'object'
+                    ? setupIntent.client_secret
+                    : null;
+            if (setupSecret) {
+                return res.status(201).json({
+                    success: true,
+                    status: 'trialing',
+                    // The app opens the sheet in setup mode on this: nothing
+                    // is charged, the card is only saved.
+                    mode: 'setup',
+                    subscriptionId: sub._id,
+                    stripeSubscriptionId: stripeSub.id,
+                    setupIntentClientSecret: setupSecret,
+                    customerId: stripeCustomerId,
+                    customerEphemeralKeySecret: trialEphemeralKey.secret,
+                    amountCents: 0,
+                    trial: trialPayload,
+                });
+            }
+
+            // Older builds can only open a payment sheet, so the card is
+            // verified with a dollar that comes straight back once the plan
+            // is running. The sheet's own Apple Pay works on this unchanged.
+            const deposit = await stripe.paymentIntents.create({
+                amount: TRIAL_CARD_CHECK_CENTS,
+                currency: 'usd',
+                automatic_payment_methods: { enabled: true },
+                customer: stripeCustomerId,
+                setup_future_usage: 'off_session',
+                description: `${promo.code} — card check, refunded when your free month starts`,
+                metadata: {
+                    // The webhook keys off this: a card check must never fall
+                    // through to the order/guest payment matchers.
+                    purpose: 'trial_card_check',
+                    userId: user._id.toString(),
+                    subscriptionId: sub._id.toString(),
+                    promoCode: promo.code,
+                },
+            });
+            sub.trialDepositPaymentIntentId = deposit.id;
+            await sub.save();
+
             return res.status(201).json({
                 success: true,
-                status: 'trialing',
-                // The app opens the sheet in setup mode on this.
-                mode: 'setup',
+                status: 'incomplete',
+                mode: 'card_check',
                 subscriptionId: sub._id,
                 stripeSubscriptionId: stripeSub.id,
-                setupIntentClientSecret: setupSecret,
+                clientSecret: deposit.client_secret,
                 customerId: stripeCustomerId,
                 customerEphemeralKeySecret: trialEphemeralKey.secret,
-                amountCents: 0,
+                amountCents: TRIAL_CARD_CHECK_CENTS,
+                cardCheckCents: TRIAL_CARD_CHECK_CENTS,
                 trial: trialPayload,
             });
         }
@@ -553,10 +621,14 @@ exports.getSubscriptionStatus = async (req, res) => {
                     // it — otherwise an abandoned payment sheet would hand
                     // out a month of valet service and no way to convert it.
                     const ready = await ensureTrialPaymentMethod(stripeSub, {
+                        sub,
                         allowSavedCard:
                             !!sub.createdAt && Date.now() - sub.createdAt.getTime() < 24 * 60 * 60 * 1000,
                     });
-                    if (ready) await activateLocal(sub, null, stripeSub);
+                    if (ready) {
+                        await activateLocal(sub, null, stripeSub);
+                        await refundTrialDeposit(sub);
+                    }
                 } else if (stripeSub.status === 'active') {
                     await activateLocal(sub, null, stripeSub);
                 } else if (['canceled', 'incomplete_expired'].includes(stripeSub.status)) {
@@ -671,6 +743,9 @@ exports.cancelSubscription = async (req, res) => {
                 console.error('Stripe cancel error:', cancelErr.message);
             }
         }
+
+        // A card check that never made it back goes back now.
+        await refundTrialDeposit(sub);
 
         sub.status = 'cancelled';
         sub.cancelledAt = new Date();
@@ -1146,6 +1221,34 @@ async function applySubscriptionUpdated(stripeSub, isDeletion = false) {
     console.log(`Subscription ${sub._id} → ${mapped} (stripe ${stripeSub.status})`);
     return { handled: true, subscriptionId: sub._id };
 }
+
+// payment_intent.succeeded for a free month's dollar card check. The app's
+// status poll does the same work, but a customer who closes the app the
+// second the sheet clears should still come back to a running plan.
+exports.applyTrialCardCheckPaid = async (paymentIntent) => {
+    const subId = paymentIntent.metadata && paymentIntent.metadata.subscriptionId;
+    if (!subId) return { handled: false, reason: 'no_subscription_id' };
+    const sub = await Subscription.findById(subId);
+    if (!sub) return { handled: false, reason: 'unknown_subscription' };
+    if (sub.status === 'cancelled') return { handled: true, ignored: 'terminal' };
+    if (!stripe || !sub.stripeSubscriptionId) return { handled: false, reason: 'no_stripe' };
+    try {
+        const stripeSub = await stripe.subscriptions.retrieve(sub.stripeSubscriptionId, {
+            expand: ['pending_setup_intent'],
+        });
+        if (!['trialing', 'active'].includes(stripeSub.status)) {
+            return { handled: false, reason: `stripe_status_${stripeSub.status}` };
+        }
+        const ready = await ensureTrialPaymentMethod(stripeSub, { sub });
+        if (!ready) return { handled: false, reason: 'no_payment_method' };
+        await activateLocal(sub, null, stripeSub);
+        await refundTrialDeposit(sub);
+        return { handled: true, subscriptionId: sub._id };
+    } catch (err) {
+        console.error('applyTrialCardCheckPaid error:', err.message);
+        return { handled: false, reason: err.message };
+    }
+};
 
 // Entry point for paymentController's webhook switch.
 async function applyStripeSubscriptionEvent(event) {

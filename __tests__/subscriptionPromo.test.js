@@ -212,6 +212,31 @@ describe('checking a code before subscribing', () => {
 });
 
 // ---------------------------------------------------------------------------
+// The dollar card check (older app builds)
+// ---------------------------------------------------------------------------
+
+describe('the card check that starts a free month', () => {
+    it('does nothing for a subscription it cannot find', async () => {
+        const out = await subscriptionController.applyTrialCardCheckPaid({
+            metadata: { purpose: 'trial_card_check', subscriptionId: new mongoose.Types.ObjectId().toString() },
+        });
+        expect(out.handled).toBe(false);
+        expect(out.reason).toBe('unknown_subscription');
+    });
+
+    it('never revives a cancelled subscription', async () => {
+        const user = await makeCustomer();
+        const sub = await makeSub(user, { status: 'cancelled', promoCode: 'HANDSFREE' });
+        const out = await subscriptionController.applyTrialCardCheckPaid({
+            metadata: { purpose: 'trial_card_check', subscriptionId: sub._id.toString() },
+        });
+        expect(out.ignored).toBe('terminal');
+        const after = await Subscription.findById(sub._id);
+        expect(after.status).toBe('cancelled');
+    });
+});
+
+// ---------------------------------------------------------------------------
 // Living inside the free month
 // ---------------------------------------------------------------------------
 

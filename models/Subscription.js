@@ -84,6 +84,15 @@ const SubscriptionSchema = new mongoose.Schema(
         trialEndsAt: {
             type: Date,
         },
+        // Older app builds can only open a payment sheet, never a card-save
+        // sheet, so a free month verifies the card with a $1 charge that is
+        // refunded the moment the plan starts. These two track it.
+        trialDepositPaymentIntentId: {
+            type: String,
+        },
+        trialDepositRefundedAt: {
+            type: Date,
+        },
         // First time this plan went live. The marker for "this customer has
         // had a plan before", which a first-plan-only promo checks.
         activatedAt: {
