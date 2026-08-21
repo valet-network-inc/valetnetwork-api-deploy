@@ -2181,31 +2181,46 @@ exports.updateCarLocation = async (req, res) => {
         //     });
         // }
 
-        // Generate new OTP (6-digit code)
-        const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
-        const otpCreatedAt = new Date();
-        const otpExpiresAt = new Date(otpCreatedAt.getTime() + OTP_EXPIRY_PARKING_LOCATION);
-        const parkedAt = new Date();
+        // Same rule as updateOrder: only the FIRST park is a park. A valet
+        // moving a car they already parked must not silently change the
+        // return-key code the customer is holding, un-verify a handoff that
+        // already happened, or restamp parkedAt.
+        const existingOtp = order.otp;
+        const hasLiveReturnKeyOtp =
+            existingOtp &&
+            existingOtp.code &&
+            existingOtp.type === 'return_key' &&
+            (existingOtp.verified ||
+                (existingOtp.expiresAt && new Date(existingOtp.expiresAt) > new Date()));
 
-        const updatedOrder = await Order.findByIdAndUpdate(
-            orderId,
-            { 
-                parkingLocation,
-                parkedAt: parkedAt,
-                otp: {
-                    code: otpCode,
-                    createdAt: otpCreatedAt,
-                    expiresAt: otpExpiresAt,
-                    verified: false,
-                    type: 'return_key',
-                }
-            },
-            { new: true }
-        );
+        const changes = { parkingLocation };
+        let otpExpiresAt = existingOtp && existingOtp.expiresAt;
+        if (!hasLiveReturnKeyOtp) {
+            // Generate new OTP (6-digit code)
+            const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+            const otpCreatedAt = new Date();
+            otpExpiresAt = new Date(otpCreatedAt.getTime() + OTP_EXPIRY_PARKING_LOCATION);
+            changes.otp = {
+                code: otpCode,
+                createdAt: otpCreatedAt,
+                expiresAt: otpExpiresAt,
+                verified: false,
+                type: 'return_key',
+            };
+        }
+        if (!order.parkedAt) {
+            changes.parkedAt = new Date();
+        }
+
+        const updatedOrder = await Order.findByIdAndUpdate(orderId, changes, {
+            new: true,
+        });
 
         const orderData = updatedOrder.toObject();
-        // Don't send OTP code to valet, only to customer
-        const orderForValet = { ...orderData };
+        // Don't send the OTP code to the valet — only to the customer. The
+        // spread is shallow, so `otp` has to be re-made or deleting the code
+        // strips it out of the customer's copy too.
+        const orderForValet = { ...orderData, otp: { ...(orderData.otp || {}) } };
         delete orderForValet.otp.code;
 
         // Removed 2026-08-06: this broadcast went to EVERY connected socket,
@@ -2213,23 +2228,27 @@ exports.updateCarLocation = async (req, res) => {
         // same payload to the only two parties that act on it, and the clients
         // ignore updates for orders that are not their own. Keeping it meant
         // handing every listener the full order document.
-        req.io.to(order.customer.toString()).emit('orderUpdated', {
-            ...orderData,
-            type: 'PARKING_LOCATION_UPDATE',
-        });
-        req.io.to(order.valet.toString()).emit('orderUpdated', {
-            ...orderForValet,
-            type: 'PARKING_LOCATION_UPDATE',
-        });
+        if (order.customer) {
+            req.io.to(order.customer.toString()).emit('orderUpdated', {
+                ...orderData,
+                type: 'PARKING_LOCATION_UPDATE',
+            });
+        }
+        if (order.valet) {
+            req.io.to(order.valet.toString()).emit('orderUpdated', {
+                ...orderForValet,
+                type: 'PARKING_LOCATION_UPDATE',
+            });
+        }
 
         res.status(200).json({
             success: true,
-            message: 'Car location updated successfully. OTP generated.',
+            message: 'Car location updated successfully.',
             order: {
                 ...orderData,
                 otp: {
                     expiresAt: otpExpiresAt,
-                    verified: false,
+                    verified: !!(updatedOrder.otp && updatedOrder.otp.verified),
                     // Don't send code in response
                 }
             },

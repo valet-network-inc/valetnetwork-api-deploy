@@ -155,6 +155,46 @@ describe('parking a car, then moving it', () => {
     });
 });
 
+describe('the guest-flow endpoint follows the same rule', () => {
+    const updateCar = async (orderId, parkingLocation) => {
+        const req = { body: { orderId: String(orderId), parkingLocation }, io: mockIo() };
+        const res = mockRes();
+        await orderController.updateCarLocation(req, res);
+        return { req, res };
+    };
+
+    test('the first call mints the return-key code, the second leaves it alone', async () => {
+        const customer = await makeUser();
+        const valet = await makeUser(true);
+        const order = await makeAwayOrder(customer._id, valet._id);
+
+        await updateCar(order._id, SPOT_A);
+        const first = await Order.findById(order._id);
+        expect(first.otp.type).toBe('return_key');
+        expect(first.otp.code).toMatch(/^\d{6}$/);
+
+        await updateCar(order._id, SPOT_B);
+        const second = await Order.findById(order._id);
+        expect(second.parkingLocation.streetAddress).toBe(SPOT_B.streetAddress);
+        expect(second.otp.code).toBe(first.otp.code);
+        expect(second.parkedAt.getTime()).toBe(first.parkedAt.getTime());
+    });
+
+    test('the customer still gets the code even though the valet does not', async () => {
+        const customer = await makeUser();
+        const valet = await makeUser(true);
+        const order = await makeAwayOrder(customer._id, valet._id);
+
+        const { req } = await updateCar(order._id, SPOT_A);
+        const toCustomer = req.io.emits.find((e) => e.room === String(customer._id));
+        const toValet = req.io.emits.find((e) => e.room === String(valet._id));
+        // A shallow spread shared one otp object between the two payloads, so
+        // hiding the code from the valet hid it from the customer as well.
+        expect(toCustomer.payload.otp.code).toMatch(/^\d{6}$/);
+        expect(toValet.payload.otp.code).toBeUndefined();
+    });
+});
+
 describe('telling the phones', () => {
     test('the update lands in the customer and valet rooms, by id', async () => {
         const customer = await makeUser();
