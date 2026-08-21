@@ -88,6 +88,11 @@ describe('admin subscriptions overview', () => {
         expect(data.summary.mrrCents).toBe(0);
         expect(data.summary.byTier).toHaveLength(3);
         expect(data.summary.growth).toHaveLength(6);
+        // Buckets end on the New York month. Render runs UTC, so on the 1st
+        // between midnight and 4am the server's own month is already the next
+        // one and the strip would show a month New York has not reached.
+        const nyMonth = require('../services/nyTime').nyDateKey(new Date()).slice(0, 7);
+        expect(data.summary.growth[5].month).toBe(nyMonth);
     });
 
     it('normalises weekly plans to a monthly figure before adding them up', async () => {

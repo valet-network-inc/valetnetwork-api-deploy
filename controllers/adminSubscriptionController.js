@@ -213,11 +213,16 @@ exports.getSubscriptionOverview = async (req, res) => {
         // Six months of starts and cancels, newest month last, for the trend
         // strip. Buckets are New York months because that is the calendar the
         // business runs on.
+        // The current month is read off the New York clock, not the server's —
+        // Render runs UTC, so between midnight and 4am on the 1st the two
+        // disagree about which month it is.
+        const [nyYear, nyMonth] = nyDateKey(new Date(now)).split('-').map(Number);
         const monthKeys = [];
-        const cursor = new Date(now);
         for (let i = 5; i >= 0; i -= 1) {
-            const d = new Date(cursor.getFullYear(), cursor.getMonth() - i, 1);
-            monthKeys.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`);
+            const d = new Date(Date.UTC(nyYear, nyMonth - 1 - i, 1));
+            monthKeys.push(
+                `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`
+            );
         }
         const monthOf = (value) => (value ? nyDateKey(new Date(value)).slice(0, 7) : null);
         const growth = monthKeys.map((key) => {
