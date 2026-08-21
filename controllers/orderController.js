@@ -978,15 +978,43 @@ exports.updateValetLocation = async (req, res) => {
             { new: true }
         );
 
+        if (!order) {
+            return res.status(404).json({
+                success: false,
+                message: 'Order not found',
+            });
+        }
+
         // Emit to both customer and valet rooms
-        req.io.to(order.customer.toString()).emit('orderUpdated', {
-            type: 'LOCATION_UPDATE',
-            order,
-        });
-        req.io.to(order.valet.toString()).emit('orderUpdated', {
-            type: 'LOCATION_UPDATE',
-            order,
-        });
+        if (order.customer) {
+            req.io.to(order.customer.toString()).emit('orderUpdated', {
+                type: 'LOCATION_UPDATE',
+                order,
+            });
+        }
+        if (order.valet) {
+            req.io.to(order.valet.toString()).emit('orderUpdated', {
+                type: 'LOCATION_UPDATE',
+                order,
+            });
+
+            // Remind the valet's app where the car is parked.
+            //
+            // The app holds the parked spot in session state only, so after a
+            // cold start it doesn't know the job it is carrying is already
+            // parked — and the control for recording a move is drawn off that
+            // state. On an away / street-cleaning job the move happens hours or
+            // days after the park, long after the app was last killed, which
+            // left the valet with no way to say where the car went. Riding
+            // along with the location ping the app already sends puts the spot
+            // back within a couple of seconds, on the build already installed.
+            if (order.status === 'parked' && order.parkingLocation) {
+                req.io.to(order.valet.toString()).emit('orderUpdated', {
+                    type: 'PARKING_LOCATION_UPDATE',
+                    order,
+                });
+            }
+        }
 
         res.status(200).json({
             success: true,
@@ -1113,33 +1141,43 @@ exports.updateOrder = async (req, res) => {
             updateObj.review = updates.review;
         }
 
-        // If parking location is being updated, generate new OTP
+        // If parking location is being updated, generate the return-key OTP.
+        //
+        // A parked car can be moved again — street cleaning on an away job, a
+        // garage that shut, a spot that turned out to be a hydrant — and each
+        // move comes back through here. Only the FIRST park is a park: a move
+        // must not mint a new code (the customer is already holding one), must
+        // not flip a verified handoff back to unverified, and must not restamp
+        // `parkedAt`, which the admin metrics read as "accepted → parked".
         if (updates.parkingLocation) {
             const existingOrder = await Order.findById(orderId);
-            
-            // Check if previous OTP has been verified
-            // if (!existingOrder.otp || !existingOrder.otp.verified) {
-            //     return res.status(400).json({
-            //         success: false,
-            //         message: 'Please verify the OTP first before updating parking location',
-            //     });
-            // }
+            const existingOtp = existingOrder && existingOrder.otp;
+            const hasLiveReturnKeyOtp =
+                existingOtp &&
+                existingOtp.code &&
+                existingOtp.type === 'return_key' &&
+                (existingOtp.verified ||
+                    (existingOtp.expiresAt && new Date(existingOtp.expiresAt) > new Date()));
 
-            // Generate new OTP (6-digit code)
-            const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
-            const otpCreatedAt = new Date();
-            const otpExpiresAt = new Date(otpCreatedAt.getTime() + OTP_EXPIRY_PARKING_LOCATION);
+            if (!hasLiveReturnKeyOtp) {
+                // Generate new OTP (6-digit code)
+                const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+                const otpCreatedAt = new Date();
+                const otpExpiresAt = new Date(otpCreatedAt.getTime() + OTP_EXPIRY_PARKING_LOCATION);
 
-            updateObj.otp = {
-                code: otpCode,
-                createdAt: otpCreatedAt,
-                expiresAt: otpExpiresAt,
-                verified: false,
-                type: 'return_key',
-            };
-            
-            // Store parkedAt timestamp when parking location is updated
-            updateObj.parkedAt = new Date();
+                updateObj.otp = {
+                    code: otpCode,
+                    createdAt: otpCreatedAt,
+                    expiresAt: otpExpiresAt,
+                    verified: false,
+                    type: 'return_key',
+                };
+            }
+
+            // Store parkedAt timestamp the first time the car is parked.
+            if (!existingOrder || !existingOrder.parkedAt) {
+                updateObj.parkedAt = new Date();
+            }
         }
 
         const order = await Order.findByIdAndUpdate(orderId, updateObj, {
@@ -1332,10 +1370,27 @@ exports.updateOrder = async (req, res) => {
         // same payload to the only two parties that act on it, and the clients
         // ignore updates for orders that are not their own. Keeping it meant
         // handing every listener the full order document.
-        req.io
-            .to(order.customer.toString())
-            .emit('orderUpdated', orderWithType);
-        req.io.to(order.valet.toString()).emit('orderUpdated', orderWithType);
+        // `order` is populated, so `order.customer` / `order.valet` are
+        // documents, not ids — calling toString() on one yields its inspect
+        // string ("{ firstName: 'x', _id: ... }") and the emit lands in a room
+        // nobody is in. Every live update out of this endpoint was being
+        // dropped, including the parking-location move the customer is
+        // waiting on. Resolve the id explicitly, and tolerate an order with
+        // no valet yet (a customer editing their own order) instead of
+        // throwing after the write has already landed.
+        const roomId = (party) =>
+            party && typeof party === 'object'
+                ? party._id && party._id.toString()
+                : party && party.toString();
+
+        const customerRoom = roomId(order.customer);
+        const valetRoom = roomId(order.valet);
+        if (customerRoom) {
+            req.io.to(customerRoom).emit('orderUpdated', orderWithType);
+        }
+        if (valetRoom) {
+            req.io.to(valetRoom).emit('orderUpdated', orderWithType);
+        }
 
         res.status(200).json({
             success: true,
