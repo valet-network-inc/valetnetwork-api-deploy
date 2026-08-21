@@ -72,6 +72,23 @@ const SubscriptionSchema = new mongoose.Schema(
         cancelledAt: {
             type: Date,
         },
+        // Promo code redeemed at purchase (HANDSFREE etc.). Kept on the doc
+        // so a trial code can be limited to one per customer and so the
+        // dashboard can count redemptions.
+        promoCode: {
+            type: String,
+        },
+        // End of a free trial period. While now < trialEndsAt the plan is
+        // fully entitled and nothing has been charged — the cancel refund
+        // and the app's copy both read this.
+        trialEndsAt: {
+            type: Date,
+        },
+        // First time this plan went live. The marker for "this customer has
+        // had a plan before", which a first-plan-only promo checks.
+        activatedAt: {
+            type: Date,
+        },
         // Street-cleaning schedule driving the auto-ASP scheduler. Times are
         // the sweep start in America/New_York local clock time.
         aspSchedule: {

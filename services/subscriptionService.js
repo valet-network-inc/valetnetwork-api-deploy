@@ -144,6 +144,9 @@ function nextAspMove(sub, now = new Date()) {
 async function buildStatusPayload(sub, now = new Date()) {
     const plan = getPlan(sub.tier);
     const entitled = isEntitled(sub, now);
+    // Inside a free month: full service, nothing charged yet, and therefore
+    // nothing to refund if they walk away.
+    const inTrial = !!(sub.trialEndsAt && now.getTime() < sub.trialEndsAt.getTime());
 
     const [usageAgg, periodUsageAgg, aspUsed, parksUsed] = await Promise.all([
         Order.aggregate([
@@ -194,10 +197,23 @@ async function buildStatusPayload(sub, now = new Date()) {
         // What a cancel-right-now refund would look like: the period's
         // payment minus usage priced at per-use rates.
         periodUsageCents: periodUsageAgg.length ? periodUsageAgg[0].cents : 0,
-        refundIfCancelledCents: Math.max(
-            0,
-            (sub.amountCents || 0) - (periodUsageAgg.length ? periodUsageAgg[0].cents : 0)
-        ),
+        refundIfCancelledCents: inTrial
+            ? 0
+            : Math.max(
+                  0,
+                  (sub.amountCents || 0) - (periodUsageAgg.length ? periodUsageAgg[0].cents : 0)
+              ),
+        promoCode: sub.promoCode || null,
+        // The app reads this to say "free until September 19, then $50/mo"
+        // instead of showing a price the customer is not paying yet.
+        trial: inTrial
+            ? {
+                  endsAt: sub.trialEndsAt,
+                  code: sub.promoCode || null,
+                  thenCents: sub.amountCents || 0,
+                  thenInterval: sub.interval,
+              }
+            : null,
         freeParkAvailableToday:
             entitled && tierRank(sub.tier) >= tierRank('home_garage') && parksUsed === 0,
         valueIndicator: {

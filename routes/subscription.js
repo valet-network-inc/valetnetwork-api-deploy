@@ -8,6 +8,7 @@ const {
     changePlan,
     updateSchedule,
     getPrefill,
+    checkPromo,
 } = require('../controllers/subscriptionController');
 
 // Subscriptions v2 (Stripe Billing). The pre-v2 doorman-referral routes
@@ -16,6 +17,7 @@ const {
 // money-moving endpoints and nothing shipped ever called them.
 
 router.get('/plans', getPlans);
+router.post('/promo', checkPromo);
 router.post('/create', createSubscription);
 router.get('/status/:userId', getSubscriptionStatus);
 router.post('/cancel', cancelSubscription);

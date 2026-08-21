@@ -30,6 +30,12 @@ const {
     isEntitled,
     buildStatusPayload,
 } = require('../services/subscriptionService');
+const {
+    findPromo,
+    planMismatch,
+    promoRedemptionBlock,
+    describe: describePromo,
+} = require('../services/subscriptionPromos');
 const { nyClock } = require('../services/nyTime');
 
 // Must match the version paymentController/extensionController use — the
@@ -99,6 +105,105 @@ async function ensureStripeCustomer(user) {
     return created.id;
 }
 
+// The card already on file for this customer, if any. Parking orders save
+// their card off-session, so a customer who has ever paid for a park can
+// start a free trial without seeing a payment sheet at all.
+async function savedPaymentMethodId(stripeCustomerId) {
+    try {
+        const customer = await stripe.customers.retrieve(stripeCustomerId);
+        const preferred = customer && customer.invoice_settings && customer.invoice_settings.default_payment_method;
+        if (preferred) return typeof preferred === 'string' ? preferred : preferred.id;
+        const cards = await stripe.paymentMethods.list({
+            customer: stripeCustomerId,
+            type: 'card',
+            limit: 1,
+        });
+        return cards.data.length ? cards.data[0].id : null;
+    } catch (err) {
+        console.error('savedPaymentMethodId error:', err.message);
+        return null;
+    }
+}
+
+// A trial subscription has no first payment, so the card arrives through the
+// sheet's SetupIntent instead. Stripe attaches it to the customer; this makes
+// it the subscription's card so the first real invoice has something to
+// charge. Returns true once the plan has a card behind it.
+async function ensureTrialPaymentMethod(stripeSub, { allowSavedCard = false } = {}) {
+    if (!stripe || !stripeSub) return false;
+    if (stripeSub.default_payment_method) return true;
+    let pmId = null;
+    const psi = stripeSub.pending_setup_intent;
+    if (psi && typeof psi === 'object' && psi.status === 'succeeded' && psi.payment_method) {
+        pmId = typeof psi.payment_method === 'string' ? psi.payment_method : psi.payment_method.id;
+    }
+    // Falling back to a card on file only makes sense while the customer is
+    // still in the purchase they started. A card they save weeks later on
+    // some parking order is not them agreeing to a plan.
+    if (!pmId && allowSavedCard) {
+        const customerId =
+            typeof stripeSub.customer === 'string' ? stripeSub.customer : stripeSub.customer && stripeSub.customer.id;
+        if (customerId) pmId = await savedPaymentMethodId(customerId);
+    }
+    if (!pmId) return false;
+    try {
+        await stripe.subscriptions.update(stripeSub.id, { default_payment_method: pmId });
+        stripeSub.default_payment_method = pmId;
+        return true;
+    } catch (err) {
+        console.error('ensureTrialPaymentMethod error:', err.message);
+        return false;
+    }
+}
+
+// POST /api/subscription/promo  { code, tier, interval, movesPerWeek?, userId? }
+//
+// What a code does, before the customer commits to it. The purchase itself
+// re-checks everything — this exists so the review screen can say "free until
+// September 19, then $50 a month" instead of taking the code on faith.
+exports.checkPromo = async (req, res) => {
+    const { code, tier, interval, movesPerWeek, userId } = req.body || {};
+    try {
+        const promo = findPromo(code);
+        if (!promo) {
+            return res.status(400).json({ success: false, message: 'That code is not valid.' });
+        }
+        const blocked = await promoRedemptionBlock(promo, userId);
+        if (blocked) {
+            return res.status(400).json({ success: false, message: blocked });
+        }
+
+        // A code locked to one plan snaps the customer onto that plan rather
+        // than turning them away at the last screen.
+        const applyTo = promo.appliesTo
+            ? {
+                  tier: promo.appliesTo.tier,
+                  interval: promo.appliesTo.interval,
+                  movesPerWeek: promo.appliesTo.movesPerWeek,
+              }
+            : null;
+        const mismatch = planMismatch(promo, { tier, interval, movesPerWeek });
+        const target = applyTo || { tier, interval, movesPerWeek };
+        const price = priceFor(target.tier, target.interval);
+        const plan = getPlan(target.tier);
+        if (!price || !plan) {
+            return res.status(400).json({ success: false, message: 'Unknown tier or interval' });
+        }
+        const amountCents = price.amountCents * (plan.perMove ? target.movesPerWeek || 1 : 1);
+
+        res.status(200).json({
+            success: true,
+            promo: describePromo(promo, { amountCents, interval: target.interval }),
+            applyTo,
+            note: mismatch,
+            amountCents,
+        });
+    } catch (err) {
+        console.error('checkPromo error:', err);
+        res.status(500).json({ success: false, message: 'Could not check that code', error: err.message });
+    }
+};
+
 // GET /api/subscription/plans
 exports.getPlans = async (req, res) => {
     const plans = Object.values(PLANS)
@@ -147,7 +252,12 @@ async function resolvePlanPurchase(tier, interval, movesPerWeek) {
 // POST /api/subscription/create
 // { userId, tier, interval, movesPerWeek?, aspSchedule, homeAddress?, promoCode? }
 exports.createSubscription = async (req, res) => {
-    const { userId, tier, interval, aspSchedule, homeAddress, promoCode, movesPerWeek } = req.body;
+    const {
+        userId, tier, interval, aspSchedule, homeAddress, promoCode, movesPerWeek,
+        // Newer app builds can present a payment sheet in setup mode, which
+        // is what a $0-today trial needs to take a card.
+        supportsSetupIntent,
+    } = req.body;
 
     try {
         if (!stripe) {
@@ -214,22 +324,50 @@ exports.createSubscription = async (req, res) => {
         const stripeCustomerId = await ensureStripeCustomer(user);
         const priceId = purchase.priceId;
 
-        // Test/promo hook: a promo code matching the env-configured value
-        // attaches its coupon (e.g. a 100%-off coupon for E2E runs against
-        // live mode). Invalid codes are rejected, not ignored.
+        // Promo codes. A trial code (HANDSFREE) runs as a real Stripe trial
+        // so the card is on file when the free month ends; the older
+        // env-configured codes stay coupons. Invalid codes are rejected
+        // rather than quietly ignored — a customer who typed a code and got
+        // charged full price would be right to be angry.
         let discounts;
+        let promo = null;
         if (promoCode) {
-            const configured = (process.env.SUB_PROMO_CODES || '')
-                .split(',')
-                .map((pair) => pair.trim().split(':'))
-                .filter((pair) => pair.length === 2);
-            const match = configured.find(
-                ([code]) => code.toUpperCase() === String(promoCode).toUpperCase()
-            );
-            if (!match) {
-                return res.status(400).json({ success: false, message: 'Invalid promo code' });
+            promo = findPromo(promoCode);
+            if (!promo) {
+                return res.status(400).json({ success: false, message: 'That code is not valid.' });
             }
-            discounts = [{ coupon: match[1] }];
+            const mismatch = planMismatch(promo, {
+                tier,
+                interval,
+                movesPerWeek: purchase.movesPerWeek,
+            });
+            if (mismatch) {
+                return res.status(400).json({
+                    success: false,
+                    message: mismatch,
+                    applyTo: promo.appliesTo || null,
+                });
+            }
+            const blocked = await promoRedemptionBlock(promo, user._id);
+            if (blocked) {
+                return res.status(400).json({ success: false, message: blocked });
+            }
+            if (promo.kind === 'coupon') discounts = [{ coupon: promo.couponId }];
+        }
+        const isTrial = !!promo && promo.kind === 'free_trial';
+
+        // A free month still needs a card behind it for the month after. If
+        // one is already saved from a park, the plan starts with no sheet at
+        // all; otherwise the app confirms a SetupIntent. An app build too old
+        // to present a setup sheet is told to update rather than being handed
+        // a trial that can never convert.
+        const trialCardId = isTrial ? await savedPaymentMethodId(stripeCustomerId) : null;
+        if (isTrial && !trialCardId && !supportsSetupIntent) {
+            return res.status(400).json({
+                success: false,
+                message:
+                    'Update the app from the App Store to start your free month — this version cannot add a card without a charge.',
+            });
         }
 
         const stripeSub = await stripe.subscriptions.create({
@@ -239,9 +377,23 @@ exports.createSubscription = async (req, res) => {
             payment_settings: {
                 save_default_payment_method: 'on_subscription',
             },
+            ...(isTrial
+                ? {
+                      trial_period_days: promo.trialDays,
+                      // No card by the end of the free month and the plan
+                      // simply stops. Nobody gets dunned over a trial.
+                      trial_settings: { end_behavior: { missing_payment_method: 'cancel' } },
+                      ...(trialCardId ? { default_payment_method: trialCardId } : {}),
+                  }
+                : {}),
             ...(discounts ? { discounts } : {}),
-            metadata: { userId: user._id.toString(), tier, interval },
-            expand: ['latest_invoice.payment_intent'],
+            metadata: {
+                userId: user._id.toString(),
+                tier,
+                interval,
+                ...(promo ? { promoCode: promo.code } : {}),
+            },
+            expand: ['latest_invoice.payment_intent', 'pending_setup_intent'],
         });
 
         const sub = new Subscription({
@@ -262,6 +414,8 @@ exports.createSubscription = async (req, res) => {
                 : undefined,
             aspSchedule: { ...aspSchedule, source: aspSchedule.source || 'onboarding' },
             ...(homeAddress ? { homeAddress } : {}),
+            ...(promo ? { promoCode: promo.code } : {}),
+            ...(stripeSub.trial_end ? { trialEndsAt: new Date(stripeSub.trial_end * 1000) } : {}),
         });
         await sub.save();
 
@@ -273,6 +427,57 @@ exports.createSubscription = async (req, res) => {
 
         const invoice = stripeSub.latest_invoice;
         const paymentIntent = invoice && typeof invoice === 'object' ? invoice.payment_intent : null;
+
+        // A trial charges nothing today, so there is no PaymentIntent to
+        // confirm. Either the card on file carries it and the plan starts
+        // now, or the app confirms a SetupIntent and the status poll starts
+        // it the moment the card lands.
+        if (isTrial) {
+            const trialPayload = {
+                code: promo.code,
+                headline: promo.headline,
+                detail: promo.detail,
+                endsAt: sub.trialEndsAt || null,
+                thenCents: purchase.amountCents,
+                thenInterval: interval,
+            };
+            if (trialCardId) {
+                await activateLocal(sub, null, stripeSub);
+                return res.status(201).json({
+                    success: true,
+                    status: 'active',
+                    noPaymentNeeded: true,
+                    trial: trialPayload,
+                    subscription: await buildStatusPayload(sub),
+                });
+            }
+            const setupIntent = stripeSub.pending_setup_intent;
+            const setupSecret =
+                setupIntent && typeof setupIntent === 'object' ? setupIntent.client_secret : null;
+            if (!setupSecret) {
+                return res.status(500).json({
+                    success: false,
+                    message: `Free month started but no card step available (status ${stripeSub.status})`,
+                });
+            }
+            const trialEphemeralKey = await stripe.ephemeralKeys.create(
+                { customer: stripeCustomerId },
+                { apiVersion: EPHEMERAL_KEY_API_VERSION }
+            );
+            return res.status(201).json({
+                success: true,
+                status: 'trialing',
+                // The app opens the sheet in setup mode on this.
+                mode: 'setup',
+                subscriptionId: sub._id,
+                stripeSubscriptionId: stripeSub.id,
+                setupIntentClientSecret: setupSecret,
+                customerId: stripeCustomerId,
+                customerEphemeralKeySecret: trialEphemeralKey.secret,
+                amountCents: 0,
+                trial: trialPayload,
+            });
+        }
 
         // A fully-discounted (or otherwise $0) first invoice settles with no
         // PaymentIntent and the subscription is already active — no sheet to
@@ -340,8 +545,19 @@ exports.getSubscriptionStatus = async (req, res) => {
         // against Stripe so the post-purchase poll converges fast.
         if (sub.status === 'incomplete' && stripe && sub.stripeSubscriptionId) {
             try {
-                const stripeSub = await stripe.subscriptions.retrieve(sub.stripeSubscriptionId);
-                if (stripeSub.status === 'active' || stripeSub.status === 'trialing') {
+                const stripeSub = await stripe.subscriptions.retrieve(sub.stripeSubscriptionId, {
+                    expand: ['pending_setup_intent'],
+                });
+                if (stripeSub.status === 'trialing') {
+                    // A free month only starts once there is a card behind
+                    // it — otherwise an abandoned payment sheet would hand
+                    // out a month of valet service and no way to convert it.
+                    const ready = await ensureTrialPaymentMethod(stripeSub, {
+                        allowSavedCard:
+                            !!sub.createdAt && Date.now() - sub.createdAt.getTime() < 24 * 60 * 60 * 1000,
+                    });
+                    if (ready) await activateLocal(sub, null, stripeSub);
+                } else if (stripeSub.status === 'active') {
                     await activateLocal(sub, null, stripeSub);
                 } else if (['canceled', 'incomplete_expired'].includes(stripeSub.status)) {
                     sub.status = 'cancelled';
@@ -410,7 +626,10 @@ exports.cancelSubscription = async (req, res) => {
 
         const usedCents = await periodUsageCents(sub);
         const paidCents = sub.amountCents || 0;
-        const refundCents = Math.max(0, Math.min(paidCents, paidCents - usedCents));
+        // Cancelling inside a free month refunds nothing because nothing was
+        // ever charged — the customer simply stops here.
+        const inTrial = !!(sub.trialEndsAt && Date.now() < sub.trialEndsAt.getTime());
+        const refundCents = inTrial ? 0 : Math.max(0, Math.min(paidCents, paidCents - usedCents));
 
         let refund = { requestedCents: refundCents, status: 'none' };
         if (stripe && sub.stripeSubscriptionId) {
@@ -466,6 +685,8 @@ exports.cancelSubscription = async (req, res) => {
             message:
                 refund.status === 'refunded'
                     ? `Cancelled — $${(refundCents / 100).toFixed(2)} is on its way back to your card.`
+                    : inTrial
+                    ? 'Cancelled — your free month ends here and your card was never charged.'
                     : 'Cancelled. You pay regular rates per park from now on.',
             usedCents,
             refund,
@@ -488,15 +709,31 @@ exports.cancelSubscription = async (req, res) => {
 exports.changePlan = async (req, res) => {
     const { userId, tier, interval, movesPerWeek, homeAddress } = req.body;
     try {
-        if (!stripe) {
-            return res.status(503).json({ success: false, message: 'Payment service unavailable' });
-        }
         const sub = await Subscription.findOne({
             user: userId,
             status: { $in: ['active', 'past_due'] },
         });
         if (!sub) {
             return res.status(404).json({ success: false, message: 'No subscription to change' });
+        }
+
+        // Switching plans mid-trial would move the free month onto a more
+        // expensive plan for nothing. The free month runs on the plan it was
+        // given for; after that everything is changeable as normal.
+        if (sub.trialEndsAt && Date.now() < sub.trialEndsAt.getTime()) {
+            const when = sub.trialEndsAt.toLocaleDateString('en-US', {
+                timeZone: 'America/New_York',
+                month: 'long',
+                day: 'numeric',
+            });
+            return res.status(400).json({
+                success: false,
+                message: `Your free month is running — you can switch plans from ${when}.`,
+            });
+        }
+
+        if (!stripe) {
+            return res.status(503).json({ success: false, message: 'Payment service unavailable' });
         }
 
         const purchase = await resolvePlanPurchase(
@@ -709,7 +946,11 @@ async function activateLocal(sub, invoice, stripeSub) {
         return;
     }
     sub.status = 'active';
+    if (!sub.activatedAt) sub.activatedAt = new Date();
     if (stripeSub) {
+        // Mirror the trial window so cancel copy and refund math know that
+        // nothing has been charged yet.
+        sub.trialEndsAt = stripeSub.trial_end ? new Date(stripeSub.trial_end * 1000) : undefined;
         if (stripeSub.current_period_start) {
             sub.currentPeriodStart = new Date(stripeSub.current_period_start * 1000);
         }
