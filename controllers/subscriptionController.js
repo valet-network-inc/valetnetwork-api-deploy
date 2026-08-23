@@ -159,8 +159,11 @@ async function ensureTrialPaymentMethod(stripeSub, { sub = null, allowSavedCard 
     }
     // Falling back to a card on file only makes sense while the customer is
     // still in the purchase they started. A card they save weeks later on
-    // some parking order is not them agreeing to a plan.
-    if (!pmId && allowSavedCard) {
+    // some parking order is not them agreeing to a plan. And a purchase that
+    // was issued a dollar card check settles ONLY through that check — the
+    // whole point of charging the dollar is proving the card can be charged,
+    // and a saved card that skipped the check has proven nothing.
+    if (!pmId && allowSavedCard && !(sub && sub.trialDepositPaymentIntentId)) {
         const customerId =
             typeof stripeSub.customer === 'string' ? stripeSub.customer : stripeSub.customer && stripeSub.customer.id;
         if (customerId) pmId = await savedPaymentMethodId(customerId);
@@ -416,12 +419,6 @@ exports.createSubscription = async (req, res) => {
         }
         const isTrial = !!promo && promo.kind === 'free_trial';
 
-        // A free month still needs a card behind it for the month after. A
-        // card already saved from a park starts the plan with no sheet at
-        // all; otherwise the customer enters one — as a SetupIntent where the
-        // app can present that, and as a refunded dollar where it cannot.
-        const trialCardId = isTrial ? await savedPaymentMethodId(stripeCustomerId) : null;
-
         const stripeSub = await stripe.subscriptions.create({
             customer: stripeCustomerId,
             items: [{ price: priceId, quantity: purchase.quantity }],
@@ -435,7 +432,6 @@ exports.createSubscription = async (req, res) => {
                       // No card by the end of the free month and the plan
                       // simply stops. Nobody gets dunned over a trial.
                       trial_settings: { end_behavior: { missing_payment_method: 'cancel' } },
-                      ...(trialCardId ? { default_payment_method: trialCardId } : {}),
                   }
                 : {}),
             ...(discounts ? { discounts } : {}),
@@ -480,10 +476,14 @@ exports.createSubscription = async (req, res) => {
         const invoice = stripeSub.latest_invoice;
         const paymentIntent = invoice && typeof invoice === 'object' ? invoice.payment_intent : null;
 
-        // A trial charges nothing today, so there is no PaymentIntent to
-        // confirm. Either the card on file carries it and the plan starts
-        // now, or the app confirms a SetupIntent and the status poll starts
-        // it the moment the card lands.
+        // A trial charges nothing today, so there is no first invoice to
+        // confirm — but the free month starts ONLY once a real dollar has
+        // cleared and been refunded. Every redemption goes through the same
+        // door, saved card or not: a card that cannot carry $1 today is a
+        // card that will not carry $50 on day 30, and a plan that starts on
+        // an unproven card converts into a dunning email instead of revenue.
+        // (Rishi's call, 2026-08-23 — the $0 SetupIntent path and the silent
+        // card-on-file start are gone on purpose.)
         if (isTrial) {
             const trialPayload = {
                 code: promo.code,
@@ -493,45 +493,14 @@ exports.createSubscription = async (req, res) => {
                 thenCents: purchase.amountCents,
                 thenInterval: interval,
             };
-            if (trialCardId) {
-                await activateLocal(sub, null, stripeSub);
-                return res.status(201).json({
-                    success: true,
-                    status: 'active',
-                    noPaymentNeeded: true,
-                    trial: trialPayload,
-                    subscription: await buildStatusPayload(sub),
-                });
-            }
             const trialEphemeralKey = await stripe.ephemeralKeys.create(
                 { customer: stripeCustomerId },
                 { apiVersion: EPHEMERAL_KEY_API_VERSION }
             );
-            const setupIntent = stripeSub.pending_setup_intent;
-            const setupSecret =
-                supportsSetupIntent && setupIntent && typeof setupIntent === 'object'
-                    ? setupIntent.client_secret
-                    : null;
-            if (setupSecret) {
-                return res.status(201).json({
-                    success: true,
-                    status: 'trialing',
-                    // The app opens the sheet in setup mode on this: nothing
-                    // is charged, the card is only saved.
-                    mode: 'setup',
-                    subscriptionId: sub._id,
-                    stripeSubscriptionId: stripeSub.id,
-                    setupIntentClientSecret: setupSecret,
-                    customerId: stripeCustomerId,
-                    customerEphemeralKeySecret: trialEphemeralKey.secret,
-                    amountCents: 0,
-                    trial: trialPayload,
-                });
-            }
 
-            // Older builds can only open a payment sheet, so the card is
-            // verified with a dollar that comes straight back once the plan
-            // is running. The sheet's own Apple Pay works on this unchanged.
+            // The card is verified with a dollar that comes straight back
+            // once the plan is running. The sheet's Apple Pay works on this
+            // unchanged, and a saved card is one tap in the same sheet.
             const deposit = await stripe.paymentIntents.create({
                 amount: TRIAL_CARD_CHECK_CENTS,
                 currency: 'usd',
@@ -1242,6 +1211,10 @@ async function applySubscriptionUpdated(stripeSub, isDeletion = false) {
     }
 
     sub.status = mapped;
+    // Stamp the start. Without this, a plan that went live through this path
+    // (rather than activateLocal) never counts as "started" — and a trial
+    // cancelled mid-month could redeem its first-time-only code again.
+    if (mapped === 'active' && !sub.activatedAt) sub.activatedAt = new Date();
     if (stripeSub.current_period_start) {
         sub.currentPeriodStart = new Date(stripeSub.current_period_start * 1000);
     }

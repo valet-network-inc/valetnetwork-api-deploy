@@ -25,7 +25,7 @@ const mockStripe = {
     customers: { create: jest.fn(), retrieve: jest.fn() },
     paymentMethods: { list: jest.fn() },
     prices: { list: jest.fn() },
-    subscriptions: { create: jest.fn(), cancel: jest.fn(), update: jest.fn() },
+    subscriptions: { create: jest.fn(), cancel: jest.fn(), update: jest.fn(), retrieve: jest.fn() },
     paymentIntents: { create: jest.fn() },
     ephemeralKeys: { create: jest.fn() },
 };
@@ -238,9 +238,7 @@ describe('a code the customer typed', () => {
 });
 
 describe('once the plan starts', () => {
-    it('the code comes back off the account', async () => {
-        // A card already on file starts the plan immediately — the shortest
-        // route to activateLocal.
+    it('a saved card gets no shortcut — the dollar check still runs', async () => {
         armStripe({ savedCard: 'pm_saved' });
         const user = await makeUser({ pendingPromoCode: 'HANDSFREE' });
         const res = mockRes();
@@ -248,7 +246,30 @@ describe('once the plan starts', () => {
         await subscriptionController.createSubscription({ body: createBody(user) }, res);
 
         expect(res.statusCode).toBe(201);
-        expect(res.body.status).toBe('active');
+        expect(res.body.mode).toBe('card_check');
+        expect(res.body.amountCents).toBeGreaterThan(0);
+        // Still incomplete: nothing starts until the dollar clears.
+        const sub = await Subscription.findOne({ user: user._id });
+        expect(sub.status).toBe('incomplete');
+    });
+
+    it('the code comes back off the account', async () => {
+        armStripe();
+        const user = await makeUser({ pendingPromoCode: 'HANDSFREE' });
+        const res = mockRes();
+        await subscriptionController.createSubscription({ body: createBody(user) }, res);
+        const sub = await Subscription.findOne({ user: user._id });
+
+        // The dollar clears and the webhook mirror reports the trial live.
+        mockStripe.subscriptions.retrieve.mockResolvedValue({
+            id: sub.stripeSubscriptionId,
+            status: 'trialing',
+            default_payment_method: 'pm_from_check',
+            current_period_start: Math.floor(Date.now() / 1000),
+            current_period_end: Math.floor(Date.now() / 1000) + 30 * 86400,
+        });
+        await subscriptionController.applySubscriptionUpdated({ id: sub.stripeSubscriptionId });
+
         const after = await User.findById(user._id);
         expect(after.pendingPromoCode).toBeUndefined();
         expect(after.pendingPromoSetAt).toBeUndefined();
@@ -311,5 +332,48 @@ describe('the admin endpoint that hangs codes on accounts', () => {
 
         expect(res.body.count).toBe(2);
         expect(res.body.byCode).toEqual({ HANDSFREE: 2 });
+    });
+});
+
+describe('a plan that went live through the webhook mirror', () => {
+    it('counts as started, so its code cannot be redeemed again after a cancel', async () => {
+        armStripe();
+        const user = await makeUser();
+        const sub = await Subscription.create({
+            user: user._id,
+            tier: 'street_cleaning',
+            interval: 'month',
+            status: 'incomplete',
+            amountCents: 5000,
+            movesPerWeek: 1,
+            promoCode: 'HANDSFREE',
+            stripeSubscriptionId: `sub_wh_${seq++}`,
+            aspSchedule: {
+                address: STREET,
+                days: [{ weekday: 2, hour: 9, minute: 0 }],
+                source: 'onboarding',
+            },
+        });
+        // Stripe reports the trial live with a card behind it.
+        mockStripe.subscriptions.retrieve.mockResolvedValue({
+            id: sub.stripeSubscriptionId,
+            status: 'trialing',
+            default_payment_method: 'pm_saved',
+            current_period_start: Math.floor(Date.now() / 1000),
+            current_period_end: Math.floor(Date.now() / 1000) + 30 * 86400,
+        });
+        await subscriptionController.applySubscriptionUpdated({ id: sub.stripeSubscriptionId });
+
+        const after = await Subscription.findById(sub._id);
+        expect(after.status).toBe('active');
+        expect(after.activatedAt).toBeInstanceOf(Date);
+
+        // The customer cancels mid-trial and comes back for another free month.
+        after.status = 'cancelled';
+        after.cancelledAt = new Date();
+        await after.save();
+        const promos = require('../services/subscriptionPromos');
+        const blocked = await promos.promoRedemptionBlock(promos.findPromo('HANDSFREE'), user._id);
+        expect(blocked).toMatch(/already used/i);
     });
 });
