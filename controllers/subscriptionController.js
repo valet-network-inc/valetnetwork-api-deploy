@@ -370,30 +370,49 @@ exports.createSubscription = async (req, res) => {
         // env-configured codes stay coupons. Invalid codes are rejected
         // rather than quietly ignored — a customer who typed a code and got
         // charged full price would be right to be angry.
+        //
+        // A code can also be hung on the account ahead of time
+        // (`pendingPromoCode`, set by the campaign tool) so a push can promise
+        // a free month to people whose app build makes them hunt for the code
+        // field. That one is dropped quietly when it does not fit — the
+        // customer picked the plan, and refusing their purchase over a code
+        // they never typed would be indefensible. A typed code still wins.
         let discounts;
         let promo = null;
-        if (promoCode) {
-            promo = findPromo(promoCode);
-            if (!promo) {
-                return res.status(400).json({ success: false, message: 'That code is not valid.' });
+        const typedCode = promoCode ? String(promoCode).trim() : '';
+        const accountCode = typedCode ? '' : String(user.pendingPromoCode || '').trim();
+        const codeToApply = typedCode || accountCode;
+        if (codeToApply) {
+            const candidate = findPromo(codeToApply);
+            const mismatch = candidate
+                ? planMismatch(candidate, {
+                      tier,
+                      interval,
+                      movesPerWeek: purchase.movesPerWeek,
+                  })
+                : null;
+            const blocked =
+                candidate && !mismatch ? await promoRedemptionBlock(candidate, user._id) : null;
+
+            let failure = null;
+            if (!candidate) failure = { message: 'That code is not valid.' };
+            else if (mismatch) failure = { message: mismatch, applyTo: candidate.appliesTo || null };
+            else if (blocked) failure = { message: blocked };
+
+            if (failure) {
+                if (typedCode) {
+                    return res.status(400).json({ success: false, ...failure });
+                }
+                console.log(
+                    `Account promo ${accountCode} not applied for user ${user._id}: ${failure.message}`
+                );
+            } else {
+                promo = candidate;
+                if (promo.kind === 'coupon') discounts = [{ coupon: promo.couponId }];
+                if (accountCode) {
+                    console.log(`Account promo ${promo.code} applied for user ${user._id}`);
+                }
             }
-            const mismatch = planMismatch(promo, {
-                tier,
-                interval,
-                movesPerWeek: purchase.movesPerWeek,
-            });
-            if (mismatch) {
-                return res.status(400).json({
-                    success: false,
-                    message: mismatch,
-                    applyTo: promo.appliesTo || null,
-                });
-            }
-            const blocked = await promoRedemptionBlock(promo, user._id);
-            if (blocked) {
-                return res.status(400).json({ success: false, message: blocked });
-            }
-            if (promo.kind === 'coupon') discounts = [{ coupon: promo.couponId }];
         }
         const isTrial = !!promo && promo.kind === 'free_trial';
 
@@ -1067,7 +1086,12 @@ async function activateLocal(sub, invoice, stripeSub) {
         }
         throw err;
     }
-    await User.findByIdAndUpdate(sub.user, { activeSubscription: sub._id });
+    await User.findByIdAndUpdate(sub.user, {
+        $set: { activeSubscription: sub._id },
+        // The plan started, so a campaign code parked on the account has done
+        // its job. Leaving it would quietly discount the NEXT plan.
+        $unset: { pendingPromoCode: 1, pendingPromoSetAt: 1 },
+    });
     console.log(`Subscription ${sub._id} active (tier ${sub.tier}, user ${sub.user})`);
 }
 
@@ -1234,7 +1258,12 @@ async function applySubscriptionUpdated(stripeSub, isDeletion = false) {
             { $unset: { activeSubscription: 1 } }
         );
     } else if (mapped === 'active') {
-        await User.findByIdAndUpdate(sub.user, { activeSubscription: sub._id });
+        await User.findByIdAndUpdate(sub.user, {
+            $set: { activeSubscription: sub._id },
+            // The plan started, so a campaign code parked on the account has
+            // done its job. Leaving it would quietly discount the NEXT plan.
+            $unset: { pendingPromoCode: 1, pendingPromoSetAt: 1 },
+        });
     }
 
     console.log(`Subscription ${sub._id} → ${mapped} (stripe ${stripeSub.status})`);

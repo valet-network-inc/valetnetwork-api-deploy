@@ -22,6 +22,7 @@ const adminNotification = require('../controllers/adminNotificationController');
 const parkingNoteController = require('../controllers/parkingNoteController');
 const aspSuspensionAdmin = require('../controllers/aspSuspensionAdminController');
 const adminSubscription = require('../controllers/adminSubscriptionController');
+const adminPromo = require('../controllers/adminPromoController');
 const requireAdminKey = require('../middleware/requireAdminKey');
 
 // Everything below this line needs the `x-admin-key` header. Only the four
@@ -90,6 +91,12 @@ router.get('/services', getServiceList);
 // this is the only place the billing, the schedule, the covered orders and
 // the suspension credits sit on one row.
 router.get('/subscriptions', adminSubscription.getSubscriptionOverview);
+
+// --- campaign promo codes hung on accounts ----------------------------
+// Lets a push promise a free month without the customer hunting for the
+// "Have a code?" field on the build already on their phone.
+router.get('/pending-promo', adminPromo.listPendingPromo);
+router.post('/pending-promo', adminPromo.setPendingPromo);
 // Where paying customers stop — built from server-side stamps only.
 router.get('/checkout-funnel', getCheckoutFunnel);
 

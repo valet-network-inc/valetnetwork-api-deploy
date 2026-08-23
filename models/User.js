@@ -325,6 +325,13 @@ const UserSchema = new mongoose.Schema({
     // suggestion. Without this the prompt would come back every launch, which
     // is exactly the kind of nagging that gets an app deleted.
     cleaningScheduleSuggestionDismissedAt: { type: Date },
+
+    // A promo code hung on the account ahead of time, so a campaign can
+    // promise a free month without the customer typing anything: subscription
+    // create falls back to this when the app sends no code. Cleared the moment
+    // a plan actually activates. A code the customer types always wins.
+    pendingPromoCode: { type: String, trim: true, uppercase: true },
+    pendingPromoSetAt: { type: Date },
 });
 
 module.exports = mongoose.model('User', UserSchema);
