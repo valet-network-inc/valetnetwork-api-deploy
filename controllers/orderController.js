@@ -2622,6 +2622,15 @@ const runAspSweep = async (io, now = new Date()) => {
                             // car. Without it this leg looks like an ordinary
                             // retrieval that nobody has touched yet.
                             aspMode: true,
+                            // This leg never passes through acceptOrder — the
+                            // sweep mints it already accepted — so nothing else
+                            // would ever give it a conversation. Without one,
+                            // every chat write keyed off the order (arrival
+                            // notice, parked message, payment link) throws on an
+                            // empty document path. It's the return leg of the
+                            // parent park, same customer and same valet, so it
+                            // belongs in the parent's thread.
+                            conversationId: order.conversationId,
                             valet: order.valet._id, // Assign same valet
                             otp: {
                                 code: otpCode,

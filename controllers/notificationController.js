@@ -60,46 +60,154 @@ const sendSlackNotification = async (title, message, details = {}) => {
     }
 };
 
+// A push can fail because the recipient's device token is dead — the app was
+// reinstalled, the phone was wiped, APNs retired the token. That is a fact
+// about their phone, not a fault on our side, and it must never be reported
+// as a server error: the caller is a valet mid-handoff whose whole action
+// (chat message, arrival flag, key OTP) aborts the moment this throws.
+const isDeadTokenError = (error) => {
+    const code = error?.code || error?.errorInfo?.code;
+    if (
+        code === 'messaging/registration-token-not-registered' ||
+        code === 'messaging/invalid-registration-token'
+    ) {
+        return true;
+    }
+    // 'invalid-argument' covers both a dead token ("APNs device token is
+    // disabled.") and a payload we built wrong. Only the former is theirs.
+    const message = error?.message || error?.errorInfo?.message || '';
+    return code === 'messaging/invalid-argument' && /token/i.test(message);
+};
+
+const buildPushMessage = (token, title, body) => ({
+    notification: {
+        title,
+        body,
+    },
+    apns: {
+        payload: {
+            aps: {
+                alert: {
+                    title,
+                    body,
+                },
+                'mutable-content': 1,
+                sound: 'valet-bell.caf',
+                badge: 1,
+            },
+        },
+        headers: {
+            'apns-priority': '10',
+            'apns-push-type': 'alert',
+            'apns-topic': 'com.xertifier.firebaseApp', // Make sure this matches your bundle identifier
+        },
+    },
+    token,
+});
+
 exports.sendNotification = async (req, res) => {
     const { token, title, body } = req.body;
     console.log('token', token);
 
-    const message = {
-        notification: {
-            title,
-            body,
-        },
-        apns: {
-            payload: {
-                aps: {
-                    alert: {
-                        title,
-                        body,
-                    },
-                    'mutable-content': 1,
-                    sound: 'valet-bell.caf',
-                    badge: 1,
-                },
-            },
-            headers: {
-                'apns-priority': '10',
-                'apns-push-type': 'alert',
-                'apns-topic': 'com.xertifier.firebaseApp', // Make sure this matches your bundle identifier
-            },
-        },
-        token: token,
+    // The app reads this token out of the Firestore user doc, which only holds
+    // whichever token was current the last time that doc was written. Mongo's
+    // FCMToken collection is the live record, so a stale token here is normal
+    // and recoverable — fall back to the owner's other registered devices
+    // rather than failing the caller.
+    const attempted = [];
+    const sendTo = async (candidate) => {
+        attempted.push(candidate);
+        return admin.messaging().send(buildPushMessage(candidate, title, body));
     };
 
     try {
-        const response = await admin.messaging().send(message);
-        console.log('Notification sent successfully:', response);
-        res.status(200).json({
+        if (!token) {
+            // Nothing to send to, but nothing broken either.
+            console.warn('Push requested with no token — reporting undelivered');
+            return res.status(200).json({
+                success: true,
+                delivered: false,
+                reason: 'no-token-supplied',
+            });
+        }
+
+        try {
+            const response = await sendTo(token);
+            console.log('Notification sent successfully:', response);
+            return res.status(200).json({
+                success: true,
+                delivered: true,
+                response: response,
+            });
+        } catch (error) {
+            if (!isDeadTokenError(error)) throw error;
+            console.warn(
+                `Supplied token is dead (${error.code}: ${error.message}) — trying the owner's other devices`
+            );
+        }
+
+        // Retire the dead token and find who it belonged to.
+        const deadTokenDoc = await FCMToken.findOneAndUpdate(
+            { token },
+            { isActive: false },
+            { new: true }
+        );
+
+        if (!deadTokenDoc) {
+            console.warn('Dead token is not in the FCMToken collection — no fallback possible');
+            return res.status(200).json({
+                success: true,
+                delivered: false,
+                reason: 'token-unregistered',
+                attempted: attempted.length,
+            });
+        }
+
+        const fallbacks = await FCMToken.find({
+            firebaseUid: deadTokenDoc.firebaseUid,
+            isActive: true,
+            token: { $ne: token },
+        }).sort({ lastUsedAt: -1 });
+
+        for (const candidate of fallbacks) {
+            try {
+                const response = await sendTo(candidate.token);
+                await FCMToken.updateOne(
+                    { _id: candidate._id },
+                    { lastUsedAt: new Date() }
+                );
+                console.log(
+                    `Notification delivered on fallback token ${candidate.token.substring(0, 20)}...`
+                );
+                return res.status(200).json({
+                    success: true,
+                    delivered: true,
+                    usedFallbackToken: true,
+                    response: response,
+                });
+            } catch (error) {
+                if (!isDeadTokenError(error)) throw error;
+                console.warn(
+                    `Fallback token ${candidate.token.substring(0, 20)}... is dead too — retiring it`
+                );
+                await FCMToken.updateOne({ _id: candidate._id }, { isActive: false });
+            }
+        }
+
+        console.warn(
+            `No live device for ${deadTokenDoc.firebaseUid} — ${attempted.length} token(s) tried`
+        );
+        return res.status(200).json({
             success: true,
-            response: response,
+            delivered: false,
+            reason: 'no-live-device',
+            attempted: attempted.length,
         });
     } catch (error) {
+        // Genuine server-side fault (Firebase credentials, Mongo, a payload we
+        // built wrong) — this one really is a 500.
         console.error('Error sending notification:', error);
-        res.status(500).json({
+        return res.status(500).json({
             success: false,
             error: error.message,
         });
