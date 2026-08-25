@@ -205,6 +205,43 @@ const retrievalHasCustody = async (order) => {
 };
 
 /**
+ * The order that owns the live key-return handoff for `order`.
+ *
+ * The ASP sweep mints its return leg on the PARENT'S conversation — it has to,
+ * the leg never passes through `acceptOrder` so nothing else would ever give
+ * it a thread. That leaves two live orders on one chat, each carrying a
+ * `return_key` OTP: the parent's, minted by `updateCarLocation` when the car
+ * was parked and dead the moment the leg took the handoff over, and the leg's,
+ * which is the one the customer's app shows (`hasActiveOrder` drops the parent
+ * once `parkClosedAt` is stamped). The valet app binds its modal to whichever
+ * of the two it finds first, so the customer reads out one number and the app
+ * checks it against the other — a correct code coming back "Invalid OTP".
+ *
+ * Follow the link instead of trusting the id the client sent. Only the sweep's
+ * leg shares a conversation with its parent, so that shared thread is the
+ * condition: a customer-booked retrieval gets its own on accept and nothing
+ * here reaches into it.
+ *
+ * Returns null when `order` already is the right document.
+ */
+const liveKeyReturnLeg = async (order) => {
+    if (!order || !order.linkedOrderId) return null;
+    if (order.orderType === 'retrieval') return null;
+    if (!order.conversationId) return null;
+    try {
+        const leg = await Order.findById(order.linkedOrderId);
+        if (!leg || leg.orderType !== 'retrieval') return null;
+        if (String(leg.conversationId || '') !== String(order.conversationId)) return null;
+        if (['cancelled', 'completed'].includes(leg.status)) return null;
+        if (!leg.otp || !leg.otp.code || leg.otp.type !== 'return_key') return null;
+        return leg;
+    } catch (err) {
+        console.error('Key-return leg lookup failed:', err.message);
+        return null;
+    }
+};
+
+/**
  * Put a parking order back the way it was before its retrieval was requested.
  *
  * A parked car is parked: the only status a cancelled retrieval can restore is
@@ -1118,8 +1155,9 @@ exports.updateOrder = async (req, res) => {
                         });
                     }
 
-                    // Verify OTP code
-                    if (otpData.code !== otp.toString()) {
+                    // Verify OTP code. Trimmed: a code read out loud and typed
+                    // back in arrives with whatever the keypad left on it.
+                    if (otpData.code !== String(otp).trim()) {
                         return res.status(400).json({
                             success: false,
                             message: 'Invalid OTP. Please try again.',
@@ -2011,13 +2049,29 @@ exports.verifyOTP = async (req, res) => {
             });
         }
 
-        const order = await Order.findById(orderId);
+        let order = await Order.findById(orderId);
         if (!order) {
             return res.status(404).json({
                 success: false,
                 message: 'Order not found',
             });
         }
+
+        // The code the customer is reading out belongs to the leg that owns
+        // the handoff, not necessarily to the order the app addressed. See
+        // `liveKeyReturnLeg`.
+        const handoffLeg = await liveKeyReturnLeg(order);
+        if (handoffLeg) {
+            console.log(
+                'verifyOTP: order',
+                String(order._id),
+                'has handed its key return to leg',
+                String(handoffLeg._id),
+                '- verifying against the leg'
+            );
+            order = handoffLeg;
+        }
+        const targetOrderId = order._id;
 
         const otpData = order.otp;
         if (!otpData || !otpData.code) {
@@ -2034,7 +2088,7 @@ exports.verifyOTP = async (req, res) => {
             const newOtpCreatedAt = new Date();
             const newOtpExpiresAt = new Date(newOtpCreatedAt.getTime() + OTP_EXPIRY_RETURN_KEY);
             
-            await Order.findByIdAndUpdate(orderId, {
+            await Order.findByIdAndUpdate(targetOrderId, {
                 'otp.code': newOtpCode,
                 'otp.createdAt': newOtpCreatedAt,
                 'otp.expiresAt': newOtpExpiresAt,
@@ -2048,8 +2102,9 @@ exports.verifyOTP = async (req, res) => {
             });
         }
 
-        // Verify OTP code
-        if (otpData.code !== otp.toString()) {
+        // Verify OTP code. Trimmed: a code read out loud and typed back in
+        // arrives with whatever the keypad left on it.
+        if (otpData.code !== String(otp).trim()) {
             return res.status(400).json({
                 success: false,
                 message: 'Invalid OTP. Please try again.',
@@ -2098,7 +2153,7 @@ exports.verifyOTP = async (req, res) => {
             // `otp.*` dotted paths and a whole `otp` object can't co-exist in one
             // $set, so the timestamp is carried over by hand.
             const updatedOrder = await Order.findByIdAndUpdate(
-                orderId,
+                targetOrderId,
                 {
                     'otpVerifiedTimes.returnKey': verifiedAt,
                     otp: {
@@ -2139,7 +2194,7 @@ exports.verifyOTP = async (req, res) => {
             });
         }
 
-        await Order.findByIdAndUpdate(orderId, updateData);
+        await Order.findByIdAndUpdate(targetOrderId, updateData);
 
         // Beat 1 of a park: the customer has just handed the keys over. Same
         // moment, different OTP type, same flag the valet's button reads.
@@ -2683,6 +2738,23 @@ const runAspSweep = async (io, now = new Date()) => {
                         // The sweep's park is finished at this point — the
                         // return leg is its own order now.
                         order.parkClosedAt = order.parkClosedAt || new Date();
+                        // One code in the world for this pair. Both orders sit
+                        // on the same chat for the rest of the job, so the
+                        // parent must stop advertising the return-key code
+                        // `updateCarLocation` minted when the car was parked:
+                        // the customer's app has moved on to the leg's, and a
+                        // valet app still bound to the parent would read the
+                        // dead one out. `verifyOTP` routes the check to the leg
+                        // whichever order the client addresses.
+                        if (retrievalOrder.otp && retrievalOrder.otp.code) {
+                            order.otp = {
+                                code: retrievalOrder.otp.code,
+                                createdAt: retrievalOrder.otp.createdAt,
+                                expiresAt: retrievalOrder.otp.expiresAt,
+                                verified: false,
+                                type: 'return_key',
+                            };
+                        }
                         await order.save();
 
                         // Emit socket events
