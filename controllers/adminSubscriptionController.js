@@ -19,6 +19,7 @@ const Order = require('../models/Order');
 const AspCredit = require('../models/AspCredit');
 const { PLANS, getPlan } = require('../services/subscriptionPlans');
 const { nyDateKey } = require('../services/nyTime');
+const { summarizeMany, describeShort } = require('../services/cleaningSchedule');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -45,6 +46,21 @@ function isLegacyDoc(sub) {
     return !sub.status || !getPlan(sub.tier);
 }
 
+// Two schedules are the same schedule when the same weekdays are set at the
+// same times. Used only to tell the operator when the plan and the customer's
+// own alarm have drifted apart — see `cleaning.matchesPlan` below.
+function scheduleSignature(schedule) {
+    return [...((schedule && schedule.days) || [])]
+        .filter((d) => d && Number.isFinite(d.weekday))
+        .map((d) => `${d.weekday}@${d.hour || 0}:${d.minute || 0}`)
+        .sort()
+        .join('|');
+}
+
+function hasDays(schedule) {
+    return !!(schedule && (schedule.days || []).length);
+}
+
 /**
  * GET /api/admin/subscriptions
  *
@@ -60,7 +76,7 @@ exports.getSubscriptionOverview = async (req, res) => {
 
         const userIds = [...new Set(subs.map((s) => s.user && s.user.toString()).filter(Boolean))];
         const users = await User.find({ _id: { $in: userIds } })
-            .select('_id firstName lastName phone isDoorman enterpriseBusinessName')
+            .select('_id firstName lastName phone isDoorman enterpriseBusinessName cleaningSchedule')
             .lean();
         const userById = {};
         users.forEach((u) => { userById[u._id.toString()] = u; });
@@ -100,6 +116,21 @@ exports.getSubscriptionOverview = async (req, res) => {
         credits.forEach((row) => {
             if (row._id) creditsBySub[row._id.toString()] = row;
         });
+
+        // The street-cleaning schedule, as the scheduler resolves it: the
+        // customer's own home schedule is the source of truth and the copy on
+        // the subscription is the fallback (services/aspScheduler reads them in
+        // that order). Showing anything else here would have the console
+        // disagreeing with the van.
+        const effectiveSchedules = subs.map((s) => {
+            const user = userById[s.user && s.user.toString()];
+            const home = user && user.cleaningSchedule;
+            return {
+                key: s._id.toString(),
+                schedule: hasDays(home) ? home : (s.aspSchedule || null),
+            };
+        });
+        const cleaningBySub = await summarizeMany(effectiveSchedules);
 
         const rows = subs.map((s) => {
             const id = s._id.toString();
@@ -154,6 +185,26 @@ exports.getSubscriptionOverview = async (req, res) => {
                 creditedDays: cred ? cred.days : 0,
 
                 scheduleDays: (s.aspSchedule && s.aspSchedule.days ? s.aspSchedule.days.length : 0),
+                cleaning: (() => {
+                    const home = (userById[s.user && s.user.toString()] || {}).cleaningSchedule;
+                    const summary = cleaningBySub.get(id) || { hasSchedule: false };
+                    const fromCustomer = hasDays(home);
+                    return {
+                        ...summary,
+                        // Which of the two copies the answer came from, so a
+                        // wrong day can be corrected in the right place.
+                        from: summary.hasSchedule ? (fromCustomer ? 'customer' : 'subscription') : null,
+                        // Null when there is nothing to compare — only a real
+                        // disagreement is worth an operator's attention.
+                        matchesPlan:
+                            fromCustomer && hasDays(s.aspSchedule)
+                                ? scheduleSignature(home) === scheduleSignature(s.aspSchedule)
+                                : null,
+                        // What the plan itself was sold with, shown only when
+                        // it disagrees with the schedule above.
+                        planLabel: hasDays(s.aspSchedule) ? describeShort(s.aspSchedule) : null,
+                    };
+                })(),
                 address:
                     (s.aspSchedule && s.aspSchedule.address && s.aspSchedule.address.streetAddress) ||
                     (s.homeAddress && s.homeAddress.streetAddress) ||
@@ -235,6 +286,9 @@ exports.getSubscriptionOverview = async (req, res) => {
             success: true,
             data: {
                 generatedAt: new Date(),
+                // New York's date, so the tab can say "today" without trusting
+                // the operator's laptop clock or the server's UTC one.
+                todayKey: nyDateKey(new Date(now)),
                 summary: {
                     total: rows.length,
                     active: active.length,

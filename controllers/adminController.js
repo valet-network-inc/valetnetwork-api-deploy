@@ -3,6 +3,8 @@ const User = require('../models/User');
 const Payment = require('../models/Payment');
 const FCMToken = require('../models/FCMToken');
 const { displayPlatform } = require('../services/signupPlatform');
+const { summarizeMany } = require('../services/cleaningSchedule');
+const { nyDateKey } = require('../services/nyTime');
 
 // Helper function to format time in hours, minutes and seconds
 const formatTime = (minutes) => {
@@ -818,7 +820,7 @@ exports.getCustomerList = async (req, res) => {
         // the ObjectId, which is why this list showed blank dates and, because it
         // was also sorting on that missing field, was not actually in date order.
         const customers = await User.find({ isValet: { $ne: true } })
-            .select('_id firstName lastName phone isDoorman enterpriseBusinessName createdAt firebaseUid signupPlatform')
+            .select('_id firstName lastName phone isDoorman enterpriseBusinessName createdAt firebaseUid signupPlatform cleaningSchedule')
             .sort({ _id: -1 })
             .lean();
 
@@ -838,6 +840,13 @@ exports.getCustomerList = async (req, res) => {
         // ones that were born on the web and later moved to the app.
         const uidsWithPushTokens = new Set(
             await FCMToken.distinct('firebaseUid')
+        );
+
+        // Street-cleaning schedules for the whole list in one suspension
+        // query — the schedule is free and belongs to the person, so plenty of
+        // these customers have one without ever buying a plan.
+        const cleaningByUser = await summarizeMany(
+            customers.map((c) => ({ key: c._id.toString(), schedule: c.cleaningSchedule }))
         );
 
         const data = customers.map((c) => {
@@ -861,10 +870,11 @@ exports.getCustomerList = async (req, res) => {
                 // token is proof rather than a guess.
                 platformSource: recorded ? 'recorded' : 'inferred',
                 totalRequests: countByCustomer[c._id.toString()] || 0,
+                cleaning: cleaningByUser.get(c._id.toString()) || { hasSchedule: false },
             };
         });
 
-        res.status(200).json({ success: true, data });
+        res.status(200).json({ success: true, data, todayKey: nyDateKey() });
     } catch (err) {
         console.error('Error fetching customer list:', err);
         res.status(500).json({

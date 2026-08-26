@@ -264,6 +264,128 @@ async function monthView(schedule, monthKey) {
     return { month: monthKey, cells, todayKey: nycDateKey() };
 }
 
+/* ------------------------- describing --------------------------------- */
+
+const WEEKDAY_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const WEEKDAY_PLURAL = [
+    'Sundays', 'Mondays', 'Tuesdays', 'Wednesdays', 'Thursdays', 'Fridays', 'Saturdays',
+];
+
+/** 11, 30 -> '11:30 AM'. The console is read by people, not parsers. */
+function clockLabel(hour, minute) {
+    const h = Number.isFinite(hour) ? hour : 9;
+    const m = Number.isFinite(minute) ? minute : 0;
+    const suffix = h >= 12 ? 'PM' : 'AM';
+    const h12 = h % 12 === 0 ? 12 : h % 12;
+    return `${h12}:${String(m).padStart(2, '0')} ${suffix}`;
+}
+
+/** Days in week order, Sunday first, so two customers never read differently. */
+function orderedDays(schedule) {
+    return [...((schedule && schedule.days) || [])]
+        .filter((d) => d && Number.isFinite(d.weekday))
+        .sort((a, b) => a.weekday - b.weekday || (a.hour || 0) - (b.hour || 0));
+}
+
+/**
+ * The schedule as a sentence — 'Tuesdays at 11:30 AM'.
+ *
+ * Every day carries its own time on purpose: sweep signs routinely differ
+ * between a block's two days, so collapsing them to one time would be a lie
+ * the operator could act on.
+ */
+function describe(schedule) {
+    const days = orderedDays(schedule);
+    if (!days.length) return null;
+    const parts = days.map((d) => `${WEEKDAY_PLURAL[d.weekday]} at ${clockLabel(d.hour, d.minute)}`);
+    if (parts.length === 1) return parts[0];
+    return `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}`;
+}
+
+/** The same thing sized for a table cell — 'Tue 11:30 AM · Thu 9:00 AM'. */
+function describeShort(schedule) {
+    const days = orderedDays(schedule);
+    if (!days.length) return null;
+    return days
+        .map((d) => `${WEEKDAY_SHORT[d.weekday]} ${clockLabel(d.hour, d.minute)}`)
+        .join(' · ');
+}
+
+/* ------------------------- admin summaries ---------------------------- */
+
+/**
+ * One schedule, flattened for a list view.
+ *
+ * Takes the suspension calendar as a map rather than querying it, so a page
+ * showing a hundred customers costs one range query instead of a hundred
+ * point lookups. `summarizeMany` below is the thing to call.
+ */
+function summarize(schedule, { from = new Date(), suspendedByDate = new Map(), lookahead = 4 } = {}) {
+    const days = orderedDays(schedule);
+    if (!days.length) {
+        return { hasSchedule: false, active: false, label: null, shortLabel: null, days: [], next: null, upcoming: [] };
+    }
+
+    const active = isActive(schedule, from);
+    const upcoming = nextOccurrences(schedule, lookahead + 4, from)
+        .map((occ) => {
+            const suspension = suspendedByDate.get(occ.dateKey) || null;
+            return {
+                at: occ.at,
+                dateKey: occ.dateKey,
+                suspended: !!suspension,
+                reason: suspension ? suspension.reason : null,
+                timeLabel: clockLabel(occ.hour, occ.minute),
+            };
+        })
+        .slice(0, lookahead);
+
+    return {
+        hasSchedule: true,
+        active,
+        // The stored word, which is not the same question as `active`: a pause
+        // with a date on it lapses on its own and reads active again.
+        status: (schedule && schedule.status) || 'active',
+        pausedUntil: (schedule && schedule.pausedUntil) || null,
+        days: days.map((d) => ({
+            weekday: d.weekday,
+            hour: Number.isFinite(d.hour) ? d.hour : 9,
+            minute: Number.isFinite(d.minute) ? d.minute : 0,
+        })),
+        daysPerWeek: days.length,
+        label: describe(schedule),
+        shortLabel: describeShort(schedule),
+        address: (schedule && schedule.address && schedule.address.streetAddress) || null,
+        reminderLeadMin: (schedule && schedule.reminderLeadMin) || null,
+        source: (schedule && schedule.source) || null,
+        updatedAt: (schedule && schedule.updatedAt) || null,
+        next: upcoming.find((u) => !u.suspended) || null,
+        upcoming,
+    };
+}
+
+/**
+ * Summaries for a whole list, in one suspension query.
+ *
+ * `entries` is [{ key, schedule }]; the returned Map is keyed the same way.
+ */
+async function summarizeMany(entries, { from = new Date(), lookahead = 4 } = {}) {
+    const out = new Map();
+    if (!entries.length) return out;
+
+    // 60 days covers four occurrences of even a once-a-week schedule with room
+    // for a run of suspended days.
+    const fromKey = nycDateKey(from);
+    const toKey = nycDateKey(new Date(from.getTime() + 60 * 24 * 60 * 60 * 1000));
+    const suspensions = await listRange(fromKey, toKey);
+    const suspendedByDate = new Map(suspensions.map((s) => [s.date, s]));
+
+    entries.forEach(({ key, schedule }) => {
+        out.set(key, summarize(schedule, { from, suspendedByDate, lookahead }));
+    });
+    return out;
+}
+
 module.exports = {
     nycParts,
     nycWallClockToDate,
@@ -272,6 +394,11 @@ module.exports = {
     isActive,
     nextMove,
     monthView,
+    describe,
+    describeShort,
+    clockLabel,
+    summarize,
+    summarizeMany,
 };
 
 /**

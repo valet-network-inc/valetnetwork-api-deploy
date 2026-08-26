@@ -244,3 +244,79 @@ describe('admin subscriptions overview', () => {
         expect(data.summary.mrrCents).toBe(10000);
     });
 });
+
+/* -------------------------------------------------------------------------- */
+/* The cleaning day, which is the thing an operator actually dispatches on      */
+/* -------------------------------------------------------------------------- */
+
+describe('the cleaning day on a subscriber row', () => {
+    const TUE = [{ weekday: 2, hour: 11, minute: 30 }];
+    const THU = [{ weekday: 4, hour: 9, minute: 0 }];
+
+    it('reads the customer\'s own schedule, which is what the scheduler books off', async () => {
+        const user = await makeCustomer({
+            cleaningSchedule: {
+                days: TUE,
+                status: 'active',
+                source: 'subscription',
+                address: { streetAddress: '264 President St, Brooklyn, NY 11231' },
+            },
+        });
+        await makeSub(user, { aspSchedule: { days: TUE } });
+
+        const [row] = (await load()).rows;
+        expect(row.cleaning.hasSchedule).toBe(true);
+        expect(row.cleaning.shortLabel).toBe('Tue 11:30 AM');
+        expect(row.cleaning.label).toBe('Tuesdays at 11:30 AM');
+        expect(row.cleaning.from).toBe('customer');
+        expect(row.cleaning.address).toContain('264 President St');
+        expect(row.cleaning.next).toBeTruthy();
+        expect(row.cleaning.matchesPlan).toBe(true);
+    });
+
+    it('falls back to the plan\'s own copy for a customer with no home schedule', async () => {
+        const user = await makeCustomer();
+        await makeSub(user, { aspSchedule: { days: THU } });
+
+        const [row] = (await load()).rows;
+        expect(row.cleaning.shortLabel).toBe('Thu 9:00 AM');
+        expect(row.cleaning.from).toBe('subscription');
+        // Nothing to compare against, so no false alarm.
+        expect(row.cleaning.matchesPlan).toBeNull();
+    });
+
+    it('flags a plan and a home schedule that have drifted apart', async () => {
+        const user = await makeCustomer({ cleaningSchedule: { days: TUE, status: 'active' } });
+        await makeSub(user, { aspSchedule: { days: [...TUE, ...THU] } });
+
+        const [row] = (await load()).rows;
+        expect(row.cleaning.shortLabel).toBe('Tue 11:30 AM');
+        expect(row.cleaning.matchesPlan).toBe(false);
+        expect(row.cleaning.planLabel).toBe('Tue 11:30 AM · Thu 9:00 AM');
+    });
+
+    it('shows a paused schedule as paused — nothing gets booked while it is', async () => {
+        const user = await makeCustomer({
+            cleaningSchedule: { days: TUE, status: 'paused', pausedUntil: null },
+        });
+        await makeSub(user, { aspSchedule: { days: TUE } });
+
+        const [row] = (await load()).rows;
+        expect(row.cleaning.active).toBe(false);
+        expect(row.cleaning.status).toBe('paused');
+    });
+
+    it('says so plainly when there is no schedule anywhere', async () => {
+        const user = await makeCustomer();
+        await makeSub(user);
+
+        const [row] = (await load()).rows;
+        expect(row.cleaning).toMatchObject({ hasSchedule: false, next: null });
+        expect(row.cleaning.from).toBeNull();
+    });
+
+    it('stamps New York\'s date so the tab can say "today" without guessing', async () => {
+        const data = await load();
+        expect(data.todayKey).toBe(require('../services/nyTime').nyDateKey(new Date()));
+    });
+});

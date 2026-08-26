@@ -255,3 +255,79 @@ describe('pausing', () => {
         expect(isActive({ days: [], status: 'active' })).toBe(false);
     });
 });
+
+/* -------------------------------------------------------------------------- */
+/* What the operator console reads off a schedule                              */
+/* -------------------------------------------------------------------------- */
+
+const {
+    describe: describeSchedule,
+    describeShort,
+    clockLabel,
+    summarize,
+} = require('../services/cleaningSchedule');
+
+describe('putting a schedule into words', () => {
+    it('writes one day as a sentence', () => {
+        expect(describeSchedule({ days: [{ weekday: 2, hour: 11, minute: 30 }] }))
+            .toBe('Tuesdays at 11:30 AM');
+    });
+
+    it('keeps each day on its own time — signs differ between a block\'s two days', () => {
+        const schedule = { days: [{ weekday: 4, hour: 9, minute: 0 }, { weekday: 2, hour: 11, minute: 30 }] };
+        expect(describeSchedule(schedule)).toBe('Tuesdays at 11:30 AM and Thursdays at 9:00 AM');
+        // Sunday-first order, whatever order they were stored in.
+        expect(describeShort(schedule)).toBe('Tue 11:30 AM · Thu 9:00 AM');
+    });
+
+    it('reads noon and midnight the way a person says them', () => {
+        expect(clockLabel(12, 0)).toBe('12:00 PM');
+        expect(clockLabel(0, 5)).toBe('12:05 AM');
+        expect(clockLabel(13, 45)).toBe('1:45 PM');
+    });
+
+    it('says nothing rather than something wrong when no days are set', () => {
+        expect(describeSchedule({ days: [] })).toBeNull();
+        expect(describeShort(null)).toBeNull();
+    });
+});
+
+describe('summarising a schedule for a list view', () => {
+    // A Wednesday, 8am in New York.
+    const FROM = new Date('2026-08-26T12:00:00Z');
+    const TUESDAYS = { days: [{ weekday: 2, hour: 11, minute: 30 }], status: 'active' };
+
+    it('reports the next move and the ones after it', () => {
+        const out = summarize(TUESDAYS, { from: FROM });
+        expect(out.hasSchedule).toBe(true);
+        expect(out.active).toBe(true);
+        expect(out.shortLabel).toBe('Tue 11:30 AM');
+        expect(out.daysPerWeek).toBe(1);
+        expect(out.next.dateKey).toBe('2026-09-01');
+        expect(out.upcoming.map((u) => u.dateKey))
+            .toEqual(['2026-09-01', '2026-09-08', '2026-09-15', '2026-09-22']);
+    });
+
+    it('marks a suspended day rather than hiding it, and skips it for "next"', () => {
+        const suspendedByDate = new Map([['2026-09-01', { date: '2026-09-01', reason: 'Labor Day' }]]);
+        const out = summarize(TUESDAYS, { from: FROM, suspendedByDate });
+        // The suspended day still shows on the calendar...
+        expect(out.upcoming[0]).toMatchObject({ dateKey: '2026-09-01', suspended: true, reason: 'Labor Day' });
+        // ...but nobody is being moved that day.
+        expect(out.next.dateKey).toBe('2026-09-08');
+    });
+
+    it('calls a paused schedule paused, and a lapsed pause active again', () => {
+        const paused = { ...TUESDAYS, status: 'paused', pausedUntil: new Date('2026-09-30T00:00:00Z') };
+        expect(summarize(paused, { from: FROM }).active).toBe(false);
+        expect(summarize(paused, { from: FROM }).status).toBe('paused');
+
+        const lapsed = { ...TUESDAYS, status: 'paused', pausedUntil: new Date('2026-08-01T00:00:00Z') };
+        expect(summarize(lapsed, { from: FROM }).active).toBe(true);
+    });
+
+    it('returns the empty shape, not a crash, for a customer who never set one', () => {
+        expect(summarize(null, { from: FROM })).toMatchObject({ hasSchedule: false, next: null, upcoming: [] });
+        expect(summarize({ days: [] }, { from: FROM }).hasSchedule).toBe(false);
+    });
+});
