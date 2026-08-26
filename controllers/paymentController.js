@@ -674,6 +674,31 @@ exports.handleStripeWebhook = async (req, res) => {
                 });
             }
 
+            // A tip and an extension are separate charges that happen to name
+            // the same order, and the order branch below rewrites
+            // `paymentIntentId`, `paymentDetails` and `checkout.paidAt` with
+            // whatever intent it is handed. So a $3 tip on a $15 park left the
+            // order pointing at the tip: the receipt showed $3, the funnel's
+            // paid-at moved to the tip's timestamp, and — the part that costs
+            // money — a later cancellation would refund against the tip's
+            // charge instead of the parking charge. Four production orders are
+            // in exactly that state.
+            //
+            // Both already have their own recording path: tipController writes
+            // the Tip row before the webhook lands, and an extension is applied
+            // by POST /api/order/:orderId/extend/confirm.
+            const piPurpose = paymentIntent.metadata?.purpose;
+            const piType = paymentIntent.metadata?.type;
+            if (piType === 'tip' || piPurpose === 'extension') {
+                console.log(
+                    `PaymentIntent ${paymentIntent.id} is a ${piType === 'tip' ? 'tip' : 'extension'} for order ${paymentIntent.metadata?.orderId} — not the order's own payment, leaving the order alone`
+                );
+                return res.status(200).json({
+                    success: true,
+                    message: 'Webhook processed successfully',
+                });
+            }
+
             // Subscription-invoice PaymentIntents carry no order metadata and
             // MUST NOT fall through to the guest-payment matchers below — the
             // "most recent pending GuestPayment" fallback would mark someone
