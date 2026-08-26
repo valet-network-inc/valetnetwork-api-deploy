@@ -55,6 +55,13 @@ exports.validateEventCode = async (req, res) => {
                 name: event.name,
                 type: event.type,
                 serviceType: event.serviceType,
+                // What the code will actually pay for. This endpoint is handed
+                // a code and nothing else — no order — so it cannot tell the
+                // caller whether THIS booking qualifies; createOrder is the one
+                // that enforces it. Reporting the scope at least lets a client
+                // say so before the customer reaches the charge.
+                scope: event.scope || 'any',
+                oncePerCustomer: !!event.oncePerCustomer,
                 validUntil: event.validUntil,
                 remainingUses: event.maxUses ? event.maxUses - event.currentUses : 'unlimited'
             }

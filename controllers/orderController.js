@@ -46,10 +46,14 @@ const OTP_EXPIRY_PARKING_LOCATION = 30 * 24 * 60 * 60 * 1000; // 30 days
 // customer $0 but carry the per-use value in listPriceCents — the valet is
 // paid from that, exactly as if the customer had paid per-use. Event-code
 // free orders stay unpaid (unchanged behavior).
+// A $0 order is not automatically $0 of work. Subscription coverage already
+// recorded what the move was worth so the valet still got their cut; a promo
+// code that zeroes the customer's fee has exactly the same shape, so the
+// source of the stamp no longer matters — only that one is there.
 const valetPayBaseCents = (order) =>
     order.totalAmount > 0
         ? order.totalAmount
-        : order.coveredBySubscription && order.listPriceCents > 0
+        : order.listPriceCents > 0
         ? order.listPriceCents
         : 0;
 exports.valetPayBaseCents = valetPayBaseCents;
@@ -373,6 +377,9 @@ exports.createOrder = async (req, res) => {
         const subscription = req.subscription || null;
         let isEventValid = false;
         let validatedEvent = null;
+        // What this move is worth at list price when a promo code paid for it.
+        // Stamped on the order so the valet is paid for work the customer got free.
+        let promoListPriceCents = 0;
         // Free service is decided here, never by the caller. This used to read
         // `isFreeService || false`, so a client could post `isFreeService: true`
         // and zero its own order — no event code, no subscription, no auth. A
@@ -407,9 +414,68 @@ exports.createOrder = async (req, res) => {
                     }
                 }
 
+                finalServiceType = serviceType || validatedEvent.serviceType || 'standard';
+
+                // A campaign code is scoped to what the campaign promised. Up
+                // to now a valid code meant "this entire order is free", which
+                // is safe for a code handed out at one venue and is not safe
+                // for one pushed to every customer on the platform: the same
+                // string would zero a 30-day away-mode hold or a plain park.
+                if (validatedEvent.scope === 'asp') {
+                    const isAspMove =
+                        !awayMode &&
+                        (orderType || 'parking') === 'parking' &&
+                        !!aspMode;
+                    if (!isAspMove) {
+                        console.log('Event code', validatedEvent.code, 'refused — not a street-cleaning move');
+                        return res.status(400).json({
+                            success: false,
+                            message:
+                                'That code covers a street-cleaning move. Book a street-cleaning move to use it.',
+                        });
+                    }
+                    // Car Watch is a paid add-on. Zeroing the order would hand
+                    // it over free too — the same reason subscription coverage
+                    // steps aside for it.
+                    if (carWatch) {
+                        console.log('Event code', validatedEvent.code, 'refused — Car Watch on the order');
+                        return res.status(400).json({
+                            success: false,
+                            message: 'Turn off Car Watch to use this code.',
+                        });
+                    }
+                }
+
+                // "The first one is on me" has to mean the first. A booking the
+                // customer cancelled does not burn it — they never got the move.
+                // The retrieval leg carries the parent's code and is not a
+                // second redemption.
+                if (validatedEvent.oncePerCustomer) {
+                    const alreadyRedeemed = await Order.exists({
+                        customer,
+                        eventCode: validatedEvent.code,
+                        orderType: { $ne: 'retrieval' },
+                        status: { $ne: 'cancelled' },
+                    });
+                    if (alreadyRedeemed) {
+                        console.log('Event code', validatedEvent.code, 'already redeemed by', customer);
+                        return res.status(400).json({
+                            success: false,
+                            message: "You've already used this code.",
+                        });
+                    }
+                }
+
+                // The promo gives away the customer's fee, not the valet's pay.
+                if (validatedEvent.paysValet) {
+                    promoListPriceCents = await subscriptionService.parkListPriceCents({
+                        aspMode: !!aspMode,
+                        serviceType: finalServiceType,
+                    });
+                }
+
                 isEventValid = true;
                 finalIsFreeService = true;
-                finalServiceType = serviceType || validatedEvent.serviceType || 'standard';
                 console.log('Event code validated successfully:', validatedEvent.name);
             } else {
                 console.log('Invalid or expired event code:', eventCode);
@@ -647,6 +713,8 @@ exports.createOrder = async (req, res) => {
                       coveredBySubscription: subscription._id,
                       listPriceCents: coverage.listPriceCents || totalAmount || 0,
                   }
+                : promoListPriceCents > 0
+                ? { listPriceCents: promoListPriceCents }
                 : {}),
             // Enterprise-only end-customer details (shown to valet instead of the enterprise's own name)
             ...(endCustomerName ? { endCustomerName } : {}),
