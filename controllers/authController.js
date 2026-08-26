@@ -40,109 +40,67 @@ exports.loginUser = async (req, res) => {
     const signupPlatform = resolveSignupPlatform(req);
 
     try {
-        let user = await User.findOne({ phone });
+        // Deleted accounts never get past here, and this read is also what
+        // tells us whether the account is brand new.
+        const existing = await User.findOne({ phone })
+            .select('_id isDeleted firstName enterpriseBusinessName')
+            .lean();
 
-        // Check if user is deleted
-        if (user && user.isDeleted) {
+        if (existing && existing.isDeleted) {
             return res.status(403).json({
                 success: false,
                 message: 'This account has been deleted. Please contact support for assistance.',
             });
         }
 
-        if (!user) {
-            user = new User({
-                phone,
-                firebaseUid,
-                verified: false,
-                isActive: true,
-                signupPlatform,
-            });
-            await user.save();
+        // ONE atomic write, deliberately not load-mutate-save.
+        //
+        // The app posts this on every launch and React Native fires it twice —
+        // 108 of 310 calls in one week arrived within half a second of their
+        // twin. Both copies used to load the same document at `__v: n`, both
+        // called save(), and the second one's version guard matched nothing and
+        // threw VersionError, which this handler turned into a 500. AuthContext
+        // catches that, never sets the user, and AuthLoadingScreen replaces the
+        // stack with LoginScreen — so a signed-in customer gets thrown back to
+        // "what's your number?" on launch. It hit 12 accounts, 11 of them real
+        // customers, in the last seven days of retained logs alone.
+        //
+        // findOneAndUpdate carries no version guard, so a concurrent twin is a
+        // harmless second write of identical values. It also stops save() from
+        // materialising `cleaningSchedule`'s subdocument defaults on every
+        // login, which is all those failed writes were ever carrying.
+        const user = await upsertLoginUser({ phone, firebaseUid, signupPlatform });
 
-            // Store FCM token if provided
-            if (fcmToken) {
-                await FCMToken.findOneAndUpdate(
-                    { token: fcmToken },
-                    {
-                        firebaseUid,
-                        token: fcmToken,
-                        deviceId: deviceId || 'unknown',
-                        isActive: true,
-                        lastUsedAt: new Date(),
-                    },
-                    { upsert: true, new: true }
-                );
-            }
-
-            res.status(200).json({
-                isNewUser: true,
-                message: 'New user created',
-                user,
-            });
-        } else {
-            // A user has "completed setup" if they have either a personal
-            // first name (Customer / Valet flow) OR an enterprise business
-            // name (Enterprise / Doorman flow). Without this fallback,
-            // Enterprise users — who never fill out firstName — get routed
-            // back through CreateAccountScreen on every re-login, which
-            // would clobber their existing enterprise data.
-            const hasCompletedSetup = !!(user.firstName || user.enterpriseBusinessName);
-            if (!hasCompletedSetup) {
-                user.firebaseUid = firebaseUid;
-                user.verified = false;
-                user.isActive = true;
-                await user.save();
-
-                // Store FCM token if provided
-                if (fcmToken) {
-                    await FCMToken.findOneAndUpdate(
-                        { token: fcmToken },
-                        {
-                            firebaseUid,
-                            token: fcmToken,
-                            deviceId: deviceId || 'unknown',
-                            isActive: true,
-                            lastUsedAt: new Date(),
-                        },
-                        { upsert: true, new: true }
-                    );
-                }
-
-                res.status(200).json({
-                    isNewUser: true,
-                    message: 'Returning user needs to setup account',
-                    user,
-                });
-            } else {
-                user.firebaseUid = firebaseUid;
-                user.verified = false;
-                user.isActive = true;
-                await user.save();
-
-                // Store FCM token if provided
-                if (fcmToken) {
-                    await FCMToken.findOneAndUpdate(
-                        { token: fcmToken },
-                        {
-                            firebaseUid,
-                            token: fcmToken,
-                            deviceId: deviceId || 'unknown',
-                            isActive: true,
-                            lastUsedAt: new Date(),
-                        },
-                        { upsert: true, new: true }
-                    );
-                }
-
-                res.status(200).json({
-                    isNewUser: false,
-                    message:
-                        'User already existed and is logged in successfully',
-                    user,
-                });
-            }
+        if (fcmToken) {
+            await FCMToken.findOneAndUpdate(
+                { token: fcmToken },
+                {
+                    firebaseUid,
+                    token: fcmToken,
+                    deviceId: deviceId || 'unknown',
+                    isActive: true,
+                    lastUsedAt: new Date(),
+                },
+                { upsert: true, new: true }
+            );
         }
+
+        // "Still needs the create-account screen." A user has completed setup if
+        // they have a personal first name (customer / valet) OR an enterprise
+        // business name (enterprise / doorman) — without the second half,
+        // enterprise users, who never fill in firstName, get routed back through
+        // CreateAccountScreen on every login and clobber their own data.
+        const isNewUser = !(user.firstName || user.enterpriseBusinessName);
+
+        return res.status(200).json({
+            isNewUser,
+            message: !existing
+                ? 'New user created'
+                : isNewUser
+                    ? 'Returning user needs to setup account'
+                    : 'User already existed and is logged in successfully',
+            user,
+        });
     } catch (err) {
         console.error(err);
         res.status(500).json({
@@ -151,6 +109,39 @@ exports.loginUser = async (req, res) => {
         });
     }
 };
+
+/**
+ * Upsert the login fields for a phone number, atomically.
+ *
+ * `phone` is a unique index, so two simultaneous first-logins can race the
+ * upsert and one of them comes back E11000 — the other one won, so retry once
+ * as a plain update and return the document it created.
+ */
+async function upsertLoginUser({ phone, firebaseUid, signupPlatform }) {
+    const update = {
+        $set: { firebaseUid, verified: false, isActive: true },
+        // Where they signed up, not where they were last seen: written only
+        // when this call is the one that creates the account.
+        $setOnInsert: { signupPlatform },
+    };
+
+    try {
+        return await User.findOneAndUpdate({ phone }, update, {
+            new: true,
+            upsert: true,
+            setDefaultsOnInsert: true,
+        });
+    } catch (err) {
+        if (err && err.code === 11000) {
+            return User.findOneAndUpdate(
+                { phone },
+                { $set: update.$set },
+                { new: true }
+            );
+        }
+        throw err;
+    }
+}
 
 exports.updateUser = async (req, res) => {
     const {

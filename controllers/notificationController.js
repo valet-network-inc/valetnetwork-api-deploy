@@ -421,8 +421,30 @@ exports.notifyClosestValets = async (req, res) => {
             tokens: uniqueValetTokens,
         };
 
-        const response = await admin.messaging().sendEachForMulticast(message);
-        console.log('Notification sent successfully:', response);
+        // The push is the loudest channel, not the only one, and it must not
+        // be able to take dispatch down with it.
+        //
+        // `sendEachForMulticast` throws outright on an empty token array, and
+        // everything that actually puts the job on a valet's screen — the
+        // notifiedValets record and the NEW_ORDER_AVAILABLE socket emit — used
+        // to sit BELOW this line. So five valets with no active token row
+        // between them (a stale token, a fresh install, a reinstall) turned
+        // into a 500, an order with an empty notifiedValets, and no socket
+        // event: the job existed, was paid for, and nobody was ever told.
+        // Both clients swallow a failure here by contract, so it was silent.
+        let response = { successCount: 0, failureCount: 0 };
+        if (uniqueValetTokens.length === 0) {
+            console.warn(
+                `notifyClosestValets: none of the ${closestValets.length} nearest valets has an active push token — dispatching over sockets only for order ${orderId}`
+            );
+        } else {
+            try {
+                response = await admin.messaging().sendEachForMulticast(message);
+                console.log('Notification sent successfully:', response);
+            } catch (pushErr) {
+                console.error('notifyClosestValets: push send failed:', pushErr.message);
+            }
+        }
 
         // Store notified valets data in the order
         const notifiedAt = new Date();
@@ -453,8 +475,11 @@ exports.notifyClosestValets = async (req, res) => {
         //     }
         // );
 
-        // Emit to customer's room
-        req.io.to(order.customer.toString()).emit('orderUpdated', {
+        // Emit to customer's room. `order.customer` is populated, so
+        // `.toString()` on it serialises the whole user document into the room
+        // name — a room nobody is in. The customer's own socket joins a room
+        // named by their id, so it has to be `._id`.
+        req.io.to(order.customer._id.toString()).emit('orderUpdated', {
             type: 'NEW_ORDER',
             order: order,
         });

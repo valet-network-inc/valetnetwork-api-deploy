@@ -1153,6 +1153,15 @@ exports.updateOrder = async (req, res) => {
             delete updates.parkClosed;
         }
 
+        // A body without an `updates` object used to throw here and come back
+        // as a 500. Say what's wrong instead.
+        if (!updates || typeof updates !== 'object') {
+            return res.status(400).json({
+                success: false,
+                message: 'updates object is required',
+            });
+        }
+
         // Check if vehicle info is required for parking/completion operations
         const requiresVehicle = ['parked', 'completed'].includes(updates.status);
         
@@ -2600,7 +2609,18 @@ const runAspSweep = async (io, now = new Date()) => {
         const aspOrders = await Order.find({
             aspMode: true,
             asp_time: { $exists: true, $ne: null },
-            status: { $in: ['parked'] },
+            // In away mode the valet takes the keys at pickup and keeps them
+            // for days. Whether the order was ever stamped `parked` is
+            // bookkeeping — the car is in the valet's hands either way, and
+            // the customer has paid for every scheduled move plus the return.
+            // Gating this on `parked` alone made a job the valet never closed
+            // out invisible to both halves below: no move reminder ever fired
+            // and no return leg was ever minted, silently, with the car still
+            // on the street. Three live orders were in exactly that state.
+            $or: [
+                { status: 'parked' },
+                { awayMode: true, status: { $in: ['accepted', 'in_progress', 'in-progress'] } },
+            ],
             linkedOrderId: { $exists: false } // Only original parking orders, not retrieval orders
         }).populate('valet customer');
 
@@ -2726,7 +2746,15 @@ const runAspSweep = async (io, now = new Date()) => {
                             customerLocation: order.customerLocation,
                             parkingType: 'retrieval',
                             orderType: 'retrieval',
-                            parkingLocation: order.parkingLocation,
+                            // A valet who never recorded where they parked
+                            // leaves this empty, and a return leg with no
+                            // location renders as a blank job. The pickup
+                            // address is the honest fallback — it is where the
+                            // car is going back to, and the valet holding the
+                            // keys knows where they left it.
+                            parkingLocation: order.parkingLocation?.lat
+                                ? order.parkingLocation
+                                : order.customerLocation,
                             duration: 30,
                             pickUpTime: now,
                             status: 'accepted',
@@ -3517,7 +3545,11 @@ exports.requestKeyReturn = async (req, res) => {
         const { orderId } = req.params;
         const { valetId } = req.body;
 
-        const order = await Order.findById(orderId).populate('user');
+        // `customer`, not `user` — the Order schema has no `user` path, and
+        // Mongoose's strictPopulate throws before a single line of the logic
+        // below runs, so every valet who tapped "return the keys" on an
+        // enterprise park-and-hold got a 500 and no way to close the job.
+        const order = await Order.findById(orderId).populate('customer');
         if (!order) {
             return res.status(404).json({ success: false, message: 'Order not found' });
         }
@@ -3546,13 +3578,13 @@ exports.requestKeyReturn = async (req, res) => {
         await order.save();
 
         // Push the enterprise/front-desk account that owns this order to
-        // generate the OTP from their app. user = the order creator
-        // (enterprise account holder for enterprise orders).
-        if (order.user?.firebaseUid) {
+        // generate the OTP from their app. `customer` is the order creator —
+        // the enterprise account holder on an enterprise order.
+        if (order.customer?.firebaseUid) {
             try {
                 const { sendPushNotification } = require('./notificationController');
                 await sendPushNotification(
-                    order.user.firebaseUid,
+                    order.customer.firebaseUid,
                     'Keys returning',
                     'Driver is returning keys — open the order to share the pickup code.',
                     {
