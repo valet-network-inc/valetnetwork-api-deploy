@@ -97,6 +97,17 @@ async function bookOccurrence(sub, day, occurrence, { io, notify, now }) {
             {
                 status: { $in: ['pending', 'accepted', 'in_progress', 'in-progress', 'parked', 'keys-returning'] },
                 paymentStatus: 'paid',
+                // A booking made for later is not a car in our care. Without
+                // this bound, one advance booking silently ate every covered
+                // move it overlapped: each occurrence returned
+                // 'skipped_active_order', the firing window closed, and no
+                // credit, push or alert marks a move that never happened. Six
+                // hours is the same horizon createOrder uses to decide whether
+                // an existing order blocks a new one (orderController.js).
+                $or: [
+                    { status: { $ne: 'pending' } },
+                    { pickUpTime: { $lte: new Date(now.getTime() + 6 * 60 * 60 * 1000) } },
+                ],
             },
             {
                 status: 'pending',

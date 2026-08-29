@@ -244,6 +244,43 @@ exports.notifyClosestValets = async (req, res) => {
             });
         }
 
+        // A booking made for later is dispatched by services/scheduledDispatch.js
+        // 45 minutes before its slot — not by whoever happened to take the
+        // payment. Refuse here, before anything is written.
+        //
+        // This is not defensive tidying. Every shipped iOS build calls this
+        // endpoint unconditionally the moment the card clears
+        // (OrderPreferencesScreen.js:732), including for an advance
+        // street-cleaning move seven days out. Two things then went wrong at
+        // once: five valets were pinged a week early, and — because the
+        // `notifiedValets` rows written below are exactly how the scheduled job
+        // recognises an order as already handled — the job would ignore that
+        // booking forever, so nobody would be told on the day either. A
+        // client-side guard cannot fix that; those builds are on phones.
+        //
+        // 200, not 4xx: both clients log a failure here, and this is not one.
+        const { DISPATCH_LEAD_MS } = require('../services/scheduledDispatch');
+        if (
+            order.pickUpTime &&
+            new Date(order.pickUpTime).getTime() - Date.now() > DISPATCH_LEAD_MS
+        ) {
+            console.log(
+                'notifyClosestValets: order',
+                orderId,
+                'is booked for',
+                new Date(order.pickUpTime).toISOString(),
+                '— deferring to scheduledDispatch'
+            );
+            return res.status(200).json({
+                success: true,
+                deferred: true,
+                dispatchAt: new Date(
+                    new Date(order.pickUpTime).getTime() - DISPATCH_LEAD_MS
+                ),
+                message: 'Booking is for later — a valet is sent 45 minutes before it.',
+            });
+        }
+
         // Find all active valets
         const activeValets = await User.find({
             isValet: true,

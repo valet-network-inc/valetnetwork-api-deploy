@@ -270,3 +270,102 @@ describe('auto-cancel and advance bookings coexist', () => {
         expect((await Order.findById(order._id)).status).toBe('cancelled');
     });
 });
+
+/* -------------------------------------------------------------------------- */
+
+describe('a client that dispatches at checkout cannot orphan its own booking', () => {
+    const notificationController = require('../controllers/notificationController');
+
+    const notify = async (orderId) => {
+        const res = mockRes();
+        await notificationController.notifyClosestValets(
+            { body: { orderId: String(orderId) }, io: { emit: () => {}, to: () => ({ emit: () => {} }) } },
+            res
+        );
+        return res;
+    };
+
+    it('defers a booking for later instead of fanning it out', async () => {
+        // Every shipped iOS build calls this the instant the card clears,
+        // whatever pickUpTime says (OrderPreferencesScreen.js:732).
+        const order = await booking(new Date(Date.now() + 5 * DAY));
+        await User.create({ phone: '+19796616775', isValet: true, verified: true, isActive: true });
+
+        const res = await notify(order._id);
+
+        expect(res.statusCode).toBe(200);
+        expect(res.body.deferred).toBe(true);
+
+        // The load-bearing half: notifiedValets must stay EMPTY, because a
+        // non-empty list is exactly how scheduledDispatch decides an order is
+        // somebody else's business. One row here and the booking is invisible
+        // to the job forever — pinged five days early and never dispatched.
+        const after = await Order.findById(order._id);
+        expect(after.notifiedValets).toHaveLength(0);
+    });
+
+    it('leaves the deferred booking dispatchable on the day', async () => {
+        const order = await booking(new Date(Date.now() + 5 * DAY));
+        await User.create({ phone: '+19796616776', isValet: true, verified: true, isActive: true });
+        await notify(order._id);
+
+        // Roll the slot forward into the lead window.
+        await Order.updateOne(
+            { _id: order._id },
+            { $set: { pickUpTime: new Date(Date.now() + 40 * MIN) } }
+        );
+
+        const spy = spyNotify();
+        await scheduledDispatch.tick({ notify: spy, alert: spyAlert() });
+        expect(spy.seen).toEqual([String(order._id)]);
+    });
+
+    it('still fans out a job for right now', async () => {
+        const order = await booking(new Date());
+        await User.create({ phone: '+19796616777', isValet: true, verified: true, isActive: true });
+        const res = await notify(order._id);
+        expect(res.body.deferred).toBeUndefined();
+    });
+});
+
+describe('createOrder refuses a pickup that has already passed', () => {
+    const create = async (pickUpTime) => {
+        const customer = await makeCustomer();
+        const res = mockRes();
+        await orderController.createOrder(
+            {
+                body: {
+                    customer: String(customer._id),
+                    customerLocation: HOME,
+                    parkingType: 'street',
+                    orderType: 'parking',
+                    duration: 90,
+                    pickUpTime,
+                    paymentMethod: 'card',
+                    totalAmount: 1500,
+                    serviceType: 'park-and-hold',
+                    aspMode: true,
+                },
+                headers: {},
+            },
+            res
+        );
+        return res;
+    };
+
+    it('400s a pickup half an hour gone', async () => {
+        const res = await create(new Date(Date.now() - 30 * MIN).toISOString());
+        expect(res.statusCode).toBe(400);
+        expect(res.body.message).toMatch(/already passed/i);
+    });
+
+    it('accepts one a few minutes old — clock skew and a slow card form', async () => {
+        const res = await create(new Date(Date.now() - 5 * MIN).toISOString());
+        expect(res.statusCode).not.toBe(400);
+    });
+
+    it('accepts a booking days out', async () => {
+        const res = await create(new Date(Date.now() + 5 * DAY).toISOString());
+        expect(res.statusCode).not.toBe(400);
+    });
+});

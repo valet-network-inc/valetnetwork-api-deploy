@@ -374,6 +374,32 @@ exports.createOrder = async (req, res) => {
             }
         }
 
+        // Nothing downstream survives a pickup that has already gone by.
+        // scheduledDispatch stops looking 20 minutes after it, parkingAlerts
+        // anchors the ending-soon push on `pickUpTime + duration`, and
+        // autoCancelStaleOrders then cancels and refunds 30 minutes later over
+        // a socket event alone — no push, no email. The customer paid, the car
+        // takes the ticket, and nobody is told. Refuse it at the door instead.
+        //
+        // The line is the dispatch window's own late edge, so anything this
+        // still accepts is something a valet can still be sent for. Away mode
+        // is exempt: its start is the leave date and its own range check
+        // already ran above.
+        {
+            const { DISPATCH_LATE_GRACE_MS } = require('../services/scheduledDispatch');
+            const pickupMs = new Date(pickUpTime).getTime();
+            if (
+                !awayMode &&
+                Number.isFinite(pickupMs) &&
+                pickupMs < Date.now() - DISPATCH_LATE_GRACE_MS
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'That pickup time has already passed. Pick a later one.',
+                });
+            }
+        }
+
         const subscription = req.subscription || null;
         let isEventValid = false;
         let validatedEvent = null;
