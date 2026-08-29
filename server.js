@@ -272,6 +272,31 @@ server.listen(PORT, () => {
         }
     }
 
+    // Background job: advance-booking dispatch — puts a booking made for
+    // later in front of valets 45 minutes before its pickup, instead of at
+    // checkout (which pinged five valets on Saturday for a Thursday job) or
+    // never (which is what actually happened). Idempotent: it only touches
+    // paid pending orders with an EMPTY notifiedValets, so a normal
+    // book-it-now order, already dispatched by the client, is invisible to it.
+    // See services/scheduledDispatch.js.
+    if (process.env.SCHEDULED_DISPATCH_ENABLED === 'false') {
+        console.warn('Scheduled dispatch DISABLED via SCHEDULED_DISPATCH_ENABLED=false — advance bookings will not reach valets.');
+    } else {
+        try {
+            const scheduledDispatch = require('./services/scheduledDispatch');
+            setInterval(() => {
+                scheduledDispatch
+                    .tick()
+                    .catch((e) =>
+                        console.error('scheduledDispatch interval error:', e.message)
+                    );
+            }, 60 * 1000);
+            console.log('Scheduled dispatch registered (runs every 60s)');
+        } catch (err) {
+            console.error('Failed to register scheduled dispatch:', err.message);
+        }
+    }
+
     // Background job: auto-ASP subscription scheduler — books the covered
     // street-cleaning move for every active subscriber ~45 min before their
     // scheduled sweep. Idempotent via Order.autoBookKey (unique index); never

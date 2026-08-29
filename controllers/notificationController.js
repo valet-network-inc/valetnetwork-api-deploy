@@ -24,6 +24,23 @@ const haversineMeters = (a, b) => {
 };
 
 // Helper function to send Slack notification
+/**
+ * How a valet should see a customer whose name we never collected.
+ *
+ * Web signups give a phone number and nothing else (`/park` asks for a code,
+ * not a name), so `firstName`/`lastName` are routinely absent on real, paying
+ * customers.
+ */
+const customerLabel = (customer) => {
+    const name = [customer?.firstName, customer?.lastName].filter(Boolean).join(' ').trim();
+    if (name) return name;
+    const digits = String(customer?.phone || '').replace(/\D/g, '').slice(-10);
+    if (digits.length === 10) {
+        return `(${digits.slice(0, 3)}) ${digits.slice(3, 6)}-${digits.slice(6)}`;
+    }
+    return 'A customer';
+};
+
 const sendSlackNotification = async (title, message, details = {}) => {
     try {
         const environment = process.env.NODE_ENV || 'development';
@@ -329,15 +346,41 @@ exports.notifyClosestValets = async (req, res) => {
             '(alwaysNotify added:', alwaysNotify.length, ')'
         );
 
-        // Prepare notification message
-        const customerName = `${order.customer.firstName} ${order.customer.lastName}`;
+        // Prepare notification message.
+        //
+        // The name used to be a bare `firstName + ' ' + lastName`. A customer
+        // who signed up on the web hands over a phone number and nothing else
+        // — no name is ever collected — so every valet push for one of them
+        // read "undefined undefined needs parking at ...". Fall back to the
+        // number, which is the thing a valet can actually act on anyway.
+        const customerName = customerLabel(order.customer);
+
+        // A street-cleaning move is not "parking". It has a hard deadline (the
+        // sweeper), the car has to be back afterwards, and — now that bookings
+        // can be made days ahead and dispatched 45 minutes before the slot —
+        // the valet needs the time in front of them, not just an address.
+        const isSweep = !!order.aspMode && order.orderType !== 'retrieval';
+        const whenLabel = order.pickUpTime
+            ? new Date(order.pickUpTime).toLocaleTimeString('en-US', {
+                  hour: 'numeric',
+                  minute: '2-digit',
+                  timeZone: 'America/New_York',
+              })
+            : null;
+
         const title =
             order.orderType === 'retrieval'
                 ? 'New Retrieval Request'
+                : isSweep
+                ? 'Street-cleaning move'
                 : 'New Parking Request';
         const body =
             order.orderType === 'retrieval'
                 ? `${customerName} needs their car retrieved from ${order.customerLocation.streetAddress}.`
+                : isSweep
+                ? `${customerName} — move at ${whenLabel || 'the posted time'} from ${
+                      order.customerLocation.streetAddress
+                  }. Re-park it when the window ends.`
                 : `${customerName} needs parking at ${
                       order.customerLocation.streetAddress
                   }. Duration: ${order.duration / 60} hours`;
@@ -387,7 +430,7 @@ exports.notifyClosestValets = async (req, res) => {
         const data = {
             orderId: order._id.toString(),
             orderType: order.orderType,
-            customerName: `${order.customer.firstName} ${order.customer.lastName}`,
+            customerName,
         };
         const stringData = Object.keys(data || {}).reduce((acc, key) => {
             acc[key] = String(data[key]);
@@ -804,3 +847,8 @@ exports.sendUserNotification = async (req, res) => {
         });
     }
 };
+
+// Exported for services/scheduledDispatch.js, which escalates an advance
+// booking nobody has taken shortly before its slot.
+exports.sendSlackNotification = sendSlackNotification;
+exports.customerLabel = customerLabel;

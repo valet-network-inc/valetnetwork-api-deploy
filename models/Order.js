@@ -367,6 +367,28 @@ const OrderSchema = new mongoose.Schema({
             type: Date,
         },
     }],
+    // --- Advance bookings --------------------------------------------------
+    // When services/scheduledDispatch.js actually put this order in front of
+    // valets. Only ever set on a booking made for later: a book-it-now order
+    // is dispatched by the client the moment the card clears, and is
+    // recognised by its already-populated `notifiedValets`. Absent on every
+    // order written before advance dispatch shipped, which is exactly what
+    // lets the job adopt them.
+    dispatchedAt: {
+        type: Date,
+    },
+    dispatchAttempts: {
+        type: Number,
+        default: 0,
+    },
+    dispatchError: {
+        type: String,
+    },
+    // Set once when a booking's slot is nearly here and no valet has taken it.
+    // Its only job is to keep that alert to one, not one a minute.
+    dispatchEscalatedAt: {
+        type: Date,
+    },
     acceptanceLocation: {
         lat: {
             type: Number,

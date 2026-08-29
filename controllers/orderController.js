@@ -825,7 +825,30 @@ exports.createOrder = async (req, res) => {
 
 exports.getPendingOrders = async (req, res) => {
     try {
-        const orders = await Order.find({ status: 'pending', paymentStatus: 'paid' });
+        // A booking made for later is a real, paid, pending order the moment
+        // it is created, and this feed had no time filter at all — so a move
+        // booked on Saturday for Thursday sat in every valet's list for five
+        // days, indistinguishable from a job waiting right now. A valet who
+        // accepted it then held it, and the customer's real dispatch window
+        // came and went with the order already assigned to someone who had
+        // moved on.
+        //
+        // The feed now ends where dispatch begins: a job appears exactly when
+        // services/scheduledDispatch.js is about to push it out, and not
+        // before. Orders with no pickUpTime are kept — the field is required
+        // now, but nothing guarantees it on older documents, and a job with no
+        // stated time is a job for now.
+        const { DISPATCH_LEAD_MS } = require('../services/scheduledDispatch');
+        const dispatchHorizon = new Date(Date.now() + DISPATCH_LEAD_MS);
+        const orders = await Order.find({
+            status: 'pending',
+            paymentStatus: 'paid',
+            $or: [
+                { pickUpTime: { $lte: dispatchHorizon } },
+                { pickUpTime: { $exists: false } },
+                { pickUpTime: null },
+            ],
+        });
 
         res.status(200).json({
             success: true,
