@@ -325,6 +325,20 @@ const OrderSchema = new mongoose.Schema({
             enum: ['order_creation', 'parking_location', 'return_key'],
         },
     },
+    // A handoff the valet vouched for instead of the customer typing a code.
+    //
+    // It happens: the customer walks away before the ritual, and the valet is
+    // standing there having just identified them face to face. The order still
+    // has to close. Recording it here keeps `otp` honest — the code stays
+    // unverified, because nobody entered it — while leaving a trail that says
+    // who overrode the step and why. Never write this to stand in for a
+    // customer action that did happen; that belongs in `otpVerifiedTimes`.
+    otpOverride: {
+        bypassedAt: { type: Date },
+        bypassedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+        method: { type: String },   // e.g. 'in-person-identity-check'
+        note: { type: String },
+    },
     otpVerifiedTimes: {
         orderCreation: {
             type: Date,
