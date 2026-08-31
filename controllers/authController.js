@@ -1,6 +1,7 @@
 const User = require('../models/User');
 const FCMToken = require('../models/FCMToken');
 const { resolveSignupPlatform } = require('../services/signupPlatform');
+const { ensurePushChannelDoc } = require('../services/pushChannel');
 
 // Function to generate a random 6-character code (numbers and capital letters)
 const generateReferralCode = () => {
@@ -84,6 +85,17 @@ exports.loginUser = async (req, res) => {
                 { upsert: true, new: true }
             );
         }
+
+        // Every account gets a Firestore push-channel document, whether or not
+        // it has a token yet. Web signups never had one, and the shipped valet
+        // build reads that document without guarding it — see
+        // `services/pushChannel.js`. Deliberately not awaited into the
+        // response path beyond this: it must never delay or fail a login.
+        ensurePushChannelDoc(firebaseUid).then((outcome) => {
+            if (outcome === 'created') {
+                console.log('Prepared push-channel doc for', firebaseUid);
+            }
+        });
 
         // "Still needs the create-account screen." A user has completed setup if
         // they have a personal first name (customer / valet) OR an enterprise
