@@ -25,6 +25,7 @@ const PricingConfig = require('../models/PricingConfig');
 const subscriptionController = require('../controllers/subscriptionController');
 const { buildStatusPayload } = require('../services/subscriptionService');
 const promos = require('../services/subscriptionPromos');
+const adminPromo = require('../controllers/adminPromoController');
 
 let mongod;
 
@@ -293,5 +294,92 @@ describe('a plan inside its free month', () => {
         );
         expect(res.statusCode).toBe(400);
         expect(res.body.message).toMatch(/free month/i);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// HANDSFREE2 — the same free month on a block that is swept twice a week
+// ---------------------------------------------------------------------------
+
+const TWO_MOVE_PLAN = { tier: 'street_cleaning', interval: 'month', movesPerWeek: 2 };
+
+describe('HANDSFREE2', () => {
+    it('is found however the customer types it', () => {
+        expect(promos.findPromo('HANDSFREE2').code).toBe('HANDSFREE2');
+        expect(promos.findPromo(' handsfree2 ').code).toBe('HANDSFREE2');
+        // What people actually type when they hear it out loud.
+        expect(promos.findPromo('hands free 2').code).toBe('HANDSFREE2');
+        expect(promos.findPromo('HANDSFREE-2').code).toBe('HANDSFREE2');
+    });
+
+    it('does not swallow the one-move code, and the one-move code does not swallow it', () => {
+        expect(promos.findPromo('HANDSFREE').code).toBe('HANDSFREE');
+        expect(promos.findPromo('HANDSFREE2').appliesTo.movesPerWeek).toBe(2);
+        expect(promos.findPromo('HANDSFREE').appliesTo.movesPerWeek).toBe(1);
+    });
+
+    it('is a trial that converts to $100, not $50', () => {
+        const promo = promos.findPromo('HANDSFREE2');
+        expect(promo.kind).toBe('free_trial');
+        expect(promo.trialDays).toBe(30);
+        const shown = promos.describe(promo, { amountCents: 10000, interval: 'month' });
+        expect(shown.dueTodayCents).toBe(0);
+        expect(shown.thenCents).toBe(10000);
+        expect(shown.requiresCard).toBe(true);
+    });
+
+    it('covers the two-move monthly plan and nothing else', () => {
+        const promo = promos.findPromo('HANDSFREE2');
+        expect(promos.planMismatch(promo, TWO_MOVE_PLAN)).toBeNull();
+        expect(promos.planMismatch(promo, { ...TWO_MOVE_PLAN, movesPerWeek: 1 })).toMatch(/\$100 a month/);
+        expect(promos.planMismatch(promo, { ...TWO_MOVE_PLAN, interval: 'week' })).toMatch(/\$100 a month/);
+        expect(promos.planMismatch(promo, { ...TWO_MOVE_PLAN, tier: 'valet_anywhere' })).toMatch(/\$100 a month/);
+    });
+
+    it('tells the customer how many moves the code is for', () => {
+        // The sentence used to be written for HANDSFREE alone and said "one
+        // move a week" whichever code produced it.
+        expect(promos.planMismatch(promos.findPromo('HANDSFREE2'), THE_PLAN)).toMatch(/two moves a week/);
+        expect(promos.planMismatch(promos.findPromo('HANDSFREE'), TWO_MOVE_PLAN)).toMatch(/one move a week/);
+    });
+
+    it('is still one free month per customer', async () => {
+        const user = await makeCustomer();
+        expect(await promos.promoRedemptionBlock(promos.findPromo('HANDSFREE2'), user._id)).toBeNull();
+        await makeSub(user, { status: 'cancelled', activatedAt: new Date('2026-07-01') });
+        expect(await promos.promoRedemptionBlock(promos.findPromo('HANDSFREE2'), user._id)).toMatch(/first plan/i);
+    });
+
+    it('snaps a customer who picked one move onto the two-move plan, priced at $100', async () => {
+        const res = mockRes();
+        await subscriptionController.checkPromo({ body: { code: 'handsfree2', ...THE_PLAN } }, res);
+        expect(res.statusCode).toBe(200);
+        expect(res.body.applyTo).toEqual(TWO_MOVE_PLAN);
+        expect(res.body.amountCents).toBe(10000);
+        expect(res.body.promo.dueTodayCents).toBe(0);
+        expect(res.body.promo.thenCents).toBe(10000);
+        expect(res.body.note).toMatch(/two moves a week/);
+    });
+
+    it('quotes $100 with no complaint when they were already on the right plan', async () => {
+        const res = mockRes();
+        await subscriptionController.checkPromo({ body: { code: 'HANDSFREE2', ...TWO_MOVE_PLAN } }, res);
+        expect(res.statusCode).toBe(200);
+        expect(res.body.note).toBeNull();
+        expect(res.body.amountCents).toBe(10000);
+        expect(res.body.promo.thenCents).toBe(10000);
+    });
+
+    it('can be hung on an account ahead of the purchase', async () => {
+        const user = await makeCustomer();
+        const res = mockRes();
+        await adminPromo.setPendingPromo(
+            { body: { userIds: [user._id.toString()], code: 'handsfree2' } },
+            res
+        );
+        expect(res.body.success).toBe(true);
+        expect(res.body.code).toBe('HANDSFREE2');
+        expect(res.body.appliesTo).toEqual(TWO_MOVE_PLAN);
+        expect((await User.findById(user._id)).pendingPromoCode).toBe('HANDSFREE2');
     });
 });

@@ -2,6 +2,8 @@
 //
 // HANDSFREE is the trial code: the first month of the $50 street-cleaning
 // plan is on us, and the plan renews at the normal price after it.
+// HANDSFREE2 is the same offer for the block that is swept twice a week —
+// the $100 two-move plan.
 //
 // It runs as a real Stripe TRIAL rather than a 100%-off coupon, because a
 // coupon that zeroes the first invoice settles with no PaymentIntent — the
@@ -25,18 +27,43 @@ const PROMOS = {
         detail:
             'Your first month of street-cleaning moves is on us. Cancel any time before it ends and you are never charged.',
         // Locked to the $50/mo plan: street cleaning, monthly, one move a
-        // week. Widening it to the two-move ($100/mo) plan is a one-line
-        // change to movesPerWeek below.
+        // week. The two-move plan has its own code, HANDSFREE2.
         appliesTo: { tier: 'street_cleaning', interval: 'month', movesPerWeek: 1 },
         // A trial is for people who have not tried it. One per customer,
         // and only before their first plan ever starts.
         firstTimeOnly: true,
         active: true,
     },
+
+    // The same free month for a block that is swept twice a week: two covered
+    // moves instead of one, $100/mo instead of $50.
+    //
+    // It is a second code rather than a widening of HANDSFREE. A promo whose
+    // appliesTo leaves movesPerWeek open has nothing to snap the customer
+    // onto — `applyTo` goes back to the app with movesPerWeek undefined, the
+    // review screen falls through to a quantity of one, and the customer is
+    // shown $50 for a plan that will bill $100 the month the trial ends. A
+    // code that lies about the price it converts to is worse than no code.
+    HANDSFREE2: {
+        code: 'HANDSFREE2',
+        kind: 'free_trial',
+        trialDays: 30,
+        headline: 'First month free',
+        detail:
+            'Your first month of street-cleaning moves is on us — both days a week. Cancel any time before it ends and you are never charged.',
+        appliesTo: { tier: 'street_cleaning', interval: 'month', movesPerWeek: 2 },
+        firstTimeOnly: true,
+        active: true,
+    },
 };
 
+// Codes are typed by hand on a phone. Inner spaces and dashes are the
+// customer's, not the code's — "hands free 2" and "HANDSFREE-2" are both
+// HANDSFREE2, and a code that turns those away only generates a support text.
 function normalizeCode(code) {
-    return String(code || '').trim().toUpperCase();
+    return String(code || '')
+        .replace(/[\s-]+/g, '')
+        .toUpperCase();
 }
 
 // Codes configured in the environment as CODE:couponId. This is the older
@@ -81,7 +108,16 @@ function planMismatch(promo, { tier, interval, movesPerWeek }) {
         (!wants.interval || interval === wants.interval) &&
         (!wants.movesPerWeek || Number(movesPerWeek) === wants.movesPerWeek);
     if (fits) return null;
-    return `${promo.code} covers the ${name} plan at $${dollars} a month — one move a week, billed monthly.`;
+    // Describe the plan the code actually covers. This sentence used to be
+    // written for HANDSFREE alone and said "one move a week, billed monthly"
+    // no matter which promo produced it — with a second code in the table it
+    // would have told a two-move customer the wrong thing about their own
+    // offer.
+    const unit = wants.interval === 'week' ? 'week' : 'month';
+    const moves = wants.movesPerWeek || 1;
+    const spelled = ['', 'one', 'two', 'three', 'four'][moves] || String(moves);
+    const cadence = `${spelled} move${moves === 1 ? '' : 's'} a week`;
+    return `${promo.code} covers the ${name} plan at $${dollars} a ${unit} — ${cadence}.`;
 }
 
 // Has this customer already had their free month? Trial codes are for a
