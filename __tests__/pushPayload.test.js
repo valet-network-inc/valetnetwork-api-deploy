@@ -48,6 +48,15 @@ describe('the APNs payload', () => {
         expect(apsOf(sent[0])).not.toHaveProperty('content-available');
     });
 
+    // A hardcoded `badge: 1` here left every iOS customer with a red dot they
+    // could not remove — iOS never clears a badge by itself, and the app has
+    // no code that does. 0 is an absolute set, so every ordinary push now
+    // clears whatever stale dot the recipient was carrying.
+    it('clears the app icon badge instead of pinning a permanent 1', async () => {
+        await sendPushNotification('uid-1', 'Title', 'Body');
+        expect(apsOf(sent[0]).badge).toBe(0);
+    });
+
     it('rings the valet bell instead of the system chime', async () => {
         await sendPushNotification('uid-1', 'Title', 'Body');
         expect(apsOf(sent[0]).sound).toBe('valet-bell.caf');

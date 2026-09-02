@@ -96,6 +96,24 @@ const isDeadTokenError = (error) => {
     return code === 'messaging/invalid-argument' && /token/i.test(message);
 };
 
+// --- iOS app-icon badge ---------------------------------------------------
+// This was a hardcoded `badge: 1` in all three payloads below, and it is why
+// customers wrote in about a red dot they could not get rid of.
+//
+// APNs treats aps.badge as an ABSOLUTE SET, not an increment, and iOS never
+// clears a badge on its own: not when the notification is swiped away, not
+// when it is deleted from Notification Center, not when the app is opened.
+// Only the app or a push carrying badge: 0 can clear one. The app has never
+// contained a single line that does. So every push we have ever sent pinned a
+// permanent "1" on the icon, removable only by deleting the app.
+//
+// 0 is the honest value until the app owns its own badge (notifee
+// setBadgeCount(0) on foreground). The alert IS the notification; the badge
+// adds nothing here and cannot be undone. Sending 0 also self-heals — the next
+// ordinary push a stuck customer receives clears their dot, with no extra
+// send and no silent-push risk, on the build already on their phone.
+const IOS_BADGE = 0;
+
 const buildPushMessage = (token, title, body) => ({
     notification: {
         title,
@@ -110,7 +128,7 @@ const buildPushMessage = (token, title, body) => ({
                 },
                 'mutable-content': 1,
                 sound: 'valet-bell.caf',
-                badge: 1,
+                badge: IOS_BADGE,
             },
         },
         headers: {
@@ -489,7 +507,7 @@ exports.notifyClosestValets = async (req, res) => {
                         },
                         'mutable-content': 1,
                         sound: 'valet-bell.caf',
-                        badge: 1,
+                        badge: IOS_BADGE,
                     },
                 },
                 headers: {
@@ -652,7 +670,7 @@ exports.sendPushNotification = async (
                                 },
                                 'mutable-content': 1,
                                 sound: soundName,
-                                badge: 1,
+                                badge: IOS_BADGE,
                             },
                         },
                         headers: {
