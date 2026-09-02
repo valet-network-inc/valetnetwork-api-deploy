@@ -102,6 +102,58 @@ const valetActiveOrderQuery = (valetId) => ({
     ],
 });
 
+// --- What a CUSTOMER has in flight -------------------------------------------
+//
+// One order at a time, which `createOrder` enforces. `hasActiveOrder` answers
+// the app's home screen from this, and the doorman link
+// (controllers/shareController.js) resolves its customer-scoped token through
+// the same query — the link has to land on exactly the order the customer's
+// own phone is showing, or the two are looking at different handoffs.
+const customerActiveOrderQuery = (userId) => ({
+    customer: userId,
+    status: {
+        $in: ['pending', 'accepted', 'in_progress', 'parked'],
+    },
+    paymentStatus: 'paid',
+    // A park the valet has closed out is NOT "in flight" to this query, and
+    // never has been: it used to sit on a status this query didn't list, so
+    // the customer app learned to find it in the orders list instead and shows
+    // it as the keys-held ticket. Keep that shape. Answering with it here
+    // hands shipped builds a case they have never seen from this endpoint, and
+    // their home screen renders the keys-held ticket for a frame and then
+    // replaces it with the generic in-progress one.
+    parkClosedAt: { $exists: false },
+});
+
+/**
+ * The same order document with the live handoff code taken out of it.
+ *
+ * `otp.code` is the number that releases a car. Several endpoints in this file
+ * answer with whole Order documents and none of them ask who is calling, so
+ * until now the code sat on the open internet: `getPendingOrders` published it
+ * beside the customer's ObjectId, and `updateValetLocation` echoed it back to
+ * anyone who posted an order id at it.
+ *
+ * The `otp` OBJECT stays. Shipped 2.2.0 reads its presence rather than its
+ * contents in two places — `arrivalRequiresOtp = !!displayOrder?.otp` and the
+ * key-return gate beside it, screens/valet/valetorder/ValetOrderScreen.js:325
+ * and :369 — and `displayOrder` is the pending-feed document until the valet
+ * accepts (hooks/useValetOrder.js:112). Deleting the whole object would take
+ * the code ritual off the valet's screen for the jobs he has not accepted yet.
+ *
+ * Reads through `toJSON()` rather than `toObject()` so the old-dialect status
+ * translation still happens; shipped builds are the reason that exists.
+ */
+const withoutOtpCode = (order) => {
+    if (!order) return order;
+    const plain = typeof order.toJSON === 'function' ? order.toJSON() : { ...order };
+    if (plain.otp && typeof plain.otp === 'object') {
+        plain.otp = { ...plain.otp };
+        delete plain.otp.code;
+    }
+    return plain;
+};
+
 // Safety valve against one valet hoovering the whole board — not a queue depth
 // we expect anyone to hit. Set VALET_MAX_ACTIVE_ORDERS to another number to
 // widen it, or to 0 for no cap at all.
@@ -206,6 +258,49 @@ const retrievalHasCustody = async (order) => {
         }
     }
     return false;
+};
+
+/**
+ * Was this retrieval BORN holding the keys?
+ *
+ * A different question from `retrievalHasCustody`, and the difference is the
+ * whole reason this exists. That one answers "does somebody have the keys
+ * right now", which is what the cancel gate and the doorman screen need. This
+ * one answers "did this leg ever have a beat 1 to be between" — which is what
+ * `verifyOTP` needs before it decides whether the code just typed was the
+ * first of two handoffs or the only one.
+ *
+ * Only the sweep's own return leg is born in custody: the valet took the keys
+ * at 8am, kept them through the move, and `checkAspOrders` mints the leg for
+ * him already accepted with no collection beat at all. Its single handoff is
+ * the one at the end, so re-minting a code when it verifies puts a live number
+ * on the doorman's screen after the car, the keys and the valet have all gone.
+ *
+ * Read off THE LEG, from the two marks the sweep stamps on the document it
+ * creates: `aspMode`, carried onto the leg deliberately, and `autoBookKey`,
+ * which is `aspreturn:<parent id>` and is written by nothing else.
+ *
+ * Deliberately NOT `retrievalHasCustody`. That helper ends in an inference
+ * about the PARENT — `aspMode && aspOrderCreated && parent.linkedOrderId
+ * points back at me` — which is sound for its own question and wrong for this
+ * one, because a customer who asks for her car back from a sweep-touched park
+ * gets an ordinary two-beat retrieval and `createRetrievalOrder` re-points the
+ * parent's `linkedOrderId` at it. That retrieval then matched the inference,
+ * skipped its re-mint, and verified both of its beats against the same six
+ * digits — which is exactly the reuse the re-mint was written to close: anyone
+ * who overheard the valet at the curb could claim the car at the end.
+ *
+ * A legacy sweep leg carrying neither mark falls through to `false` and gets a
+ * fresh code it has no second beat to spend. That is the safe side of the
+ * trade — a stale number on a screen, against a car that opens to a code a
+ * stranger heard — and nothing minted since the flags landed lacks them.
+ *
+ * Synchronous: everything it reads is on the document already.
+ */
+const retrievalBornInCustody = (order) => {
+    if (order?.orderType !== 'retrieval') return false;
+    if (order?.aspMode) return true;
+    return String(order?.autoBookKey || '').startsWith('aspreturn:');
 };
 
 /**
@@ -879,7 +974,13 @@ exports.getPendingOrders = async (req, res) => {
         res.status(200).json({
             success: true,
             message: 'Orders fetched successfully',
-            orders,
+            // The feed is pre-accept and open to anyone, which is two reasons
+            // the code has no business on it. A valet reads the number out at
+            // the curb on a job he is already carrying, and by then the
+            // document he is reading came from `acceptOrder` or
+            // `hasActiveOrder` (context/OrderContext.js:494 and :344), never
+            // from here — nothing shipped has ever taken a code off this list.
+            orders: orders.map(withoutOtpCode),
         });
     } catch (err) {
         console.error(err);
@@ -1078,23 +1179,7 @@ exports.hasActiveOrder = async (req, res) => {
         const valetSide = isValet === 'true';
         const query = valetSide
             ? valetActiveOrderQuery(userId)
-            : {
-                  customer: userId,
-                  status: {
-                      $in: ['pending', 'accepted', 'in_progress', 'parked'],
-                  },
-                  paymentStatus: 'paid',
-                  // A park the valet has closed out is NOT "in flight" to
-                  // this endpoint, and never has been: it used to sit on a
-                  // status this query didn't list, so the customer app
-                  // learned to find it in the orders list instead and shows
-                  // it as the keys-held ticket. Keep that shape. Answering
-                  // with it here hands shipped builds a case they have
-                  // never seen from this endpoint, and their home screen
-                  // renders the keys-held ticket for a frame and then
-                  // replaces it with the generic in-progress one.
-                  parkClosedAt: { $exists: false },
-              };
+            : customerActiveOrderQuery(userId);
 
         // Valets get the whole set; customers are still held to one order at a
         // time by `createOrder`, so that side keeps its single-document read.
@@ -1122,8 +1207,33 @@ exports.hasActiveOrder = async (req, res) => {
     }
 };
 
+/**
+ * Where the valet on this job is right now.
+ *
+ * Unauthenticated, and it writes a field the customer's live map and ETA are
+ * drawn from — so today a stranger with an order id (they are handed out by
+ * `getPendingOrders`) can move somebody's valet across a customer's screen.
+ *
+ * NOT enforced yet, deliberately. The build in every valet's pocket is 2.2.0,
+ * and context/LocationContext.js there posts `{ orderId, valetLocation }` and
+ * nothing else — no valet id, no token, nothing this endpoint could check a
+ * caller against. Rejecting unidentified writes would blind the customer's map
+ * on every live job until the fleet updates, which is a worse failure than the
+ * one it fixes.
+ *
+ * So: accept the write, and log the one case that is already evidence of
+ * something — a caller that names a valet who is not the one on the order. A
+ * caller naming nobody is the entire shipped fleet, thirty seconds apart, and
+ * logging that would be noise rather than a signal. When a build that sends
+ * `valetId` is out, the missing case becomes the interesting one and this
+ * becomes a 403.
+ *
+ * The doorman link no longer depends on this field at all — `handoffWindow` in
+ * controllers/shareController.js used to gate its keypad on it and does not
+ * any more, precisely because it is forgeable.
+ */
 exports.updateValetLocation = async (req, res) => {
-    const { orderId, valetLocation } = req.body;
+    const { orderId, valetLocation, valetId } = req.body;
 
     try {
         const order = await Order.findByIdAndUpdate(
@@ -1137,6 +1247,17 @@ exports.updateValetLocation = async (req, res) => {
                 success: false,
                 message: 'Order not found',
             });
+        }
+
+        if (valetId && String(valetId) !== String(order.valet || '')) {
+            console.warn(
+                'Valet location written by a caller who is not the assigned valet — order',
+                String(order._id),
+                '- claimed:',
+                String(valetId),
+                '- assigned:',
+                String(order.valet || 'none')
+            );
         }
 
         // Emit to both customer and valet rooms
@@ -1170,10 +1291,22 @@ exports.updateValetLocation = async (req, res) => {
             }
         }
 
+        // The echo is the leak, not the sockets. This endpoint takes an order
+        // id and nothing else, so anybody who read one off `getPendingOrders`
+        // could post it here and be handed the whole document back, live code
+        // included. Nothing reads the echo: LocationContext.js:148 checks
+        // `success` and drops the body.
+        //
+        // The socket payloads above are left whole on purpose. The valet's app
+        // folds a LOCATION_UPDATE into the job it names with a shallow spread
+        // (context/OrderContext.js `mergeOrderUpdate`), so an `otp` object
+        // arriving without its code would overwrite the good one and leave the
+        // valet with no number to read out — every thirty seconds, on every
+        // live job.
         res.status(200).json({
             success: true,
             message: 'Valet location updated successfully',
-            order,
+            order: withoutOtpCode(order),
         });
     } catch (err) {
         console.error(err);
@@ -1209,6 +1342,42 @@ exports.updateOrder = async (req, res) => {
                 success: false,
                 message: 'updates object is required',
             });
+        }
+
+        // The same swipe, said the way every shipped build actually says it.
+        //
+        // Neither spelling above is on a phone. "Swipe to End Order" sends a
+        // bare `{ status: 'parked' }` (hooks/useValetOrder.js), so no Park &
+        // Retrieve park has been stamped closed by a client since the collapse
+        // to one parked state — leaving the customer with no "bring my car
+        // back" button, no cancel-for-refund, and a 400 on their next booking
+        // until someone edited Mongo by hand.
+        //
+        // `status` alone cannot be the discriminator: the FIRST save of the
+        // parking spot sends `{ status: 'parked' }` too, while the valet is
+        // still walking the keys back. What separates them is that by the time
+        // the swipe arrives the key handoff is already stamped. So read the
+        // STORED document rather than `updates`, and match the exact shape
+        // scripts/backfill-park-closed-at.js repairs after the fact — park,
+        // park-and-hold, not already closed, handoff done. Enterprise
+        // dispatches (`endCustomerName`) close out on their own path and are
+        // deliberately left on it, same carve-out `valetActiveOrderQuery`
+        // makes.
+        if (updates.status === 'parked' && !updates.parkClosedAt) {
+            const closingOut = await Order.exists({
+                _id: orderId,
+                status: 'parked',
+                orderType: 'parking',
+                serviceType: 'park-and-hold',
+                parkClosedAt: { $exists: false },
+                'otpVerifiedTimes.returnKey': { $exists: true },
+                $or: [
+                    { endCustomerName: { $exists: false } },
+                    { endCustomerName: '' },
+                    { endCustomerName: null },
+                ],
+            });
+            if (closingOut) updates.parkClosedAt = new Date();
         }
 
         // Check if vehicle info is required for parking/completion operations
@@ -1477,7 +1646,7 @@ exports.updateOrder = async (req, res) => {
         // Otherwise, if status just became 'completed' and there's a valet,
         // credit valet's currentBalance + totalEarnings.
         //
-        // Revenue split: 70% to the valet, 30% to ValetNYC. Math.floor avoids
+        // Revenue split: 70% to the valet, 30% to Valet Network. Math.floor avoids
         // fractional cents (any rounding fragment goes to the platform).
         // Adjust `VALET_CUT` if the split changes — keep it on this single line.
         if (
@@ -1570,19 +1739,44 @@ exports.updateOrder = async (req, res) => {
     }
 };
 
+/**
+ * Every order this person has ever had, and the one place the live code could
+ * not be taken off.
+ *
+ * The valet's half is safe to strip and is stripped below: the only shipped
+ * caller that passes `isValet=true` is the history list
+ * (screens/PreviousOrdersScreen.js:84), which renders receipts, and the valet
+ * side of `fetchLiveOrder` returns before it ever reaches this endpoint
+ * (context/OrderContext.js:350).
+ *
+ * The CUSTOMER's half still carries it, and cannot stop. Both shipped customer
+ * surfaces fall back to this list when `hasActiveOrder` doesn't answer, and
+ * both then read the code straight off the document they picked:
+ *
+ *   iOS 2.2.0  context/OrderContext.js:359 -> screens/customer/UserOrderScreen.js:325
+ *   /park web  components/park/park-context.tsx:117 -> components/park/tracking.tsx:158,172
+ *
+ * The web one is not even a fallback. A park the valet has closed out is
+ * excluded by `customerActiveOrderQuery`, so the keys-held ticket — the screen
+ * that shows the code the customer reads out to get her keys back — is served
+ * from this list every time. Blanking it there takes the number off her screen
+ * with a valet standing at the car, and neither client can be rebuilt before
+ * tomorrow morning. So it stays, and it stays a known hole: closing it needs
+ * an authenticated read, not a projection.
+ */
 exports.getOrdersByUser = async (req, res) => {
     const { userId, isValet } = req.query;
 
     try {
-        const query =
-            isValet === 'true' ? { valet: userId } : { customer: userId };
+        const valetSide = isValet === 'true';
+        const query = valetSide ? { valet: userId } : { customer: userId };
 
         const orders = await Order.find(query).sort({ pickUpTime: -1 }).exec();
 
         res.status(200).json({
             success: true,
             message: 'Orders fetched successfully',
-            orders,
+            orders: valetSide ? orders.map(withoutOtpCode) : orders,
         });
     } catch (err) {
         console.error(err);
@@ -2164,6 +2358,214 @@ exports.getTodaysParkedCars = async (req, res) => {
 };
 
 // Update parking location for a car
+/**
+ * Run a submitted code through the handoff it belongs to.
+ *
+ * Split out of `verifyOTP` because the doorman's share link
+ * (controllers/shareController.js) has to walk the SAME beats: follow the
+ * link to the leg that owns the handoff, mint a fresh code between a
+ * retrieval's two beats, and split the socket so the valet never sees the
+ * number the customer is about to say. A second copy of that would be a
+ * second place for the two beats to drift apart — and them drifting apart is
+ * exactly how a car gets handed to whoever overheard beat 1.
+ *
+ * Returns the `{ status, body }` its caller should answer with. Shipped iOS
+ * builds read that body, so its shape is not ours to change.
+ */
+const applyOtpVerification = async (order, submittedOtp, io) => {
+    // The code the customer is reading out belongs to the leg that owns
+    // the handoff, not necessarily to the order the app addressed. See
+    // `liveKeyReturnLeg`.
+    const handoffLeg = await liveKeyReturnLeg(order);
+    if (handoffLeg) {
+        console.log(
+            'verifyOTP: order',
+            String(order._id),
+            'has handed its key return to leg',
+            String(handoffLeg._id),
+            '- verifying against the leg'
+        );
+        order = handoffLeg;
+    }
+    const targetOrderId = order._id;
+
+    const otpData = order.otp;
+    if (!otpData || !otpData.code) {
+        return {
+            status: 400,
+            body: {
+                success: false,
+                message: 'No OTP found for this order. Please update parking location first.',
+            },
+        };
+    }
+
+    // Check if OTP is expired - regenerate if needed
+    if (new Date() > otpData.expiresAt) {
+        // Regenerate OTP
+        const newOtpCode = Math.floor(100000 + Math.random() * 900000).toString();
+        const newOtpCreatedAt = new Date();
+        const newOtpExpiresAt = new Date(newOtpCreatedAt.getTime() + OTP_EXPIRY_RETURN_KEY);
+
+        await Order.findByIdAndUpdate(targetOrderId, {
+            'otp.code': newOtpCode,
+            'otp.createdAt': newOtpCreatedAt,
+            'otp.expiresAt': newOtpExpiresAt,
+            'otp.verified': false,
+        });
+
+        return {
+            status: 400,
+            body: {
+                success: false,
+                message: 'OTP has expired. A new OTP has been generated and sent.',
+                otpRegenerated: true,
+            },
+        };
+    }
+
+    // Verify OTP code. Trimmed: a code read out loud and typed back in
+    // arrives with whatever the keypad left on it.
+    if (otpData.code !== String(submittedOtp).trim()) {
+        return {
+            status: 400,
+            body: {
+                success: false,
+                message: 'Invalid OTP. Please try again.',
+            },
+        };
+    }
+
+    // Mark OTP as verified with timestamp
+    const verifiedAt = new Date();
+    const updateData = {
+        'otp.verified': true,
+        'otp.verifiedAt': verifiedAt,
+    };
+
+    // Track verification time based on OTP type
+    if (otpData.type === 'order_creation') {
+        updateData['otpVerifiedTimes.orderCreation'] = verifiedAt;
+    } else if (otpData.type === 'parking_location') {
+        updateData['otpVerifiedTimes.parkingLocation'] = verifiedAt;
+    } else if (otpData.type === 'return_key') {
+        updateData['otpVerifiedTimes.returnKey'] = verifiedAt;
+    }
+
+    // A RETRIEVAL has two handoffs, and they must not share a code.
+    //
+    //   Beat 1 — the valet arrives, reads their code, the customer types it,
+    //            and hands over the keys.
+    //   Beat 2 — the valet returns with the car, the customer says a code,
+    //            the valet types it, and the car is released.
+    //
+    // A parking order gets its second code for free: `updateCarLocation`
+    // regenerates the OTP when the valet parks. Nothing does that on a
+    // retrieval, so until now both beats verified against the SAME code —
+    // which means anyone who overheard beat 1 could claim the car at beat 2.
+    // Beat 1 is identified by `otpVerifiedTimes.returnKey` being unset; once
+    // it is stamped, this is beat 2 and the order is finished with.
+    //
+    // Except on a street-cleaning return leg, which has no beat 1 to be
+    // between. The sweep mints that leg for the valet who is already holding
+    // the keys — he took them at 8am and kept them through the move — so its
+    // single handoff is the one at the end, and `otpVerifiedTimes.returnKey`
+    // is unset for the whole of its life because nothing ever collected
+    // anything. Reading that as "beat 1" minted a fresh code the moment the
+    // keys went back, and the doorman's page then drew it: a number on screen
+    // after the car, the keys and the valet were all gone.
+    //
+    // The exception is asked as `retrievalBornInCustody` and not as
+    // `retrievalHasCustody`. They sound like the same question and they are
+    // not: custody is "does somebody hold the keys now", which on a sweep leg
+    // is true from birth AND is inferred, from the parent, for legs that
+    // predate the flag. That inference matches an ordinary retrieval booked
+    // against a sweep-touched park — `createRetrievalOrder` re-points the
+    // parent's `linkedOrderId` at the new leg — so gating the re-mint on it
+    // handed those retrievals one code for both beats and reopened the reuse
+    // above. Born-in-custody reads the sweep's own marks off this leg and
+    // answers only for the leg that truly has no beat 1.
+    const isRetrievalKeyPickup =
+        order.orderType === 'retrieval' &&
+        otpData.type === 'return_key' &&
+        !(order.otpVerifiedTimes && order.otpVerifiedTimes.returnKey) &&
+        !retrievalBornInCustody(order);
+
+    if (isRetrievalKeyPickup) {
+        const nextCode = Math.floor(100000 + Math.random() * 900000).toString();
+        const nextCreatedAt = new Date();
+        const nextExpiresAt = new Date(nextCreatedAt.getTime() + OTP_EXPIRY_RETURN_KEY);
+
+        // `otp.*` dotted paths and a whole `otp` object can't co-exist in one
+        // $set, so the timestamp is carried over by hand.
+        const updatedOrder = await Order.findByIdAndUpdate(
+            targetOrderId,
+            {
+                'otpVerifiedTimes.returnKey': verifiedAt,
+                otp: {
+                    code: nextCode,
+                    createdAt: nextCreatedAt,
+                    expiresAt: nextExpiresAt,
+                    verified: false,
+                    type: 'return_key',
+                },
+            },
+            { new: true }
+        );
+
+        // The customer SAYS this one, so only the customer may see it —
+        // same split `updateCarLocation` uses for the parking leg.
+        if (io && updatedOrder) {
+            const orderData = updatedOrder.toObject();
+            const orderForValet = { ...orderData, otp: { ...orderData.otp } };
+            delete orderForValet.otp.code;
+
+            io
+                .to(updatedOrder.customer.toString())
+                .emit('orderUpdated', { ...orderData, type: 'RETURN_KEY_OTP_GENERATED' });
+            if (updatedOrder.valet) {
+                io
+                    .to(updatedOrder.valet.toString())
+                    .emit('orderUpdated', { ...orderForValet, type: 'RETURN_KEY_OTP_GENERATED' });
+            }
+        }
+
+        // Beat 1 of a retrieval: the valet has just taken the keys.
+        await markCollectVerifiedOnConversation(updatedOrder || order);
+
+        return {
+            status: 200,
+            body: {
+                success: true,
+                message: 'OTP verified successfully',
+                otpRegenerated: true,
+            },
+        };
+    }
+
+    await Order.findByIdAndUpdate(targetOrderId, updateData);
+
+    // Beat 1 of a park: the customer has just handed the keys over. Same
+    // moment, different OTP type, same flag the valet's button reads.
+    if (otpData.type === 'order_creation') {
+        await markCollectVerifiedOnConversation(order);
+    }
+
+    return {
+        status: 200,
+        body: {
+            success: true,
+            message: 'OTP verified successfully',
+        },
+    };
+};
+
+exports.applyOtpVerification = applyOtpVerification;
+exports.liveKeyReturnLeg = liveKeyReturnLeg;
+exports.retrievalHasCustody = retrievalHasCustody;
+exports.retrievalBornInCustody = retrievalBornInCustody;
+exports.customerActiveOrderQuery = customerActiveOrderQuery;
+
 exports.verifyOTP = async (req, res) => {
     const { orderId, otp } = req.body;
 
@@ -2175,7 +2577,7 @@ exports.verifyOTP = async (req, res) => {
             });
         }
 
-        let order = await Order.findById(orderId);
+        const order = await Order.findById(orderId);
         if (!order) {
             return res.status(404).json({
                 success: false,
@@ -2183,155 +2585,8 @@ exports.verifyOTP = async (req, res) => {
             });
         }
 
-        // The code the customer is reading out belongs to the leg that owns
-        // the handoff, not necessarily to the order the app addressed. See
-        // `liveKeyReturnLeg`.
-        const handoffLeg = await liveKeyReturnLeg(order);
-        if (handoffLeg) {
-            console.log(
-                'verifyOTP: order',
-                String(order._id),
-                'has handed its key return to leg',
-                String(handoffLeg._id),
-                '- verifying against the leg'
-            );
-            order = handoffLeg;
-        }
-        const targetOrderId = order._id;
-
-        const otpData = order.otp;
-        if (!otpData || !otpData.code) {
-            return res.status(400).json({
-                success: false,
-                message: 'No OTP found for this order. Please update parking location first.',
-            });
-        }
-
-        // Check if OTP is expired - regenerate if needed
-        if (new Date() > otpData.expiresAt) {
-            // Regenerate OTP
-            const newOtpCode = Math.floor(100000 + Math.random() * 900000).toString();
-            const newOtpCreatedAt = new Date();
-            const newOtpExpiresAt = new Date(newOtpCreatedAt.getTime() + OTP_EXPIRY_RETURN_KEY);
-            
-            await Order.findByIdAndUpdate(targetOrderId, {
-                'otp.code': newOtpCode,
-                'otp.createdAt': newOtpCreatedAt,
-                'otp.expiresAt': newOtpExpiresAt,
-                'otp.verified': false,
-            });
-            
-            return res.status(400).json({
-                success: false,
-                message: 'OTP has expired. A new OTP has been generated and sent.',
-                otpRegenerated: true,
-            });
-        }
-
-        // Verify OTP code. Trimmed: a code read out loud and typed back in
-        // arrives with whatever the keypad left on it.
-        if (otpData.code !== String(otp).trim()) {
-            return res.status(400).json({
-                success: false,
-                message: 'Invalid OTP. Please try again.',
-            });
-        }
-
-        // Mark OTP as verified with timestamp
-        const verifiedAt = new Date();
-        const updateData = {
-            'otp.verified': true,
-            'otp.verifiedAt': verifiedAt,
-        };
-
-        // Track verification time based on OTP type
-        if (otpData.type === 'order_creation') {
-            updateData['otpVerifiedTimes.orderCreation'] = verifiedAt;
-        } else if (otpData.type === 'parking_location') {
-            updateData['otpVerifiedTimes.parkingLocation'] = verifiedAt;
-        } else if (otpData.type === 'return_key') {
-            updateData['otpVerifiedTimes.returnKey'] = verifiedAt;
-        }
-
-        // A RETRIEVAL has two handoffs, and they must not share a code.
-        //
-        //   Beat 1 — the valet arrives, reads their code, the customer types it,
-        //            and hands over the keys.
-        //   Beat 2 — the valet returns with the car, the customer says a code,
-        //            the valet types it, and the car is released.
-        //
-        // A parking order gets its second code for free: `updateCarLocation`
-        // regenerates the OTP when the valet parks. Nothing does that on a
-        // retrieval, so until now both beats verified against the SAME code —
-        // which means anyone who overheard beat 1 could claim the car at beat 2.
-        // Beat 1 is identified by `otpVerifiedTimes.returnKey` being unset; once
-        // it is stamped, this is beat 2 and the order is finished with.
-        const isRetrievalKeyPickup =
-            order.orderType === 'retrieval' &&
-            otpData.type === 'return_key' &&
-            !(order.otpVerifiedTimes && order.otpVerifiedTimes.returnKey);
-
-        if (isRetrievalKeyPickup) {
-            const nextCode = Math.floor(100000 + Math.random() * 900000).toString();
-            const nextCreatedAt = new Date();
-            const nextExpiresAt = new Date(nextCreatedAt.getTime() + OTP_EXPIRY_RETURN_KEY);
-
-            // `otp.*` dotted paths and a whole `otp` object can't co-exist in one
-            // $set, so the timestamp is carried over by hand.
-            const updatedOrder = await Order.findByIdAndUpdate(
-                targetOrderId,
-                {
-                    'otpVerifiedTimes.returnKey': verifiedAt,
-                    otp: {
-                        code: nextCode,
-                        createdAt: nextCreatedAt,
-                        expiresAt: nextExpiresAt,
-                        verified: false,
-                        type: 'return_key',
-                    },
-                },
-                { new: true }
-            );
-
-            // The customer SAYS this one, so only the customer may see it —
-            // same split `updateCarLocation` uses for the parking leg.
-            if (req.io && updatedOrder) {
-                const orderData = updatedOrder.toObject();
-                const orderForValet = { ...orderData, otp: { ...orderData.otp } };
-                delete orderForValet.otp.code;
-
-                req.io
-                    .to(updatedOrder.customer.toString())
-                    .emit('orderUpdated', { ...orderData, type: 'RETURN_KEY_OTP_GENERATED' });
-                if (updatedOrder.valet) {
-                    req.io
-                        .to(updatedOrder.valet.toString())
-                        .emit('orderUpdated', { ...orderForValet, type: 'RETURN_KEY_OTP_GENERATED' });
-                }
-            }
-
-            // Beat 1 of a retrieval: the valet has just taken the keys.
-            await markCollectVerifiedOnConversation(updatedOrder || order);
-
-            return res.status(200).json({
-                success: true,
-                message: 'OTP verified successfully',
-                otpRegenerated: true,
-            });
-        }
-
-        await Order.findByIdAndUpdate(targetOrderId, updateData);
-
-        // Beat 1 of a park: the customer has just handed the keys over. Same
-        // moment, different OTP type, same flag the valet's button reads.
-        if (otpData.type === 'order_creation') {
-            await markCollectVerifiedOnConversation(order);
-        }
-
-        res.status(200).json({
-            success: true,
-            message: 'OTP verified successfully',
-        });
+        const { status, body } = await applyOtpVerification(order, otp, req.io);
+        res.status(status).json(body);
     } catch (err) {
         console.error(err);
         res.status(500).json({
@@ -2832,6 +3087,15 @@ const runAspSweep = async (io, now = new Date()) => {
                             // belongs in the parent's thread.
                             conversationId: order.conversationId,
                             valet: order.valet._id, // Assign same valet
+                            // The leg is born accepted, so it never passes
+                            // through `acceptOrder` and nothing else ever
+                            // stamps this. Legs without it read as accepted by
+                            // nobody at no time: `valetCancelOrder` computes
+                            // its cooldown from `acceptedAt + 3min` and treats
+                            // a missing stamp as the epoch, so the valet could
+                            // stand the return leg down the instant the sweep
+                            // minted it.
+                            acceptedAt: now,
                             otp: {
                                 code: otpCode,
                                 createdAt: otpCreatedAt,

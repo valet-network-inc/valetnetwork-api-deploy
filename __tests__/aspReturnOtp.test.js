@@ -253,6 +253,195 @@ describe('the code the customer is holding', () => {
         expect((await verify(parent._id, '386682')).statusCode).toBe(200);
     });
 
+    test('and the handoff ENDS there — no fresh code appears behind it', async () => {
+        // A retrieval has two beats and must not share a code between them, so
+        // `applyOtpVerification` mints a new one after beat 1. A sweep leg has
+        // no beat 1: the valet took the keys at 8am and kept them through the
+        // move, so `otpVerifiedTimes.returnKey` is unset for the whole of its
+        // life and the branch read that as "beat 1" — minting a fresh number
+        // the moment the keys went back. It then appeared on the doorman's
+        // screen, after the car, the keys and the valet were all gone.
+        const customer = await makeUser();
+        const valet = await makeUser(true);
+        const { parent, leg } = await makeAspPair(customer._id, valet._id, {
+            parentCode: '386682',
+            legCode: '909011',
+        });
+
+        const res = await verify(parent._id, '909011');
+
+        expect(res.statusCode).toBe(200);
+        expect(res.body.otpRegenerated).toBeUndefined();
+
+        const legAfter = await Order.findById(leg._id);
+        expect(legAfter.otp.verified).toBe(true);
+        // The same spent code, not a new live one.
+        expect(legAfter.otp.code).toBe('909011');
+    });
+
+    test('a two-beat retrieval still gets its second code, which is the point of the branch', async () => {
+        // Deliberate and unchanged: anyone who overheard beat 1 must not be
+        // able to claim the car at beat 2. This one has no custody yet — nobody
+        // is holding the keys — which is exactly what tells it apart from a
+        // sweep leg.
+        const customer = await makeUser();
+        const valet = await makeUser(true);
+        const park = await Order.create({
+            customer: customer._id,
+            valet: valet._id,
+            customerLocation: { lat: 40.68652, lng: -73.99213, streetAddress: '38 Wyckoff St' },
+            parkingType: 'street',
+            orderType: 'parking',
+            duration: 90,
+            pickUpTime: new Date(),
+            status: 'parked',
+            totalAmount: 1650,
+            paymentMethod: 'card',
+            paymentStatus: 'paid',
+            serviceType: 'park-and-hold',
+            conversationId: 'two-beat-park',
+            parkingLocation: SPOT,
+            parkedAt: new Date(),
+        });
+        const retrieval = await Order.create({
+            customer: customer._id,
+            valet: valet._id,
+            customerLocation: { lat: 40.68652, lng: -73.99213, streetAddress: '38 Wyckoff St' },
+            parkingType: 'retrieval',
+            orderType: 'retrieval',
+            parkingLocation: SPOT,
+            duration: 30,
+            pickUpTime: new Date(),
+            status: 'accepted',
+            totalAmount: 500,
+            paymentMethod: 'card',
+            paymentStatus: 'paid',
+            serviceType: 'park-and-hold',
+            conversationId: 'two-beat-retrieval',
+            linkedOrderId: park._id,
+            otp: returnKeyOtp('424242'),
+        });
+
+        const res = await verify(retrieval._id, '424242');
+
+        expect(res.statusCode).toBe(200);
+        expect(res.body.otpRegenerated).toBe(true);
+
+        const after = await Order.findById(retrieval._id);
+        expect(after.otpVerifiedTimes.returnKey).toBeTruthy();
+        expect(after.otp.code).toMatch(/^\d{6}$/);
+        expect(after.otp.code).not.toBe('424242');
+        expect(after.otp.verified).toBe(false);
+    });
+
+    test('and so does one booked against a park the sweep has already touched', async () => {
+        // The shape that reopened the reuse hole. A customer parks on a sweep
+        // block; the sweep runs, mints its return leg, and stamps the parent
+        // `aspOrderCreated`. Later — a cancelled leg, a second night, a car
+        // she wants back herself — she asks for a retrieval, and
+        // `createRetrievalOrder` re-points the parent's `linkedOrderId` at the
+        // new order.
+        //
+        // That new order is an ORDINARY two-beat retrieval: nobody has her
+        // keys, a valet is coming to collect them. But it now matched the
+        // legacy custody inference — parent is aspMode, is aspOrderCreated,
+        // and points back at me — so beat 1 was read as "already in custody",
+        // no fresh code was minted, and both beats verified against the same
+        // six digits. Anyone who overheard the valet at the curb could claim
+        // the car at the end of the day.
+        const customer = await makeUser();
+        const valet = await makeUser(true);
+        const park = await Order.create({
+            customer: customer._id,
+            valet: valet._id,
+            customerLocation: { lat: 40.68652, lng: -73.99213, streetAddress: '38 Wyckoff St' },
+            parkingType: 'street',
+            orderType: 'parking',
+            duration: 90,
+            pickUpTime: new Date(),
+            status: 'parked',
+            totalAmount: 1650,
+            paymentMethod: 'card',
+            paymentStatus: 'paid',
+            serviceType: 'park-and-hold',
+            aspMode: true,
+            aspOrderCreated: true,
+            conversationId: 'swept-park-chat',
+            parkingLocation: SPOT,
+            parkedAt: new Date(),
+            parkClosedAt: new Date(),
+            otpVerifiedTimes: { orderCreation: new Date() },
+        });
+        const retrieval = await Order.create({
+            customer: customer._id,
+            valet: valet._id,
+            customerLocation: { lat: 40.68652, lng: -73.99213, streetAddress: '38 Wyckoff St' },
+            parkingType: 'retrieval',
+            orderType: 'retrieval',
+            parkingLocation: SPOT,
+            duration: 30,
+            pickUpTime: new Date(),
+            status: 'accepted',
+            totalAmount: 0,
+            paymentMethod: 'card',
+            paymentStatus: 'paid',
+            isFreeService: true,
+            serviceType: 'park-and-hold',
+            // Its own thread and no sweep marks — this leg was not born
+            // holding anything.
+            conversationId: 'her-own-retrieval-chat',
+            linkedOrderId: park._id,
+            otp: returnKeyOtp('313131'),
+        });
+        // The re-point `createRetrievalOrder` does, which is what made the
+        // parent lookup answer "in custody" for an order that was not.
+        park.linkedOrderId = retrieval._id;
+        await park.save();
+
+        // Beat 1: the valet reads 313131 out, she types it, he takes the keys.
+        const beatOne = await verify(retrieval._id, '313131');
+        expect(beatOne.statusCode).toBe(200);
+        expect(beatOne.body.otpRegenerated).toBe(true);
+
+        const afterBeatOne = await Order.findById(retrieval._id);
+        expect(afterBeatOne.otpVerifiedTimes.returnKey).toBeTruthy();
+        expect(afterBeatOne.otp.code).toMatch(/^\d{6}$/);
+        expect(afterBeatOne.otp.code).not.toBe('313131');
+
+        // Beat 2: whoever overheard the curb has the wrong number.
+        expect((await verify(retrieval._id, '313131')).statusCode).toBe(400);
+
+        const stillOpen = await Order.findById(retrieval._id);
+        expect(stillOpen.otp.verified).toBe(false);
+
+        // And the number she is actually holding releases the car.
+        expect((await verify(retrieval._id, afterBeatOne.otp.code)).statusCode).toBe(200);
+        expect((await Order.findById(retrieval._id)).otp.verified).toBe(true);
+    });
+
+    test('the sweep’s own leg is still spared, by its own marks and not the parent’s', async () => {
+        // The other half of the same distinction. This leg has no beat 1 to be
+        // between — the valet took the keys at 8am and kept them — so the code
+        // it carries is the only one it will ever have, and minting a fresh one
+        // when the keys go back leaves a live number on the doorman's screen
+        // after the car, the keys and the valet have all gone.
+        const customer = await makeUser();
+        const valet = await makeUser(true);
+        const { leg } = await makeAspPair(customer._id, valet._id, {
+            parentCode: '386682',
+            legCode: '909011',
+        });
+
+        const res = await verify(leg._id, '909011');
+
+        expect(res.statusCode).toBe(200);
+        expect(res.body.otpRegenerated).toBeUndefined();
+
+        const after = await Order.findById(leg._id);
+        expect(after.otp.code).toBe('909011');
+        expect(after.otp.verified).toBe(true);
+    });
+
     test('an ordinary park with no leg is untouched', async () => {
         const customer = await makeUser();
         const valet = await makeUser(true);
@@ -320,5 +509,44 @@ describe('the sweep leaves one code in the world', () => {
 
         // And it verifies from either side.
         expect((await verify(parent._id, leg.otp.code)).statusCode).toBe(200);
+    });
+
+    test('the leg is stamped with when it was accepted, because nothing else ever will be', async () => {
+        // The sweep mints this leg already `accepted` with a valet on it, so
+        // it never passes through `acceptOrder` — the only writer of the
+        // field. Without it `valetCancelOrder` reads the accept as the epoch
+        // and its three-minute cooldown has already elapsed, so the valet
+        // could stand the return leg down the second it appeared.
+        const customer = await makeUser();
+        const valet = await makeUser(true);
+        const order = await Order.create({
+            customer: customer._id,
+            valet: valet._id,
+            customerLocation: { lat: 40.68652, lng: -73.99213, streetAddress: '38 Wyckoff St' },
+            parkingType: 'street',
+            orderType: 'parking',
+            duration: 90,
+            pickUpTime: new Date(),
+            status: 'parked',
+            totalAmount: 1650,
+            paymentMethod: 'card',
+            paymentStatus: 'paid',
+            serviceType: 'park-and-hold',
+            aspMode: true,
+            asp_time: new Date(Date.now() - 60 * 1000),
+            conversationId: 'accepted-at-chat',
+            parkingLocation: SPOT,
+            parkedAt: new Date(),
+            otp: returnKeyOtp('551166'),
+        });
+
+        const sweptAt = Date.now();
+        await orderController.runAspSweep(mockIo());
+
+        const leg = await Order.findById(
+            (await Order.findById(order._id)).linkedOrderId
+        );
+        expect(leg.acceptedAt).toBeTruthy();
+        expect(Math.abs(new Date(leg.acceptedAt).getTime() - sweptAt)).toBeLessThan(60 * 1000);
     });
 });

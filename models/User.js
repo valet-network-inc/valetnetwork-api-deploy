@@ -332,6 +332,57 @@ const UserSchema = new mongoose.Schema({
     // a plan actually activates. A code the customer types always wins.
     pendingPromoCode: { type: String, trim: true, uppercase: true },
     pendingPromoSetAt: { type: Date },
+
+    // --- The handoff link the customer gives their doorman ----------------
+    //
+    // The ritual assumes whoever is holding the keys is also holding a phone
+    // with our app on it. A weekly street-cleaning subscriber is in a meeting
+    // at 8am; her doorman does the handoff. He cannot be given the code in
+    // advance — at that beat the code is the VALET'S, read out loud on
+    // arrival, and the person with the keys types it back — so what he needs
+    // is not a number, it is a screen to type into.
+    //
+    // It hangs on the PERSON and not on an order because it is a standing
+    // link: it is minted once, texted to the front desk once, and has to keep
+    // working next Thursday and the Thursday after that. A per-order token
+    // would mean a new URL every week, which in practice means the doorman
+    // types the code into a dead page while the valet waits at the curb.
+    //
+    // For the same reason there is no expiry clock. A link that dies at 3am
+    // on its own dies unnoticed, and the failure lands on the one morning it
+    // was needed. Revocation is the only off switch, and it is the customer's.
+    // The token is still a bearer credential for a car, so what it can SHOW is
+    // narrow and gated on a live handoff window — see
+    // controllers/shareController.js.
+    doormanLink: {
+        // `select: false`, and it is the whole point of the field.
+        //
+        // The token IS the car. Nothing about it is a login, so anybody
+        // holding the string can open the handoff screen — and this document
+        // is answered whole, to anyone who asks, by
+        // `GET /api/auth/getUserById/:userId` and by `POST /api/auth/loginUser`.
+        // Neither of those knows the difference between a field that is safe
+        // to publish and one that releases a car, so a plain path here put the
+        // live token on the open internet beside the customer's name.
+        //
+        // Deny by default and opt in. The three reads that legitimately need
+        // the string all live in controllers/shareController.js and all say
+        // `.select('+doormanLink.token')`; every other read of a User — login,
+        // the admin console, the valet's customer lookup — now cannot leak it
+        // even by accident, and neither can the next field somebody adds to a
+        // response.
+        //
+        // `createdAt` and `revokedAt` stay visible: they say whether a link
+        // exists, which is not a credential.
+        token: { type: String, select: false },
+        createdAt: { type: Date },
+        revokedAt: { type: Date },
+    },
 });
+
+// Every hit on a doorman link is a lookup by token and nothing else. Unique so
+// two customers can never collide on one; sparse because only the handful of
+// customers who asked for a link carry the field at all.
+UserSchema.index({ 'doormanLink.token': 1 }, { unique: true, sparse: true });
 
 module.exports = mongoose.model('User', UserSchema);

@@ -449,6 +449,25 @@ const OrderSchema = new mongoose.Schema({
         status: { type: String },
         refundedAt: { type: Date },
     },
+
+    // --- Doorman link: wrong codes typed at this order ---------------------
+    //
+    // The rolling limiter in middleware/rateLimit.js is burst control and
+    // nothing more: its window reopens, so a leaked link left guessing all
+    // night walks a six-digit code at its own pace and gets there. This is the
+    // absolute cap, per order and per beat, and it never resets. Once a beat
+    // is spent the link is done with it and only the app can finish the
+    // handoff.
+    //
+    // Spelled `typeBeat`/`sayBeat` rather than keyed by the beat's own name,
+    // because a schema path literally called `type` is read by Mongoose as a
+    // type declaration. Only the type beat is reachable through the link (the
+    // valet types the say beat), but both are counted so a future beat cannot
+    // arrive uncapped.
+    shareVerifyAttempts: {
+        typeBeat: { type: Number, default: 0 },
+        sayBeat: { type: Number, default: 0 },
+    },
 }, {
     timestamps: true, // Adds createdAt and updatedAt automatically
 });
@@ -488,5 +507,4 @@ OrderSchema.set('toJSON', {
 OrderSchema.index({ autoBookKey: 1 }, { unique: true, sparse: true });
 OrderSchema.index({ customer: 1, status: 1 });
 OrderSchema.index({ coveredBySubscription: 1, createdAt: -1 }, { sparse: true });
-
 module.exports = mongoose.model('Order', OrderSchema);

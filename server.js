@@ -96,6 +96,19 @@ app.use((req, res, next) => {
 app.use(bodyParser.json());
 app.use(cors());
 
+/**
+ * A request path with nothing in it that opens a door.
+ *
+ * The doorman link (`/api/share/<token>`) is a permanent bearer credential in
+ * a URL, and its page polls every four seconds — so logging the raw path wrote
+ * hundreds of copies of a live credential into Render's log stream every
+ * morning, where anyone with log access could pick one up and take a car.
+ *
+ * The status codes and the timings are the whole reason these lines exist and
+ * they survive untouched; only the segment that IS the secret is replaced.
+ */
+const scrubPath = (url) => String(url).replace(/(\/api\/share\/)[^/?]+/, '$1<token>');
+
 // API Logging Middleware
 app.use((req, res, next) => {
     const start = Date.now();
@@ -116,7 +129,7 @@ app.use((req, res, next) => {
         const duration = Date.now() - start;
         const responseTimestamp = new Date().toISOString();
         
-        console.log(`[${responseTimestamp}] ${req.method} ${req.originalUrl} - ${res.statusCode} (${duration}ms)`);
+        console.log(`[${responseTimestamp}] ${req.method} ${scrubPath(req.originalUrl)} - ${res.statusCode} (${duration}ms)`);
         // console.log(`[${responseTimestamp}] Response Body:`, data);
         // console.log('---');
         
@@ -166,6 +179,7 @@ app.get('/health', (req, res) => {
 // Routes
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/order', require('./routes/order'));
+app.use('/api/share', require('./routes/share'));
 app.use('/api/pricing', require('./routes/pricing'));
 app.use('/api/chauffeur', require('./routes/chauffeur'));
 app.use('/api/parking-notes', require('./routes/parkingNote'));
@@ -185,11 +199,13 @@ app.use('/api/webhooks', require('./routes/webhook'));
 // Error Logging Middleware
 app.use((err, req, res, next) => {
     const timestamp = new Date().toISOString();
-    console.error(`[${timestamp}] ERROR in ${req.method} ${req.originalUrl}:`, {
+    console.error(`[${timestamp}] ERROR in ${req.method} ${scrubPath(req.originalUrl)}:`, {
         message: err.message,
         stack: err.stack,
         body: req.body,
-        params: req.params,
+        // `params` is where a route's token lands, and it is the one field
+        // here that is nothing BUT credentials on the share routes. The url
+        // above already names the endpoint, so it buys nothing anyway.
         query: req.query
     });
     
