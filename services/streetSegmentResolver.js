@@ -260,7 +260,7 @@ exports.resolveBlockSegment = async (tap, streetName) => {
         const res = await axios.post(OVERPASS_ENDPOINT, params, {
             timeout: REQUEST_TIMEOUT_MS,
             headers: {
-                'User-Agent': 'ValetNYC/1.2 (ops@valetnetwork.co)',
+                'User-Agent': 'ValetNetwork/1.2 (ops@valetnetwork.co)',
                 Accept: 'application/json',
             },
         });
@@ -426,7 +426,7 @@ exports.resolveAreaSegments = async (tap, radiusMeters = AREA_RADIUS_DEFAULT) =>
         const res = await axios.post(OVERPASS_ENDPOINT, params, {
             timeout: 10000,
             headers: {
-                'User-Agent': 'ValetNYC/1.2 (ops@valetnetwork.co)',
+                'User-Agent': 'ValetNetwork/1.2 (ops@valetnetwork.co)',
                 Accept: 'application/json',
             },
         });

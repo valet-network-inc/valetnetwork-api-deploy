@@ -32,7 +32,7 @@ const ValetPayout = require('../models/ValetPayout');
 // Once valetnetwork.co is verified, set RESEND_FROM to alerts@valetnetwork.co
 // and add rishi@valetnetwork.co to NOTIFY_RECIPIENTS.
 const NOTIFY_RECIPIENTS = ['developer@valetnetwork.co'];
-const RESEND_FROM = process.env.RESEND_FROM || 'ValetNYC Alerts <onboarding@resend.dev>';
+const RESEND_FROM = process.env.RESEND_FROM || 'Valet Network Alerts <onboarding@resend.dev>';
 
 const isEmail = (s) => /\S+@\S+\.\S+/.test(s);
 const isPhone = (s) => /^\+?[\d()\-\s]{7,}$/.test(s);
@@ -120,7 +120,7 @@ const sendEmailPayoutNotification = async (payout, valet) => {
                 ? `$${payout.handle}`
                 : payout.handle;
 
-        const subject = `[ValetNYC] Payout requested — ${valetName}, $${dollarAmount} (${methodLabel})`;
+        const subject = `[Valet Network] Payout requested — ${valetName}, $${dollarAmount} (${methodLabel})`;
 
         const text = [
             `Valet:       ${valetName}`,

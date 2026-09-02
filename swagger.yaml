@@ -1,10 +1,10 @@
 openapi: 3.0.0
 info:
-  title: Valet NYC API
+  title: Valet Network API
   version: 1.0.0
-  description: API documentation for Valet NYC backend service
+  description: API documentation for the Valet Network backend service
   contact:
-    name: Valet NYC Team
+    name: Valet Network Team
 
 servers:
   - url: http://localhost:3001/api
