@@ -318,15 +318,37 @@ exports.createSubscription = async (req, res) => {
             return res.status(400).json({ success: false, message: 'Unknown tier or interval' });
         }
 
-        const scheduleError = validateAspSchedule(aspSchedule);
-        if (scheduleError) {
-            return res.status(400).json({ success: false, message: scheduleError });
-        }
-        if (aspSchedule.days.length > purchase.movesPerWeek) {
-            return res.status(400).json({
-                success: false,
-                message: `Your plan covers ${purchase.movesPerWeek} move${purchase.movesPerWeek === 1 ? '' : 's'} a week — pick at most that many days.`,
-            });
+        // A sweep schedule is only asked for on the plan that is sold by the
+        // move, where the customer's own days are what the auto-booker runs on.
+        //
+        // The fixed-garage and valet-anywhere plans invert that (Rishi,
+        // 2026-09-02): on those we actively manage the car for as long as it is
+        // parked with us, and the cleaning rules come from the spot the VALET
+        // put it in rather than from anything the customer typed. A valet is
+        // dispatched to move it before that block's sweep, repeatedly, until
+        // the customer takes the car back; when it returns to our custody we
+        // record wherever it goes next and look after it there. Asking those
+        // customers which mornings their street is cleaned would be asking them
+        // to do the job they are paying us for.
+        //
+        // So an absent schedule here is the normal case for those two tiers,
+        // not a degraded one. Everything downstream already copes with it:
+        // nextAspMove returns null on empty days, adoptFromSubscription bails,
+        // and the schedule-driven scheduler skips a subscription with no days.
+        // The parked-location dispatch is its own path and does not read this
+        // field. PUT /schedule still lets a customer add days by hand.
+        const scheduleRequired = !!purchase.plan.perMove;
+        if (scheduleRequired || aspSchedule) {
+            const scheduleError = validateAspSchedule(aspSchedule);
+            if (scheduleError) {
+                return res.status(400).json({ success: false, message: scheduleError });
+            }
+            if (aspSchedule.days.length > purchase.movesPerWeek) {
+                return res.status(400).json({
+                    success: false,
+                    message: `Your plan covers ${purchase.movesPerWeek} move${purchase.movesPerWeek === 1 ? '' : 's'} a week — pick at most that many days.`,
+                });
+            }
         }
         if (tier === 'home_garage') {
             const homeError = validateAddress(homeAddress, 'homeAddress');
@@ -460,7 +482,9 @@ exports.createSubscription = async (req, res) => {
             currentPeriodEnd: stripeSub.current_period_end
                 ? new Date(stripeSub.current_period_end * 1000)
                 : undefined,
-            aspSchedule: { ...aspSchedule, source: aspSchedule.source || 'onboarding' },
+            ...(aspSchedule
+                ? { aspSchedule: { ...aspSchedule, source: aspSchedule.source || 'onboarding' } }
+                : {}),
             ...(homeAddress ? { homeAddress } : {}),
             ...(promo ? { promoCode: promo.code } : {}),
             ...(stripeSub.trial_end ? { trialEndsAt: new Date(stripeSub.trial_end * 1000) } : {}),
