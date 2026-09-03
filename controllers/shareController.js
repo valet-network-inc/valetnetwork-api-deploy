@@ -187,6 +187,11 @@ const handoffWindow = async (order) => {
     // there is no key return while the car sits parked, and the code staged on
     // this order belongs to the return leg the sweep will mint later.
     if (order.aspMode) return shut('valet_keeps_the_keys_through_the_sweep');
+    // The same fact on the flat plans, for the whole life of the park rather
+    // than just a sweep. `updateCarLocation` mints a return-key code at EVERY
+    // park, so between the valet saving the spot and swiping the job closed
+    // this window would print a number for a key handoff nobody is walking to.
+    if (order.keysStayWithValet) return shut('valet_keeps_the_keys');
 
     return { beat: 'say', code: otp.code, reason: 'keys_coming_back' };
 };

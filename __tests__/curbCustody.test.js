@@ -740,6 +740,31 @@ describe('key custody', () => {
         expect(await orderController.retrievalHasCustody(delivery)).toBe(true);
     });
 
+    test('no key-return code is shown while the keys are staying with us', async () => {
+        // updateCarLocation mints a return-key code at EVERY park. Between the
+        // valet saving the spot and swiping the job closed, handoffWindow would
+        // otherwise print that number and tell the customer to read it out for
+        // a handoff nobody is walking to. Both copies — this one and the app's
+        // — carry the same guard.
+        const share = require('../controllers/shareController');
+        const { order } = await parkedManagedCar();
+        const parked = await Order.findById(order._id);
+        parked.otp = {
+            code: '123456',
+            createdAt: new Date(),
+            expiresAt: new Date(Date.now() + 3600e3),
+            verified: false,
+            type: 'return_key',
+        };
+        parked.parkClosedAt = undefined;
+        await parked.save();
+
+        const w = await share.handoffWindow(await Order.findById(order._id).lean());
+        expect(w.beat).toBeNull();
+        expect(w.code).toBeNull();
+        expect(w.reason).toBe('valet_keeps_the_keys');
+    });
+
     test('the valet closes out without ever handing the keys back', async () => {
         // The shape-match close-out requires `otpVerifiedTimes.returnKey`, which
         // on these plans never happens — nobody walks the keys back. Without a
