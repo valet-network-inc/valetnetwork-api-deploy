@@ -26,6 +26,10 @@ const { MongoMemoryServer } = require('mongodb-memory-server');
   process.env.ASP_SWEEP_ENABLED = 'false';
   process.env.AUTO_CANCEL_ENABLED = 'false';
   process.env.CLEANING_SCHEDULER_ENABLED = 'false';
+  // The curb-sweep MOVER would book a real move order mid-screenshot. The
+  // WATCHDOG stays on deliberately: it is read-mostly, and its reconciler is
+  // what gives a seeded managed car its custody row without extra setup.
+  process.env.CURB_SWEEP_ENABLED = 'false';
 
   // Never a live key here. Nothing in the screenshot path charges anything —
   // order state is written straight into mongo by seed.js.
@@ -33,6 +37,14 @@ const { MongoMemoryServer } = require('mongodb-memory-server');
     process.env.STRIPE_API_KEY || 'sk_test_placeholder_not_used_by_the_rig';
   process.env.STRIPE_WEBHOOK_SECRET = 'whsec_placeholder';
   process.env.ADMIN_API_KEY = 'localrig';
+
+  // Firebase is not configured here, and getSignedUrl throws without it — which
+  // 500s the parking-note GET and makes the valet screens untestable. Stub it:
+  // the rig never stores a real photo, and no screenshot depends on one loading.
+  const storage = require('./services/firebaseStorage');
+  storage.getSignedUrl = async (path) => `https://rig.local/${path}`;
+  storage.uploadFile = async (buf, path) => ({ bucket: 'rig-bucket', path });
+  storage.deleteFile = async () => true;
 
   require('./server.js');
 

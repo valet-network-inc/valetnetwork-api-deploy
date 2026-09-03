@@ -147,6 +147,23 @@ exports.setManagedCarRules = async (req, res) => {
                 message: 'streetCleaning must be an array of { day, startTime, endTime }.',
             });
         }
+        // An empty list cannot be an answer here.
+        //
+        // setOperatorRules would happily write source 'operator' with zero
+        // windows and mark the car ARMED — so it would read as handled on this
+        // very screen, schedule no move, and stop raising the blind alarm that
+        // is the only thing standing between it and a ticket. A car that looks
+        // fixed and is not is worse than one that is obviously broken. If a
+        // valet genuinely read the sign and there is no cleaning on that block,
+        // that is `sweepDataStatus` on the note, not a blank form here.
+        if (!streetCleaning.length) {
+            return res.status(400).json({
+                success: false,
+                message:
+                    'Add at least one sweep window. If this block genuinely has no street ' +
+                    'cleaning, that has to come from a valet at the sign, not from here.',
+            });
+        }
         const converted = sweepWindows.toSweepWindows(streetCleaning);
         if (streetCleaning.length && !converted.windows.length) {
             return res.status(400).json({
