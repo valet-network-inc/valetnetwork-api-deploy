@@ -55,6 +55,29 @@ const PROMOS = {
         firstTimeOnly: true,
         active: true,
     },
+
+    // The same free month on the Fixed garage plan — the $250 one, where the
+    // covered moves come with a free park and retrieval every day at one spot.
+    //
+    // It exists because the plan is the hardest of the three to buy on faith:
+    // $250 is four times the street-cleaning plan, and the part that justifies
+    // it is the daily park, which nobody believes until they have used it for a
+    // few weeks. A month of actually living with it is the argument.
+    //
+    // Fixed garage is not a per-move plan (subscriptionPlans.js), so quantity
+    // is always 1 and `movesPerWeek` is deliberately absent from appliesTo —
+    // pinning it would make the code refuse the only plan it is for.
+    LOLGARAGE: {
+        code: 'LOLGARAGE',
+        kind: 'free_trial',
+        trialDays: 30,
+        headline: 'First month free',
+        detail:
+            'Your first month of Fixed garage is on us — the street-cleaning moves and a free park and retrieval every day at your spot. Cancel any time before it ends and you are never charged.',
+        appliesTo: { tier: 'home_garage', interval: 'month' },
+        firstTimeOnly: true,
+        active: true,
+    },
 };
 
 // Codes are typed by hand on a phone. Inner spaces and dashes are the
@@ -114,6 +137,14 @@ function planMismatch(promo, { tier, interval, movesPerWeek }) {
     // would have told a two-move customer the wrong thing about their own
     // offer.
     const unit = wants.interval === 'week' ? 'week' : 'month';
+    // Only a per-move plan is bought by the move. Spelling a weekly cadence on
+    // a flat plan describes a product we do not sell — LOLGARAGE is for Fixed
+    // garage, which has no moves-per-week to name, and would otherwise be
+    // advertised to the customer as "one move a week" at $250.
+    const perMove = plan && plan.perMove;
+    if (!perMove) {
+        return `${promo.code} covers the ${name} plan at $${dollars} a ${unit}.`;
+    }
     const moves = wants.movesPerWeek || 1;
     const spelled = ['', 'one', 'two', 'three', 'four'][moves] || String(moves);
     const cadence = `${spelled} move${moves === 1 ? '' : 's'} a week`;
