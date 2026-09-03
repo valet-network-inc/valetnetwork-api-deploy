@@ -1,0 +1,786 @@
+/**
+ * curbCustody — opening, re-arming and closing the record of a car we hold.
+ *
+ * THE LOOP THIS EXISTS TO CLOSE:
+ *
+ *     we park the car        →  capture that block's cleaning window
+ *                            →  we hold responsibility until the sweep
+ *     sweep is due           →  dispatch a valet, move it to another empty spot
+ *                            →  CAPTURE THAT SPOT'S WINDOW TOO
+ *     sweep ends             →  move it back to the original spot
+ *                            →  back to that block's window. normal.
+ *     customer takes the car →  management stops
+ *     customer parks again   →  loop restarts, wherever the valet puts it
+ *
+ * The recursion IS the feature. Arm once and never re-arm and a car is managed
+ * exactly once and then abandoned on whatever block the first sweep left it on.
+ *
+ * Everything here is called from a request path a valet is waiting on, so every
+ * public entry point either cannot throw (`armSafely`, `closeSafely`) or is
+ * called from a background tick that catches for itself.
+ */
+
+const CurbCustody = require('../models/CurbCustody');
+const Order = require('../models/Order');
+const ParkingNote = require('../models/ParkingNote');
+const StreetParkingMark = require('../models/StreetParkingMark');
+const Subscription = require('../models/Subscription');
+const sweepWindows = require('./sweepWindows');
+const operatorAlert = require('./operatorAlert');
+const { nyDateKey, nyClock } = require('./nyTime');
+
+const MANAGED_TIERS = ['home_garage', 'valet_anywhere'];
+
+// How far a ParkingNote may sit from where the car actually is before we stop
+// believing it describes this block.
+//
+// This is not a tolerance, it is a DETECTOR. ParkingNote is upserted one row per
+// ORDER, so after a second park within one order the note's rules describe block
+// A while the car stands on block B — and the note still exists, so nothing else
+// in the system flags it. Comparing the note's own coordinates against the
+// order's current parkingLocation is the only signal available for that state.
+// 40m is roughly half a short Brooklyn block: wide enough for GPS drift and a
+// valet nudging the car two spaces up, narrow enough to catch a real move.
+const NOTE_SPOT_TOLERANCE_M = 40;
+
+// How far to look for another valet's note on the same block face.
+const BLOCK_NOTE_RADIUS_M = 60;
+
+// A car whose recorded spot is further than this from the order's actual
+// parking location has drifted, and a valet would be sent to the wrong place.
+const DRIFT_TOLERANCE_M = 40;
+
+// How long a custody row may sit on a completed order before it counts as a
+// leak rather than a loop in progress. The normal hop takes minutes.
+const STALE_COMPLETED_MS = 6 * 60 * 60 * 1000;
+
+const isManagedTier = (tier) => MANAGED_TIERS.includes(tier);
+
+const finite = (n) => typeof n === 'number' && Number.isFinite(n);
+
+/** Enterprise dispatches are the front desk's custody, never ours. */
+const isEnterprise = (order) =>
+    !!(order && order.endCustomerName && String(order.endCustomerName).trim());
+
+/**
+ * A street-cleaning move's return leg is `orderType: 'retrieval'`, but it is not
+ * a retrieval in the sense the customer means: the car comes off the swept block
+ * and goes straight back onto the street. The valet re-parks through that leg,
+ * so it has to be able to re-arm custody like any other park.
+ */
+const isSweepReturnLeg = (order) =>
+    !!(
+        order &&
+        order.orderType === 'retrieval' &&
+        (order.aspMode || String(order.autoBookKey || '').startsWith('aspreturn:'))
+    );
+
+/**
+ * Is this order a managed park — one of ours, on a flat plan, on the street?
+ *
+ * Deliberately NOT gated on `aspMode`: the free daily park that a flat plan
+ * covers is aspMode:false (evaluateParkCoverage → 'daily_free_park'), and that
+ * is exactly the park that starts custody.
+ */
+async function classify(order) {
+    if (!order) return null;
+    if (order.orderType !== 'parking' && !isSweepReturnLeg(order)) return null;
+    // A sweep return is 'completed' at the moment the valet closes it, and that
+    // is precisely when we most need to record where the car ended up.
+    if (['cancelled'].includes(order.status)) return null;
+    if (order.status === 'completed' && !isSweepReturnLeg(order)) return null;
+    if (isEnterprise(order)) return null;
+    if (!order.coveredBySubscription) return null;
+    const loc = order.parkingLocation;
+    if (!loc || !finite(loc.lat) || !finite(loc.lng)) return null;
+
+    const subId = order.coveredBySubscription._id || order.coveredBySubscription;
+    const sub = await Subscription.findById(subId).select('tier user status').lean();
+    if (!sub || !isManagedTier(sub.tier)) return null;
+
+    return { sub, loc };
+}
+
+const customerIdOf = (order) =>
+    order && order.customer
+        ? String(order.customer._id || order.customer)
+        : null;
+
+const valetIdOf = (order) =>
+    order && order.valet ? order.valet._id || order.valet : undefined;
+
+/**
+ * Open custody for this order, or re-point it at the block the car has just
+ * been moved to. Idempotent: this runs on every park AND every move, and may
+ * run twice for one move.
+ */
+async function arm({ order }) {
+    const classified = await classify(order);
+    if (!classified) return null;
+    const { sub, loc } = classified;
+
+    const tileKey = sweepWindows.tileKeyOf(loc);
+    const now = new Date();
+
+    let custody = await CurbCustody.findOne({
+        currentOrder: order._id,
+        closedAt: { $exists: false },
+    });
+
+    // The car may already be under management through the order this one came
+    // out of. A sweep move mints order M and then a return leg R linked back to
+    // it; the valet re-parks through R, so R has to attach to the SAME row
+    // rather than opening a second one for the same car. Matching on the linked
+    // order (and then on the chain) is precise enough not to collide with a
+    // second car in the same household, which a match on customer alone would.
+    if (!custody && order.linkedOrderId) {
+        custody = await CurbCustody.findOne({
+            closedAt: { $exists: false },
+            customer: customerIdOf(order),
+            $or: [
+                { currentOrder: order.linkedOrderId },
+                { orderChain: order.linkedOrderId },
+            ],
+        });
+        if (custody) {
+            custody.currentOrder = order._id;
+            if (!custody.orderChain.some((id) => String(id) === String(order._id))) {
+                custody.orderChain.push(order._id);
+            }
+        }
+    }
+
+    if (!custody) {
+        custody = new CurbCustody({
+            customer: customerIdOf(order),
+            subscription: sub._id,
+            tier: sub.tier,
+            currentOrder: order._id,
+            orderChain: [order._id],
+            valet: valetIdOf(order),
+            state: 'resolving',
+            spot: {
+                lat: loc.lat,
+                lng: loc.lng,
+                streetAddress: loc.streetAddress,
+                tileKey,
+            },
+            spotSince: now,
+            spots: [
+                {
+                    seq: 1,
+                    order: order._id,
+                    lat: loc.lat,
+                    lng: loc.lng,
+                    streetAddress: loc.streetAddress,
+                    tileKey,
+                    arrivedAt: now,
+                },
+            ],
+            openedAt: now,
+        });
+        try {
+            await custody.save();
+        } catch (err) {
+            if (err && err.code === 11000) {
+                // Another concurrent park won. Re-read and fall through to the
+                // move path, which is idempotent.
+                custody = await CurbCustody.findOne({
+                    currentOrder: order._id,
+                    closedAt: { $exists: false },
+                });
+                if (!custody) return null;
+            } else {
+                throw err;
+            }
+        }
+        return custody;
+    }
+
+    // Already open on this order. Only a change of BLOCK is a move worth
+    // recording — a valet correcting a pin by ten metres has not changed the
+    // sign, and appending a spot for that would fill the history with noise.
+    if (custody.spot && custody.spot.tileKey === tileKey) {
+        custody.spot.lat = loc.lat;
+        custody.spot.lng = loc.lng;
+        if (loc.streetAddress) custody.spot.streetAddress = loc.streetAddress;
+        if (valetIdOf(order)) custody.valet = valetIdOf(order);
+        await custody.save();
+        return custody;
+    }
+
+    const last = custody.spots[custody.spots.length - 1];
+    if (last && !last.departedAt) last.departedAt = now;
+
+    custody.spots.push({
+        seq: (last ? last.seq : 0) + 1,
+        order: order._id,
+        lat: loc.lat,
+        lng: loc.lng,
+        streetAddress: loc.streetAddress,
+        tileKey,
+        arrivedAt: now,
+    });
+    custody.spot = {
+        lat: loc.lat,
+        lng: loc.lng,
+        streetAddress: loc.streetAddress,
+        tileKey,
+    };
+    custody.spotSince = now;
+    if (valetIdOf(order)) custody.valet = valetIdOf(order);
+
+    // The car is somewhere new, so whatever we knew about the old block is now
+    // wrong. Drop back to 'resolving' and clear the rules rather than carrying
+    // them forward — dispatching against the block the car has LEFT is the
+    // precise failure this model exists to prevent.
+    custody.rules = {
+        source: 'unknown',
+        windows: [],
+        disputed: false,
+        droppedWindows: 0,
+    };
+    custody.state = 'resolving';
+    custody.lastMoveReminderKey = undefined;
+    custody.reminderSpotKey = undefined;
+    custody.reminderSentAt = undefined;
+    // A new block gets a fresh chance to alarm.
+    custody.alerts.noRulesOn = undefined;
+    custody.alerts.disputedOn = undefined;
+    custody.alerts.didNotMoveOn = undefined;
+    custody.alerts.inProgressOn = undefined;
+
+    await custody.save();
+    return custody;
+}
+
+/**
+ * The wrapper every request path calls. It must be impossible for custody
+ * bookkeeping to fail a valet's park, so nothing escapes here.
+ */
+async function armSafely({ order, orderId }) {
+    try {
+        let doc = order;
+        if (!doc && orderId) doc = await Order.findById(orderId);
+        if (!doc) return null;
+        return await arm({ order: doc });
+    } catch (err) {
+        console.error('curbCustody.armSafely failed:', err.message);
+        return null;
+    }
+}
+
+/**
+ * Read the sweep windows for the block this car is on, in the order that
+ * reflects how much we should trust each source.
+ *
+ * Returns { source, windows, disputed, disputeDetail, droppedWindows, noteId }.
+ * `source: 'unknown'` means we do not know — which is an ALARM, never a green
+ * light. It is never "no sweep here".
+ */
+async function resolveRules({ order, note, spot }) {
+    const at = { lat: spot.lat, lng: spot.lng };
+    let primary = null;
+    let disputeDetail = null;
+    let dropped = 0;
+
+    // 1. This order's own note — a valet stood at this car and photographed this
+    //    sign. Guarded on distance, because the note is upserted per order and
+    //    after a move it may still describe the previous block.
+    let ownNote = note;
+    if (!ownNote && order) {
+        ownNote = await ParkingNote.findOne({ order: order._id })
+            .sort({ updatedAt: -1 })
+            .lean();
+    }
+    if (ownNote && ownNote.location) {
+        const away = sweepWindows.haversineMeters(at, {
+            lat: ownNote.location.lat,
+            lng: ownNote.location.lng,
+        });
+        if (away <= NOTE_SPOT_TOLERANCE_M) {
+            // A valet who read the sign and told us there is nothing to read is
+            // the ONLY thing that legitimately silences the alarm on a block.
+            const status = ownNote.sweepDataStatus;
+            if (status === 'none_on_sign' || status === 'off_street') {
+                return {
+                    source: status,
+                    windows: [],
+                    disputed: false,
+                    droppedWindows: 0,
+                    noteId: ownNote._id,
+                };
+            }
+            const converted = sweepWindows.toSweepWindows(ownNote.streetCleaning);
+            dropped = converted.dropped;
+            if (converted.windows.length) {
+                primary = { source: 'note', windows: converted.windows, noteId: ownNote._id };
+            }
+            // An empty array with no sweepDataStatus is a LEGACY note, and it
+            // means both "no cleaning here" and "the valet skipped the field".
+            // It falls through to the block sources and then to unknown. It is
+            // never backfilled to 'none_on_sign' — that would be a lie that
+            // silences the alarm on this block permanently.
+
+            // The valet app writes date.getHours(), the PHONE's local hour, and
+            // nothing validates it. A phone on the wrong timezone turns into a
+            // wrong dispatch instant that looks completely ordinary.
+            if (finite(ownNote.tzOffsetMinutes)) {
+                const nyOffset = nyOffsetMinutes(ownNote.createdAt || new Date());
+                if (ownNote.tzOffsetMinutes !== nyOffset) {
+                    disputeDetail =
+                        `Sign times were entered on a phone ${ownNote.tzOffsetMinutes} minutes ` +
+                        `off UTC while New York was ${nyOffset}. The hours may be shifted.`;
+                }
+            }
+        } else {
+            disputeDetail =
+                `The parking note for this order was taken ${Math.round(away)}m away, ` +
+                `so it describes a different block. Ignored.`;
+        }
+    }
+
+    // 2. Another valet's note on the same block face.
+    const blockWindows = await blockNoteWindows(at, ownNote && ownNote._id);
+
+    // 3. StreetParkingMark consensus. Measured in production: 1 of 11 marks
+    //    carries streetCleaning at all, so this is a tertiary hint and never a
+    //    confirmation on its own.
+    const markWindows = await markTileWindows(spot.tileKey);
+
+    const secondary = blockWindows.length
+        ? { source: 'block', windows: blockWindows }
+        : markWindows.length
+        ? { source: 'mark', windows: markWindows }
+        : null;
+
+    if (!primary && !secondary) {
+        return {
+            source: 'unknown',
+            windows: [],
+            disputed: false,
+            disputeDetail,
+            droppedWindows: dropped,
+        };
+    }
+    if (!primary) {
+        return {
+            source: secondary.source,
+            windows: secondary.windows,
+            disputed: false,
+            disputeDetail,
+            droppedWindows: dropped,
+        };
+    }
+    if (!secondary) {
+        return {
+            source: 'note',
+            windows: primary.windows,
+            disputed: !!disputeDetail,
+            disputeDetail,
+            droppedWindows: dropped,
+            noteId: primary.noteId,
+        };
+    }
+
+    // Two readings of one block. If they agree, nothing to say. If they do not,
+    // dispatch on the UNION and flag it: moving the car on a morning it did not
+    // need moving costs one valet fee, and missing the real morning costs a $65
+    // ticket we have said we eat. Same asymmetry aspSuspensions reasons from.
+    if (sweepWindows.sameWindows(primary.windows, secondary.windows)) {
+        return {
+            source: 'note',
+            windows: primary.windows,
+            disputed: !!disputeDetail,
+            disputeDetail,
+            droppedWindows: dropped,
+            noteId: primary.noteId,
+        };
+    }
+    return {
+        source: 'note',
+        windows: sweepWindows.unionWindows(primary.windows, secondary.windows),
+        disputed: true,
+        disputeDetail:
+            (disputeDetail ? `${disputeDetail} ` : '') +
+            `This block's own note says ${sweepWindows.describeWindows(primary.windows)}, ` +
+            `while ${secondary.source === 'block' ? 'another note on the same block' : 'the block map'} ` +
+            `says ${sweepWindows.describeWindows(secondary.windows)}. Moving for both.`,
+        droppedWindows: dropped,
+        noteId: primary.noteId,
+    };
+}
+
+/** New York's UTC offset, in the same sign convention as getTimezoneOffset(). */
+function nyOffsetMinutes(at) {
+    const c = nyClock(at);
+    const asUtc = Date.UTC(c.year, c.month - 1, c.day, c.hour, c.minute, c.second);
+    return Math.round((new Date(at).getTime() - asUtc) / 60000);
+}
+
+async function blockNoteWindows(at, excludeNoteId) {
+    const dLat = BLOCK_NOTE_RADIUS_M / 111000;
+    const dLng = BLOCK_NOTE_RADIUS_M / (111000 * Math.cos((at.lat * Math.PI) / 180));
+    const candidates = await ParkingNote.find({
+        'location.lat': { $gte: at.lat - dLat, $lte: at.lat + dLat },
+        'location.lng': { $gte: at.lng - dLng, $lte: at.lng + dLng },
+        'streetCleaning.0': { $exists: true },
+    })
+        .sort({ createdAt: -1 })
+        .limit(20)
+        .lean();
+
+    for (const n of candidates) {
+        if (excludeNoteId && String(n._id) === String(excludeNoteId)) continue;
+        const away = sweepWindows.haversineMeters(at, {
+            lat: n.location.lat,
+            lng: n.location.lng,
+        });
+        if (away > BLOCK_NOTE_RADIUS_M) continue;
+        const converted = sweepWindows.toSweepWindows(n.streetCleaning);
+        if (converted.windows.length) return converted.windows;
+    }
+    return [];
+}
+
+async function markTileWindows(tileKey) {
+    if (!tileKey) return [];
+    const marks = await StreetParkingMark.find({
+        tileKey,
+        'details.streetCleaning.0': { $exists: true },
+    })
+        .sort({ createdAt: -1 })
+        .limit(10)
+        .lean();
+    for (const m of marks) {
+        const converted = sweepWindows.toSweepWindows(m.details.streetCleaning);
+        if (converted.windows.length) return converted.windows;
+    }
+    return [];
+}
+
+/**
+ * Called after a valet files a ParkingNote. This is where a car stops being
+ * 'resolving' and becomes either 'armed' or 'blind'.
+ */
+async function enrichFromNote({ order, note }) {
+    const custody = await CurbCustody.findOne({
+        currentOrder: order._id,
+        closedAt: { $exists: false },
+    });
+    if (!custody) return null;
+    return applyRules(custody, { order, note });
+}
+
+async function applyRules(custody, { order, note } = {}) {
+    const resolved = await resolveRules({
+        order,
+        note,
+        spot: custody.spot || {},
+    });
+
+    custody.rules = {
+        source: resolved.source,
+        windows: resolved.windows,
+        capturedAt: new Date(),
+        noteId: resolved.noteId,
+        disputed: !!resolved.disputed,
+        disputeDetail: resolved.disputeDetail,
+        droppedWindows: resolved.droppedWindows || 0,
+    };
+
+    const last = custody.spots[custody.spots.length - 1];
+    if (last) {
+        last.windows = resolved.windows;
+        last.rulesSource = resolved.source;
+        last.disputed = !!resolved.disputed;
+        last.noteId = resolved.noteId;
+        last.rulesCapturedAt = new Date();
+    }
+
+    // 'none_on_sign' and 'off_street' are armed with zero windows: we know there
+    // is nothing to move for. 'unknown' is blind, which the watchdog alarms on.
+    custody.state = resolved.source === 'unknown' ? 'blind' : 'armed';
+    await custody.save();
+    return custody;
+}
+
+/**
+ * Re-read the block for a car we already hold. Used by the dispatcher tick so a
+ * note filed after the park (the normal ordering — parkingNoteController hard
+ * requires parkingLocation to exist first) still arms the car within a minute,
+ * and so a car whose rules were never resolved keeps trying.
+ */
+async function refreshRules(custody) {
+    try {
+        const order = await Order.findById(custody.currentOrder);
+        return await applyRules(custody, { order });
+    } catch (err) {
+        console.error('curbCustody.refreshRules failed:', err.message);
+        return custody;
+    }
+}
+
+/** A human typing the sign into the admin console. */
+async function setOperatorRules({ custodyId, streetCleaning, note }) {
+    const custody = await CurbCustody.findById(custodyId);
+    if (!custody) return null;
+    const converted = sweepWindows.toSweepWindows(streetCleaning);
+    custody.rules = {
+        source: 'operator',
+        windows: converted.windows,
+        capturedAt: new Date(),
+        disputed: false,
+        disputeDetail: note || undefined,
+        droppedWindows: converted.dropped,
+    };
+    custody.state = 'armed';
+    custody.alerts.noRulesOn = undefined;
+    const last = custody.spots[custody.spots.length - 1];
+    if (last) {
+        last.windows = converted.windows;
+        last.rulesSource = 'operator';
+        last.rulesCapturedAt = new Date();
+    }
+    await custody.save();
+    return custody;
+}
+
+/**
+ * The car went back to the customer, or the order died.
+ *
+ * Note what is NOT a close signal: `parkClosedAt`. That is stamped when the KEYS
+ * go back, which on these plans happens at the end of every park while the car
+ * stays on the street for weeks. Closing on it would drop exactly the cars this
+ * feature exists for.
+ */
+async function close({ custody, reason }) {
+    if (!custody || custody.closedAt) return custody;
+    custody.closedAt = new Date();
+    custody.closeReason = reason;
+    custody.state = 'closed';
+    const last = custody.spots[custody.spots.length - 1];
+    if (last && !last.departedAt) last.departedAt = custody.closedAt;
+    await custody.save();
+    return custody;
+}
+
+async function closeSafely({ orderId, customerId, reason }) {
+    try {
+        const query = { closedAt: { $exists: false } };
+        if (orderId) query.currentOrder = orderId;
+        else if (customerId) query.customer = customerId;
+        else return null;
+        const custody = await CurbCustody.findOne(query);
+        if (!custody) return null;
+        return await close({ custody, reason });
+    } catch (err) {
+        console.error('curbCustody.closeSafely failed:', err.message);
+        return null;
+    }
+}
+
+/**
+ * A sweep move mints a NEW order, and completing that move's return leg drives
+ * the OLD order to 'completed'. The custody row has to HOP rather than close —
+ * this is the recursion, and getting it wrong means a car is managed once and
+ * then abandoned on whatever block the first sweep left it on.
+ *
+ * Ordering matters: the completion of the old order can arrive before or after
+ * the new park. Hopping is therefore keyed on the NEW order existing, and
+ * `closeSafely` is only ever called for a real retrieval, so a completion can
+ * never close a row that has already hopped.
+ */
+async function handOff({ fromOrderId, toOrderId }) {
+    try {
+        const custody = await CurbCustody.findOne({
+            currentOrder: fromOrderId,
+            closedAt: { $exists: false },
+        });
+        if (!custody) return null;
+        custody.currentOrder = toOrderId;
+        if (!custody.orderChain.some((id) => String(id) === String(toOrderId))) {
+            custody.orderChain.push(toOrderId);
+        }
+        custody.state = 'moving';
+        await custody.save();
+        return custody;
+    } catch (err) {
+        console.error('curbCustody.handOff failed:', err.message);
+        return null;
+    }
+}
+
+/**
+ * The safety net that makes the fire-and-forget hooks safe to use.
+ *
+ * Every arm() call site is wrapped in a catch, which is right — a valet's park
+ * must never fail because of bookkeeping — but it means a swallowed throw, a
+ * deploy gap, or an order parked before this shipped leaves a car we are holding
+ * with no row saying so. And a row that has DRIFTED is worse than a missing one:
+ * it will confidently send a valet to a block the car has left.
+ */
+async function reconcile({ now = new Date() } = {}) {
+    const found = { backfilled: 0, drifted: 0, superseded: 0 };
+    const dateKey = nyDateKey(now);
+
+    // (a) A managed park with no open custody row.
+    try {
+        const parked = await Order.find({
+            status: 'parked',
+            orderType: 'parking',
+            coveredBySubscription: { $exists: true, $ne: null },
+            'parkingLocation.lat': { $exists: true },
+        })
+            .sort({ updatedAt: -1 })
+            .limit(200);
+
+        for (const order of parked) {
+            const existing = await CurbCustody.exists({
+                currentOrder: order._id,
+                closedAt: { $exists: false },
+            });
+            if (existing) continue;
+            const custody = await arm({ order });
+            if (!custody) continue;
+            found.backfilled += 1;
+            if (custody.alerts.backfilledOn !== dateKey) {
+                custody.alerts.backfilledOn = dateKey;
+                await custody.save();
+                await operatorAlert.raise({
+                    kind: 'custody_backfilled',
+                    severity: operatorAlert.SEVERITY.WARN,
+                    custody: custody._id,
+                    order: order._id,
+                    customer: custody.customer,
+                    dateKey,
+                    title: 'Started managing a car we were already holding',
+                    detail:
+                        `A ${custody.tier === 'home_garage' ? '$250' : '$300'} plan car at ` +
+                        `${custody.spot.streetAddress || 'an unknown address'} had no management ` +
+                        `record. It has one now. Worth checking why it was missed.`,
+                    payload: { orderId: String(order._id), spot: custody.spot },
+                });
+            }
+        }
+    } catch (err) {
+        console.error('curbCustody.reconcile backfill failed:', err.message);
+    }
+
+    // (b) A row pointing somewhere the car is not.
+    try {
+        const open = await CurbCustody.find({ closedAt: { $exists: false } }).limit(500);
+        for (const custody of open) {
+            const order = await Order.findById(custody.currentOrder)
+                .select('status parkingLocation orderType')
+                .lean();
+            if (!order) continue;
+
+            if (order.status === 'cancelled') {
+                await close({ custody, reason: 'cancelled' });
+                found.superseded += 1;
+                continue;
+            }
+
+            // (c) A terminal order with nothing after it.
+            //
+            // Being 'completed' is NOT on its own a reason to close. A sweep
+            // return completes normally and the car stays on the street — that
+            // is the product — and custody hops onto the next order within
+            // minutes. So only a row that has sat on a completed order for
+            // hours, with nothing live for that customer, is a genuine leak.
+            // And it is worth saying out loud rather than tidying away: if the
+            // car really is still out there, closing this stops us moving it.
+            if (order.status === 'completed') {
+                const stale =
+                    now.getTime() -
+                        new Date(custody.spotSince || custody.openedAt).getTime() >
+                    STALE_COMPLETED_MS;
+                if (!stale) continue;
+                const live = await Order.exists({
+                    customer: custody.customer,
+                    status: { $in: ['pending', 'accepted', 'in_progress', 'in-progress', 'parked'] },
+                });
+                if (live) continue;
+                await close({ custody, reason: 'superseded' });
+                found.superseded += 1;
+                await operatorAlert.raise({
+                    kind: 'custody_superseded',
+                    severity: operatorAlert.SEVERITY.WARN,
+                    custody: custody._id,
+                    order: order._id,
+                    customer: custody.customer,
+                    dateKey,
+                    title: 'Stopped managing a car whose order ended',
+                    detail:
+                        `The order for a car at ` +
+                        `${custody.spot.streetAddress || 'an unknown address'} completed hours ` +
+                        `ago with nothing after it, so management has stopped. If that car is ` +
+                        `still on the street, it is no longer being moved.`,
+                    payload: { custodyId: String(custody._id), orderId: String(order._id) },
+                });
+                continue;
+            }
+
+            const loc = order.parkingLocation;
+            if (!loc || !finite(loc.lat) || !finite(loc.lng)) continue;
+            if (!custody.spot || !finite(custody.spot.lat)) continue;
+            const away = sweepWindows.haversineMeters(
+                { lat: loc.lat, lng: loc.lng },
+                { lat: custody.spot.lat, lng: custody.spot.lng }
+            );
+            if (away <= DRIFT_TOLERANCE_M) continue;
+
+            const full = await Order.findById(custody.currentOrder);
+            await arm({ order: full });
+            found.drifted += 1;
+            const fresh = await CurbCustody.findById(custody._id);
+            if (fresh && fresh.alerts.driftedOn !== dateKey) {
+                fresh.alerts.driftedOn = dateKey;
+                await fresh.save();
+                await operatorAlert.raise({
+                    kind: 'custody_spot_drifted',
+                    severity: operatorAlert.SEVERITY.PAGE,
+                    custody: fresh._id,
+                    order: order._id,
+                    customer: fresh.customer,
+                    dateKey,
+                    title: 'A managed car was not where we thought it was',
+                    detail:
+                        `We had it ${Math.round(away)}m from where the order says it is. ` +
+                        `Fixed, and the block is being read again — but a valet may have been ` +
+                        `sent to the wrong place before this.`,
+                    payload: {
+                        orderId: String(order._id),
+                        was: custody.spot,
+                        now: { lat: loc.lat, lng: loc.lng, streetAddress: loc.streetAddress },
+                    },
+                });
+            }
+        }
+    } catch (err) {
+        console.error('curbCustody.reconcile drift failed:', err.message);
+    }
+
+    return found;
+}
+
+module.exports = {
+    MANAGED_TIERS,
+    NOTE_SPOT_TOLERANCE_M,
+    DRIFT_TOLERANCE_M,
+    STALE_COMPLETED_MS,
+    isManagedTier,
+    isSweepReturnLeg,
+    classify,
+    arm,
+    armSafely,
+    resolveRules,
+    enrichFromNote,
+    refreshRules,
+    setOperatorRules,
+    close,
+    closeSafely,
+    handOff,
+    reconcile,
+};

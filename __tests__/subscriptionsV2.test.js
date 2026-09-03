@@ -92,7 +92,7 @@ const makeCustomer = async (overrides = {}) =>
 const HOME = { lat: 40.679, lng: -73.995, streetAddress: '123 Court St, Brooklyn' };
 const AWAY = { lat: 40.72, lng: -73.957, streetAddress: '99 Elsewhere Ave, Brooklyn' };
 
-const makeSub = async (user, overrides = {}) =>
+const makeSubShared = async (user, overrides = {}) =>
     Subscription.create({
         user: user._id,
         tier: 'home_garage',
@@ -112,6 +112,9 @@ const makeSub = async (user, overrides = {}) =>
         homeAddress: HOME,
         ...overrides,
     });
+
+// Every describe outside the auto-ASP scheduler wants the shared default.
+const makeSub = makeSubShared;
 
 // createOrder needs the middleware's work done: req.subscription + req.user.
 const createOrderVia = async (user, body, subscription = null) => {
@@ -181,6 +184,24 @@ describe('nyTime', () => {
 // ---------------------------------------------------------------------------
 
 describe('auto-ASP scheduler', () => {
+    // This scheduler owns the PER-MOVE plan only. The $250 and $300 flat plans
+    // are managed from the block the valet parked on rather than from days the
+    // customer typed, so services/curbSweepDispatcher.js owns them and this one
+    // skips them by tier — see the partition in subscriptionScheduler.tick().
+    // Shadowing the shared helper here keeps these cases pointed at the tier
+    // this scheduler is actually responsible for.
+    const makeSub = (user, overrides = {}) =>
+        makeSubShared(user, { tier: 'street_cleaning', amountCents: 3000, ...overrides });
+
+    it('never books for a flat plan — those cars are managed from where they are parked', async () => {
+        const user = await makeCustomer();
+        await makeSubShared(user, { tier: 'home_garage' });
+        const results = await runTick(inWindowNow);
+        expect(results.filter((r) => r.outcome === 'booked')).toHaveLength(0);
+        expect(results.filter((r) => r.outcome === 'managed_tier')).toHaveLength(1);
+        expect(await Order.countDocuments({})).toBe(0);
+    });
+
     it('books a $0 covered order inside the firing window with the right shape', async () => {
         const user = await makeCustomer();
         const sub = await makeSub(user, { tier: 'street_cleaning', amountCents: 3000 });

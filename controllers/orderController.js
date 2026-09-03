@@ -1,6 +1,7 @@
 const dotenv = require('dotenv');
 dotenv.config({ path: `.env.${process.env.NODE_ENV}` });
 const Order = require('../models/Order');
+const curbCustody = require('../services/curbCustody');
 const User = require('../models/User');
 const Event = require('../models/Event');
 const subscriptionService = require('../services/subscriptionService');
@@ -1525,11 +1526,64 @@ exports.updateOrder = async (req, res) => {
             });
         }
 
+        // A car parked under one of the flat plans ($250 fixed garage, $300
+        // valet anywhere) is one we manage on the street until the customer
+        // takes it back: we read the sign where the valet put it and move it
+        // before that block's sweep, over and over. This is the hook that
+        // records where it is — on the first park AND on every move, because
+        // after a move the old block's rules describe somewhere the car is not.
+        //
+        // Fire-and-forget by design: bookkeeping must never be able to fail a
+        // valet's park. services/curbCustody.js reconcile() is the safety net
+        // for anything this swallows.
+        //
+        // Awaited rather than fired and forgotten: armSafely cannot throw (it
+        // catches for itself), and responding "parked" before the row exists
+        // leaves a window where a restart loses the only record that we are
+        // holding this car. Two queries is a fair price for that.
+        if (updates.parkingLocation) {
+            await curbCustody.armSafely({ order });
+        }
+
         // If completing a retrieval order, update the linked parking order
         // AND credit the parking valet for their share. The credit hook
         // below only fires for the order that was directly updated; the
         // linked parking is updated via a separate findByIdAndUpdate so we
         // have to run the credit logic explicitly here.
+        // A completed retrieval is the moment a managed car stops being managed
+        // — but only if it is a REAL retrieval.
+        //
+        // A street-cleaning move's return leg looks identical at this line: same
+        // orderType, same 'completed', same linkedOrderId, and completing it
+        // drives its parent to 'completed' too. The difference is that the
+        // customer is not taking the car anywhere. It comes off the swept block
+        // and goes straight back onto the street, which is the whole product.
+        // Closing custody here would end management after exactly one sweep and
+        // abandon the car on whatever block that sweep left it on — the failure
+        // this feature exists to prevent.
+        //
+        // runAspSweep mints those legs with `aspMode` and an `aspreturn:` key,
+        // so that is the discriminator.
+        if (order.orderType === 'retrieval' && updates.status === 'completed') {
+            const isSweepReturn =
+                order.aspMode ||
+                String(order.autoBookKey || '').startsWith('aspreturn:');
+            if (isSweepReturn) {
+                await curbCustody.armSafely({ order });
+            } else {
+                await curbCustody.closeSafely({
+                    orderId: order.linkedOrderId || order._id,
+                    reason: 'retrieved',
+                });
+                if (order.customer) {
+                    await curbCustody.closeSafely({
+                        customerId: order.customer._id || order.customer,
+                        reason: 'retrieved',
+                    });
+                }
+            }
+        }
+
         if (order.orderType === 'retrieval' && updates.status === 'completed' && order.linkedOrderId) {
             try {
                 const linkedParking = await Order.findById(order.linkedOrderId);
@@ -2652,6 +2706,12 @@ exports.updateCarLocation = async (req, res) => {
             new: true,
         });
 
+        // The other way a parked car moves. This endpoint is the valet's
+        // "today's parked cars" shuffling screen rather than the park flow, but
+        // a managed car moved from here has moved just the same, and custody
+        // must follow it or the next sweep dispatch goes to the old block.
+        await curbCustody.armSafely({ order: updatedOrder });
+
         const orderData = updatedOrder.toObject();
         // Don't send the OTP code to the valet — only to the customer. The
         // spread is shallow, so `otp` has to be re-made or deleting the code
@@ -3602,6 +3662,8 @@ exports.cancelOrder = async (req, res) => {
         order.status = 'cancelled';
         await order.save();
 
+        await curbCustody.closeSafely({ orderId: order._id, reason: 'cancelled' });
+
         // If this is a linked retrieval order (parking → retrieval pair), put
         // the parking order back exactly where it was so the customer can ask
         // again. Same helper the auto-cancel cron uses for stale retrievals.
@@ -4043,6 +4105,7 @@ exports.verifyKeyReturnOtp = async (req, res) => {
         order.status = 'completed';
         order.keyReturn.completedAt = new Date();
         order.keyReturn.verifiedBy = valetId;
+        await curbCustody.closeSafely({ orderId: order._id, reason: 'enterprise_key_return' });
         // Clear the OTP so it's no longer usable
         order.keyReturn.otp = undefined;
         await order.save();

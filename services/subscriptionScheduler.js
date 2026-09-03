@@ -39,6 +39,7 @@ const {
 } = require('./subscriptionService');
 const { ASP_MOVES_PER_WEEK } = require('./subscriptionPlans');
 const { nyDateKey, nextNyOccurrence } = require('./nyTime');
+const { isManagedTier } = require('./curbCustody');
 const { getSuspension } = require('./aspSuspensions');
 const { creditSuspendedDay } = require('./subscriptionCredits');
 
@@ -253,6 +254,24 @@ async function tick({ io = null, now = new Date(), notify = null } = {}) {
 
         for (const sub of subs) {
             if (!isEntitled(sub, now)) continue; // stale period → webhook lag or lapse; never book
+
+            // The two dispatchers are partitioned by tier, and the partition is
+            // the only thing stopping them both firing on one customer.
+            //
+            // This one books from a schedule the CUSTOMER typed, which is what
+            // the per-move plan is sold on. The flat plans invert that: we hold
+            // the car, the sweep days come off the sign where the VALET parked
+            // it, and services/curbSweepDispatcher.js owns them end to end.
+            //
+            // Leaving them here would not merely duplicate work, it would do
+            // nothing at all and say nothing about it: bookOccurrence refuses to
+            // book while any order is 'parked' (the live-order guard below), and
+            // a managed car is parked by definition for the life of the plan. So
+            // every occurrence would come back 'skipped_active_order' forever.
+            if (isManagedTier(sub.tier)) {
+                results.push({ subscriptionId: sub._id, outcome: 'managed_tier' });
+                continue;
+            }
 
             // User.cleaningSchedule wins; the subscription's copy is the
             // fallback for documents written before the schedule moved.

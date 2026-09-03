@@ -7,6 +7,10 @@
 
 const Subscription = require('../models/Subscription');
 const Order = require('../models/Order');
+
+// Kept here rather than imported from services/curbCustody so the status
+// payload cannot pull the dispatcher into every request that reads a plan.
+const MANAGED_TIERS = ['home_garage', 'valet_anywhere'];
 const PricingConfig = require('../models/PricingConfig');
 const {
     ASP_MOVES_PER_WEEK,
@@ -174,6 +178,46 @@ async function buildStatusPayload(sub, now = new Date()) {
         entitled ? freeParksUsedToday(sub, now) : 0,
     ]);
 
+    // What the flat plans replaced the sweep-day question with.
+    //
+    // On home_garage and valet_anywhere the customer is never asked when their
+    // street is cleaned, so there is no schedule to show them. What there IS, is
+    // a car we are holding and a block we have read — so the app states the fact
+    // instead of asking the question. `blind` is the honest case: we have the
+    // car and cannot read the block yet, and the customer is still never asked
+    // to fill that gap; a human is (services/curbSweepDispatcher.js watch()).
+    let managed = null;
+    if (MANAGED_TIERS.includes(sub.tier)) {
+        managed = { active: false, blind: false };
+        try {
+            const CurbCustody = require('../models/CurbCustody');
+            const sweepWindows = require('./sweepWindows');
+            const custody = await CurbCustody.findOne({
+                subscription: sub._id,
+                closedAt: { $exists: false },
+            })
+                .sort({ openedAt: -1 })
+                .lean();
+            if (custody) {
+                const windows = (custody.rules && custody.rules.windows) || [];
+                const next = windows.length ? sweepWindows.nextSweep(windows, now) : null;
+                managed = {
+                    active: true,
+                    spotAddress: (custody.spot && custody.spot.streetAddress) || null,
+                    nextMoveAt: next ? next.at : null,
+                    windowsLabel: windows.length ? sweepWindows.describeWindows(windows) : null,
+                    blind: custody.rules && custody.rules.source === 'unknown',
+                    movesThisPeriod: custody.movesThisPeriod || 0,
+                };
+            }
+        } catch (err) {
+            // A status screen must never fail because of this. An absent
+            // `managed` reads as "nothing parked with us", which is the safe
+            // thing to say when we cannot tell.
+            console.error('buildStatusPayload: managed lookup failed:', err.message);
+        }
+    }
+
     const usageCents = usageAgg.length > 0 ? usageAgg[0].cents : 0;
     const usageCount = usageAgg.length > 0 ? usageAgg[0].count : 0;
     const paidCents = (sub.payments || []).reduce((s, p) => s + (p.amountCents || 0), 0);
@@ -194,6 +238,10 @@ async function buildStatusPayload(sub, now = new Date()) {
         aspMovesPerWeek: sub.movesPerWeek || ASP_MOVES_PER_WEEK,
         movesPerWeek: sub.movesPerWeek || ASP_MOVES_PER_WEEK,
         homeAddressChangedAt: sub.homeAddressChangedAt,
+        managed,
+        // The radius the server actually pays coverage inside. Sent so the app's
+        // map default and this check can never drift apart.
+        homeRadiusMeters: HOME_RADIUS_METERS,
         // What a cancel-right-now refund would look like: the period's
         // payment minus usage priced at per-use rates.
         periodUsageCents: periodUsageAgg.length ? periodUsageAgg[0].cents : 0,

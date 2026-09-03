@@ -64,6 +64,36 @@ const ParkingNoteSchema = new mongoose.Schema(
 
         // Structured rules
         streetCleaning: { type: [TimeWindowSchema], default: [] },
+
+        /**
+         * What an EMPTY `streetCleaning` actually means.
+         *
+         * Until this field existed, `[]` meant both "I read the sign and there
+         * is no street cleaning on this block" and "I skipped the field", and
+         * nothing could tell them apart. That ambiguity is fatal to the managed
+         * plans: read as "no sweep" it silently abandons a car on a swept block,
+         * and read as "unknown" it pages a human every day about a driveway.
+         *
+         *   'captured'     — at least one window was entered
+         *   'none_on_sign' — the valet read the sign; no street cleaning here
+         *   'off_street'   — garage, driveway, private lot; sweeps do not apply
+         *   'skipped'      — could not read it (dark, no sign, obstructed)
+         *
+         * Only 'none_on_sign' and 'off_street' legitimately silence the alarm.
+         * A legacy note with no value here stays UNKNOWN forever — backfilling
+         * it would be a lie that permanently silences the alarm on that block.
+         */
+        sweepDataStatus: {
+            type: String,
+            enum: ['captured', 'none_on_sign', 'off_street', 'skipped'],
+        },
+
+        // The phone's UTC offset when the times were typed. The valet app writes
+        // `date.getHours()` — the DEVICE's local hour — and nothing else can
+        // tell whether that clock agreed with New York. A phone in the wrong
+        // timezone turns a correctly-read sign into a wrong dispatch instant
+        // that looks completely ordinary.
+        tzOffsetMinutes: { type: Number },
         // Meter limit in minutes (e.g., 60 for 1-hour meter). null/undefined
         // means no metered limit — plain free parking up to other windows.
         meterMaxMinutes: { type: Number, min: 0 },

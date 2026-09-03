@@ -21,6 +21,7 @@ const orderPhotoController = require('../controllers/orderPhotoController');
 const adminNotification = require('../controllers/adminNotificationController');
 const parkingNoteController = require('../controllers/parkingNoteController');
 const aspSuspensionAdmin = require('../controllers/aspSuspensionAdminController');
+const managedCarAdmin = require('../controllers/managedCarAdminController');
 const adminSubscription = require('../controllers/adminSubscriptionController');
 const adminPromo = require('../controllers/adminPromoController');
 const requireAdminKey = require('../middleware/requireAdminKey');
@@ -36,6 +37,16 @@ router.use(requireAdminKey);
 // days as the city calls them. Both the free reminder and the subscription
 // scheduler read this, so an empty calendar means we confidently tell people
 // to move their car on Thanksgiving.
+// The cars we are holding on the $250 and $300 plans. Those customers are never
+// asked when their street is cleaned, so this is the only place a human can see
+// whether we actually know — and type the sign in when we do not.
+router.get('/managed-cars', managedCarAdmin.listManagedCars);
+router.get('/managed-cars/:id', managedCarAdmin.getManagedCar);
+router.put('/managed-cars/:id/rules', managedCarAdmin.setManagedCarRules);
+router.post('/managed-cars/:id/close', managedCarAdmin.closeManagedCar);
+router.get('/ops-alerts', managedCarAdmin.listOpsAlerts);
+router.post('/ops-alerts/:id/ack', managedCarAdmin.ackOpsAlert);
+
 router.get('/asp-suspensions', aspSuspensionAdmin.list);
 router.post('/asp-suspensions', aspSuspensionAdmin.create);
 router.post('/asp-suspensions/import', aspSuspensionAdmin.import);

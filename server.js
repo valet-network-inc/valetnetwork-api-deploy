@@ -333,6 +333,50 @@ server.listen(PORT, () => {
             console.error('Failed to register subscription scheduler:', err.message);
         }
     }
+
+    // Background job: the curb-sweep MOVER — moves cars we hold on the flat
+    // plans ($250 fixed garage, $300 valet anywhere) before the block they are
+    // parked on is swept. Those customers are never asked when their street is
+    // cleaned; the sweep days come off the sign where the valet parked the car,
+    // and they change every time we re-park. See services/curbSweepDispatcher.js.
+    if (process.env.CURB_SWEEP_ENABLED === 'false') {
+        console.warn('Curb-sweep mover DISABLED via CURB_SWEEP_ENABLED=false — managed cars will not be moved.');
+    } else {
+        try {
+            const { tick } = require('./services/curbSweepDispatcher');
+            setInterval(() => {
+                tick({ io }).catch((e) =>
+                    console.error('curbSweepDispatcher interval error:', e.message)
+                );
+            }, 60 * 1000);
+            console.log('Curb-sweep mover registered (runs every 60s)');
+        } catch (err) {
+            console.error('Failed to register curb-sweep mover:', err.message);
+        }
+    }
+
+    // Background job: the curb-sweep WATCHDOG.
+    //
+    // Registered OUTSIDE the mover's flag, deliberately. A ticket on a managed
+    // car is ours, so a car whose block we cannot read is a liability whether or
+    // not the mover is switched on. Turning the mover off to investigate
+    // something is a decision; turning the alarm off along with it is how a car
+    // takes a ticket that nobody hears about.
+    //
+    // It also runs the reconciler, which is what makes the fire-and-forget
+    // custody hooks in orderController safe: a swallowed throw or a deploy gap
+    // leaves a car we hold with no record, and this is what finds it.
+    try {
+        const { watch } = require('./services/curbSweepDispatcher');
+        setInterval(() => {
+            watch().catch((e) =>
+                console.error('curbSweep watchdog interval error:', e.message)
+            );
+        }, 5 * 60 * 1000);
+        console.log('Curb-sweep watchdog registered (runs every 5 min)');
+    } catch (err) {
+        console.error('Failed to register curb-sweep watchdog:', err.message);
+    }
 });
 
 server.on('error', (err) => {

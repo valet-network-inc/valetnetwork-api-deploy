@@ -33,6 +33,7 @@ const crypto = require('crypto');
 const Order = require('../models/Order');
 const ParkingNote = require('../models/ParkingNote');
 const firebaseStorage = require('../services/firebaseStorage');
+const curbCustody = require('../services/curbCustody');
 
 const ACCEPTED_MIME_TYPES = ['image/jpeg', 'image/jpg', 'image/png', 'image/heic'];
 const MAX_BYTES = 12 * 1024 * 1024;
@@ -127,6 +128,20 @@ exports.createParkingNote = async (req, res) => {
                 : undefined;
         const notes = typeof rules.notes === 'string' ? rules.notes.trim() : '';
 
+        // See models/ParkingNote.js — the difference between "no sweep here" and
+        // "I skipped it". A note that carries windows is 'captured' whatever the
+        // client claimed; anything else is only believed when the valet said it.
+        const ALLOWED_SWEEP_STATUS = ['captured', 'none_on_sign', 'off_street', 'skipped'];
+        const sweepDataStatus = streetCleaning.length
+            ? 'captured'
+            : ALLOWED_SWEEP_STATUS.includes(rules.sweepDataStatus)
+            ? rules.sweepDataStatus
+            : undefined;
+        const tzOffsetMinutes =
+            typeof rules.tzOffsetMinutes === 'number' && Number.isFinite(rules.tzOffsetMinutes)
+                ? rules.tzOffsetMinutes
+                : undefined;
+
         // Mirror the parked location off the order so this dataset is
         // independently queryable by geo without a join.
         const parkingLocation = order.parkingLocation || {};
@@ -168,9 +183,24 @@ exports.createParkingNote = async (req, res) => {
                 meterMaxMinutes,
                 noParkWindows,
                 notes,
+                sweepDataStatus,
+                tzOffsetMinutes,
             },
             { upsert: true, new: true, setDefaultsOnInsert: true }
         );
+
+        // This is the moment a managed car stops being a car we are holding
+        // blind and becomes one we know the sweep days for. The ordering is
+        // fixed and cannot be changed: this endpoint hard-requires
+        // order.parkingLocation to already be set, so the park always lands
+        // before the note, and custody is opened by the park and enriched here.
+        //
+        // Fire-and-forget — a valet finishing a job must never be blocked by it.
+        try {
+            await curbCustody.enrichFromNote({ order, note });
+        } catch (err) {
+            console.error('curbCustody.enrichFromNote failed:', err.message);
+        }
 
         const signPhotoUrl = await firebaseStorage.getSignedUrl(
             storagePath,

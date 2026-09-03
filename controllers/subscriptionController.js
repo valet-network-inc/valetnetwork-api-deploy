@@ -296,7 +296,7 @@ async function resolvePlanPurchase(tier, interval, movesPerWeek) {
 // POST /api/subscription/create
 // { userId, tier, interval, movesPerWeek?, aspSchedule, homeAddress?, promoCode? }
 exports.createSubscription = async (req, res) => {
-    const {
+    let {
         userId, tier, interval, aspSchedule, homeAddress, promoCode, movesPerWeek,
         // Newer app builds can present a payment sheet in setup mode, which
         // is what a $0-today trial needs to take a card.
@@ -350,9 +350,24 @@ exports.createSubscription = async (req, res) => {
                 });
             }
         }
+        // The fixed address belongs to exactly one plan.
+        //
+        // home_garage sells one free park and retrieval a day FROM THAT ADDRESS
+        // AND NOWHERE ELSE — evaluateParkCoverage refuses anything beyond
+        // HOME_RADIUS_METERS with 'not_at_home_address' — so the address is the
+        // product and it is required.
+        //
+        // valet_anywhere is the plan that has no fixed address; that is exactly
+        // what its extra $50 buys. Shipped clients (2.2.0-2.2.2) seed the field
+        // from the device's saved Home spot and post it on EVERY tier, so a
+        // valet_anywhere buyer today sends an address they never chose and we
+        // stored it. Drop it rather than 400 — a shipped client must never be
+        // rejected for a field it was always going to send.
         if (tier === 'home_garage') {
             const homeError = validateAddress(homeAddress, 'homeAddress');
             if (homeError) return res.status(400).json({ success: false, message: homeError });
+        } else if (homeAddress) {
+            homeAddress = undefined;
         }
 
         const user = await User.findById(userId);
