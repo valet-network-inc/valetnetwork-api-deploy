@@ -300,6 +300,14 @@ const retrievalHasCustody = async (order) => {
  */
 const retrievalBornInCustody = (order) => {
     if (order?.orderType !== 'retrieval') return false;
+    // We were already holding the keys when this was booked, so there is no
+    // beat 1 to be between — the valet walks to the car, not to the customer.
+    // Stamped at creation because the question is about the custody row and
+    // this function has to answer off the document alone.
+    if (order?.bornInCustody) return true;
+    // Handing the keys back is a single handoff by definition. The car is not
+    // moving; there is nothing to collect first.
+    if (order?.keyDeliveryOnly) return true;
     if (order?.aspMode) return true;
     return String(order?.autoBookKey || '').startsWith('aspreturn:');
 };
@@ -1364,6 +1372,28 @@ exports.updateOrder = async (req, res) => {
         // dispatches (`endCustomerName`) close out on their own path and are
         // deliberately left on it, same carve-out `valetActiveOrderQuery`
         // makes.
+        // A managed park where the keys STAY with the valet has no key-return
+        // handoff to wait for, so the shape-match below — which requires
+        // `otpVerifiedTimes.returnKey` — would never fire and the job would sit
+        // on the valet's screen forever. The swipe is the whole close-out here.
+        if (updates.status === 'parked' && !updates.parkClosedAt) {
+            try {
+                const held = await Order.findById(orderId)
+                    .select('customer orderType serviceType parkClosedAt endCustomerName')
+                    .lean();
+                const keysStay =
+                    held &&
+                    held.orderType === 'parking' &&
+                    held.serviceType === 'park-and-hold' &&
+                    !held.parkClosedAt &&
+                    !held.endCustomerName &&
+                    (await curbCustody.weHoldTheKeys(held.customer));
+                if (keysStay) updates.parkClosedAt = new Date();
+            } catch (keyErr) {
+                console.error('updateOrder: key-custody close-out check failed:', keyErr.message);
+            }
+        }
+
         if (updates.status === 'parked' && !updates.parkClosedAt) {
             const closingOut = await Order.exists({
                 _id: orderId,
@@ -1564,12 +1594,50 @@ exports.updateOrder = async (req, res) => {
         //
         // runAspSweep mints those legs with `aspMode` and an `aspreturn:` key,
         // so that is the discriminator.
-        if (order.orderType === 'retrieval' && updates.status === 'completed') {
+        // A key delivery ending is the keys changing hands, and nothing else.
+        // The car is still parked on its block and still ours to move before the
+        // sweep, so custody stays OPEN — closing it here would abandon a car we
+        // are still being paid to manage.
+        if (order.keyDeliveryOnly && updates.status === 'completed') {
+            try {
+                const custody = await curbCustody.openFor(
+                    order.customer._id || order.customer
+                );
+                if (custody) {
+                    await curbCustody.giveKeysBack({ custody, order, verifiedVia: 'return_key' });
+                }
+            } catch (keyErr) {
+                console.error('updateOrder: giveKeysBack failed:', keyErr.message);
+            }
+        }
+
+        if (order.orderType === 'retrieval' && updates.status === 'completed' && !order.keyDeliveryOnly) {
             const isSweepReturn =
                 order.aspMode ||
                 String(order.autoBookKey || '').startsWith('aspreturn:');
             if (isSweepReturn) {
                 await curbCustody.armSafely({ order });
+                // The move borrowed the customer's keys. This handoff — the one
+                // they just read a code out for — is where they get them back.
+                try {
+                    const parent = order.linkedOrderId
+                        ? await Order.findById(order.linkedOrderId).select('keysBorrowed').lean()
+                        : null;
+                    if (order.keysBorrowed || (parent && parent.keysBorrowed)) {
+                        const custody = await curbCustody.openFor(
+                            order.customer._id || order.customer
+                        );
+                        if (custody) {
+                            await curbCustody.giveKeysBack({
+                                custody,
+                                order,
+                                verifiedVia: 'sweep_return',
+                            });
+                        }
+                    }
+                } catch (keyErr) {
+                    console.error('updateOrder: borrowed-key return failed:', keyErr.message);
+                }
             } else {
                 await curbCustody.closeSafely({
                     orderId: order.linkedOrderId || order._id,
@@ -1584,7 +1652,17 @@ exports.updateOrder = async (req, res) => {
             }
         }
 
-        if (order.orderType === 'retrieval' && updates.status === 'completed' && order.linkedOrderId) {
+        // `keyDeliveryOnly` is excluded here for the reason it exists: it is a
+        // retrieval in shape only. Completing one must NOT complete the park it
+        // is linked to — the car never moved, and marking that park finished
+        // would erase the only record that we are holding a car on a block we
+        // have to sweep-move.
+        if (
+            order.orderType === 'retrieval' &&
+            updates.status === 'completed' &&
+            order.linkedOrderId &&
+            !order.keyDeliveryOnly
+        ) {
             try {
                 const linkedParking = await Order.findById(order.linkedOrderId);
                 if (
@@ -2015,6 +2093,21 @@ exports.createRetrievalOrder = async (req, res) => {
                 type: 'return_key',
             }
         };
+
+        // If we are already holding this customer's keys — the steady state on
+        // the $250 and $300 plans — this retrieval has ONE handoff, not two.
+        // The valet holding the keys walks to the car and brings it; there is
+        // no trip to the customer to collect anything first. Stamped here
+        // because retrievalBornInCustody has to answer off the document.
+        try {
+            retrievalOrderData.bornInCustody = await curbCustody.weHoldTheKeys(customer);
+        } catch (custodyErr) {
+            // Fails toward the two-beat flow: an extra trip costs one fee, while
+            // wrongly skipping the key pickup sends a valet to a car they cannot
+            // open and leaves the customer holding keys nobody asked for.
+            console.error('createRetrievalOrder: key-custody check failed:', custodyErr.message);
+            retrievalOrderData.bornInCustody = false;
+        }
 
         console.log('Retrieval order data:', retrievalOrderData);
 

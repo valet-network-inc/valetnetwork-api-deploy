@@ -350,6 +350,45 @@ const OrderSchema = new mongoose.Schema({
             type: Date,
         },
     },
+    /**
+     * A sweep move on a car whose keys the CUSTOMER was holding.
+     *
+     * We borrow them for the move and hand them straight back at the end of it,
+     * because they asked for them and a street cleaning is not consent to take
+     * them again. A sweep move never changes who holds the keys.
+     */
+    keysBorrowed: {
+        type: Boolean,
+        default: false,
+    },
+
+    /**
+     * This retrieval started with us already holding the keys.
+     *
+     * Stamped at creation because `retrievalBornInCustody` has to answer
+     * synchronously off the document, and "do we hold the keys" is a database
+     * question about the custody row. A retrieval born in custody has ONE
+     * handoff — the car and keys arriving — so it must not mint a second code.
+     */
+    bornInCustody: {
+        type: Boolean,
+        default: false,
+    },
+
+    /**
+     * A job whose only purpose is handing the keys back.
+     *
+     * Shaped as a retrieval so it inherits dispatch, acceptance, chat and the
+     * OTP machinery — but the CAR IS NOT COMING. It stays parked exactly where
+     * it is and we go on moving it for street cleaning. A valet who drives to
+     * the car on one of these has misread the job, which is why the app renders
+     * it as its own type rather than as a retrieval with a note on it.
+     */
+    keyDeliveryOnly: {
+        type: Boolean,
+        default: false,
+    },
+
     aspMode: {
         type: Boolean,
         default: false,

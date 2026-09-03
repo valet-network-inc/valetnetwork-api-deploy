@@ -158,6 +158,22 @@ async function arm({ order }) {
             currentOrder: order._id,
             orderChain: [order._id],
             valet: valetIdOf(order),
+            // The park is what puts the keys in our hands. On these plans they
+            // stay there until the customer asks for them back — that is the
+            // whole point of the tier, and it is the only way a sweep move can
+            // happen without the customer being present for it.
+            keysWith: 'valet',
+            keysWithSetAt: now,
+            keyHolder: valetIdOf(order),
+            keyHandoffs: [
+                {
+                    at: now,
+                    direction: 'to_valet',
+                    order: order._id,
+                    toValet: valetIdOf(order),
+                    verifiedVia: 'order_creation',
+                },
+            ],
             state: 'resolving',
             spot: {
                 lat: loc.lat,
@@ -200,6 +216,11 @@ async function arm({ order }) {
     // Already open on this order. Only a change of BLOCK is a move worth
     // recording — a valet correcting a pin by ten metres has not changed the
     // sign, and appending a spot for that would fill the history with noise.
+    // A park by a customer who had taken their keys back hands them over again.
+    // Without this the dispatcher would keep booking two-beat sweep moves for a
+    // car whose keys are in fact in our pocket.
+    takeKeys(custody, order, now);
+
     if (custody.spot && custody.spot.tileKey === tileKey) {
         custody.spot.lat = loc.lat;
         custody.spot.lng = loc.lng;
@@ -252,6 +273,95 @@ async function arm({ order }) {
 
     await custody.save();
     return custody;
+}
+
+/**
+ * Record that the keys are now in our hands.
+ *
+ * Called from `arm()` on every park. Idempotent: a valet correcting a pin does
+ * not generate a second handoff entry, because the keys did not move.
+ */
+function takeKeys(custody, order, now = new Date()) {
+    // A sweep move only BORROWS the keys. The customer asked for them; a street
+    // cleaning happening on our schedule is not a reason to take them back, and
+    // silently doing so is exactly the kind of thing that makes holding
+    // somebody's car keys feel like a trap rather than a service.
+    if (order && order.keysBorrowed) return custody;
+    const valet = valetIdOf(order);
+    const alreadyOurs =
+        custody.keysWith === 'valet' &&
+        String(custody.keyHolder || '') === String(valet || '');
+    if (alreadyOurs) return custody;
+
+    custody.keysWith = 'valet';
+    custody.keysWithSetAt = now;
+    custody.keyHolder = valet;
+    // A park supersedes any key-back request that never completed — the
+    // customer is standing in front of the valet handing the keys over.
+    if (custody.keyRequest && custody.keyRequest.requestedAt && !custody.keyRequest.deliveredAt) {
+        custody.keyRequest.cancelledAt = now;
+    }
+    custody.keyHandoffs.push({
+        at: now,
+        direction: 'to_valet',
+        order: order && order._id,
+        toValet: valet,
+        verifiedVia: 'order_creation',
+    });
+    return custody;
+}
+
+/**
+ * Record that the keys went back to the customer.
+ *
+ * Custody deliberately STAYS OPEN. The car is still parked on our block, still
+ * on our plan, and still ours to move before the sweep — the only thing that
+ * changed is that a sweep move now costs two handoffs instead of a push.
+ * Closing here would abandon a car we are still being paid to manage.
+ */
+async function giveKeysBack({ custody, order, verifiedVia = 'return_key', now = new Date() }) {
+    if (!custody) return null;
+    custody.keysWith = 'customer';
+    custody.keysWithSetAt = now;
+    custody.keyHandoffs.push({
+        at: now,
+        direction: 'to_customer',
+        order: order && order._id,
+        fromValet: custody.keyHolder,
+        verifiedVia,
+    });
+    custody.keyHolder = undefined;
+    if (custody.keyRequest && custody.keyRequest.requestedAt) {
+        custody.keyRequest.deliveredAt = now;
+    }
+    await custody.save();
+    return custody;
+}
+
+/** The open custody row for a customer, or null. */
+async function openFor(customerId) {
+    if (!customerId) return null;
+    try {
+        return await CurbCustody.findOne({
+            customer: customerId,
+            closedAt: { $exists: false },
+        }).sort({ openedAt: -1 });
+    } catch (err) {
+        console.error('curbCustody.openFor failed:', err.message);
+        return null;
+    }
+}
+
+/**
+ * Do we hold this customer's keys right now?
+ *
+ * The question every handoff asks, because it decides how many OTP moments the
+ * job has. Fails toward FALSE: believing we have keys we do not sends a valet to
+ * a locked car, while believing we lack keys we do have costs one extra trip.
+ */
+async function weHoldTheKeys(customerId) {
+    const custody = await openFor(customerId);
+    return !!(custody && custody.keysWith === 'valet');
 }
 
 /**
@@ -772,6 +882,10 @@ module.exports = {
     STALE_COMPLETED_MS,
     isManagedTier,
     isSweepReturnLeg,
+    takeKeys,
+    giveKeysBack,
+    openFor,
+    weHoldTheKeys,
     classify,
     arm,
     armSafely,

@@ -39,6 +39,7 @@ const dispatcher = require('../services/curbSweepDispatcher');
 const sweepWindows = require('../services/sweepWindows');
 const aspSuspensions = require('../services/aspSuspensions');
 const orderController = require('../controllers/orderController');
+const custodyController = require('../controllers/custodyController');
 
 let mongo;
 
@@ -181,9 +182,14 @@ describe('opening custody', () => {
         expect(custody.spot.streetAddress).toBe(BLOCK_A.streetAddress);
         expect(custody.spot.tileKey).toBe(sweepWindows.tileKeyOf(BLOCK_A));
         expect(custody.state).toBe('resolving');
-        // The safe side. We do not have the keys unless somebody recorded that
-        // we do, and assuming otherwise sends a valet to a locked car.
-        expect(custody.keysWith).toBe('customer');
+        // The park is what puts the keys in our hands, and on these plans they
+        // stay there. Handing them back after every park was too much friction
+        // and, worse, meant the car could not be moved before its sweep without
+        // the customer standing at the curb twice per cleaning.
+        expect(custody.keysWith).toBe('valet');
+        expect(String(custody.keyHolder)).toBe(String(valet._id));
+        expect(custody.keyHandoffs).toHaveLength(1);
+        expect(custody.keyHandoffs[0].direction).toBe('to_valet');
         expect(custody.spots).toHaveLength(1);
     });
 
@@ -468,7 +474,13 @@ describe('ending custody', () => {
 });
 
 describe('dispatching the move', () => {
-    const armCar = async () => {
+    /**
+     * @param keysWith 'valet' is the steady state on these plans and takes the
+     *   PUSH path — no order, just the valet who already has the keys. Passing
+     *   'customer' exercises the booked two-beat move, which is what a sweep
+     *   costs once somebody has asked for their keys back.
+     */
+    const armCar = async (keysWith = 'valet') => {
         const customer = await makeUser();
         const valet = await makeUser(true);
         const sub = await makeSub(customer);
@@ -478,11 +490,15 @@ describe('dispatching the move', () => {
             sweepDataStatus: 'captured',
         });
         await curbCustody.enrichFromNote({ order: await Order.findById(order._id), note });
+        if (keysWith === 'customer') {
+            const custody = await CurbCustody.findOne({ currentOrder: order._id });
+            await curbCustody.giveKeysBack({ custody, order });
+        }
         return { customer, valet, sub, order };
     };
 
     test('books a $0 move from where the car is, 45 minutes before the sweep', async () => {
-        const { customer, sub } = await armCar();
+        const { customer, sub } = await armCar('customer');
         const sweep = nextMonday830();
         const now = new Date(sweep.getTime() - 30 * 60 * 1000);
 
@@ -507,7 +523,7 @@ describe('dispatching the move', () => {
     });
 
     test('a second tick books nothing — the database refuses the duplicate', async () => {
-        await armCar();
+        await armCar('customer');
         const sweep = nextMonday830();
         const now = new Date(sweep.getTime() - 30 * 60 * 1000);
         const notify = jest.fn().mockResolvedValue();
@@ -532,7 +548,7 @@ describe('dispatching the move', () => {
     });
 
     test('never moves a car on a day the city suspended cleaning', async () => {
-        await armCar();
+        await armCar('customer');
         const sweep = nextMonday830();
         const now = new Date(sweep.getTime() - 30 * 60 * 1000);
 
@@ -551,7 +567,7 @@ describe('dispatching the move', () => {
     });
 
     test('a database blip on the suspension calendar books the move rather than skipping it', async () => {
-        await armCar();
+        await armCar('customer');
         const sweep = nextMonday830();
         const now = new Date(sweep.getTime() - 30 * 60 * 1000);
 
@@ -664,5 +680,222 @@ describe('the alarm', () => {
         const alert = await OpsAlert.findOne({ kind: 'custody_spot_drifted' });
         expect(alert).toBeTruthy();
         expect(alert.severity).toBe('page');
+    });
+});
+
+/**
+ * Who holds the keys, and what that costs in handoffs.
+ *
+ * On the $250/$300 plans the valet keeps the keys after every park. That is the
+ * only arrangement under which a car can be moved before its block is swept
+ * without the customer being present for it — which is the whole product. The
+ * price of keeping somebody's keys is that they can have them back in one tap,
+ * and every one of those handoffs has to verify in the right direction:
+ *
+ *   valet RECEIVING keys/car  ->  the VALET says the code, the customer types it
+ *   valet HANDING keys/car    ->  the CUSTOMER says it, the valet verifies
+ */
+describe('key custody', () => {
+    const parkedManagedCar = async () => {
+        const customer = await makeUser();
+        const valet = await makeUser(true);
+        const sub = await makeSub(customer);
+        const order = await makePark(customer, valet, sub);
+        await park(order._id, { status: 'parked', parkingLocation: BLOCK_A });
+        return { customer, valet, sub, order };
+    };
+
+    test('a park hands us the keys and records who has them', async () => {
+        const { customer, valet } = await parkedManagedCar();
+        const custody = await CurbCustody.findOne({ customer: customer._id });
+        expect(custody.keysWith).toBe('valet');
+        expect(String(custody.keyHolder)).toBe(String(valet._id));
+    });
+
+    test('the valet closes out without ever handing the keys back', async () => {
+        // The shape-match close-out requires `otpVerifiedTimes.returnKey`, which
+        // on these plans never happens — nobody walks the keys back. Without a
+        // separate path the job would sit on the valet's screen forever.
+        const { order } = await parkedManagedCar();
+        await park(order._id, { status: 'parked' });
+        const closed = await Order.findById(order._id).lean();
+        expect(closed.parkClosedAt).toBeTruthy();
+        expect(closed.otpVerifiedTimes && closed.otpVerifiedTimes.returnKey).toBeFalsy();
+    });
+
+    test('street_cleaning keeps its key return — we never hold those', async () => {
+        const customer = await makeUser();
+        const valet = await makeUser(true);
+        const sub = await makeSub(customer, 'street_cleaning');
+        const order = await makePark(customer, valet, sub);
+        await park(order._id, { status: 'parked', parkingLocation: BLOCK_A });
+        await park(order._id, { status: 'parked' });
+        const closed = await Order.findById(order._id).lean();
+        // No custody, so no keys-stay close-out: this park still waits for the
+        // key handoff exactly as it always did.
+        expect(await CurbCustody.countDocuments({})).toBe(0);
+        expect(closed.parkClosedAt).toBeFalsy();
+    });
+
+    test('a retrieval while we hold the keys is ONE handoff, not two', async () => {
+        const { customer } = await parkedManagedCar();
+        expect(await curbCustody.weHoldTheKeys(customer._id)).toBe(true);
+
+        const retrieval = await Order.create({
+            customer: customer._id,
+            customerLocation: BLOCK_A,
+            parkingLocation: BLOCK_A,
+            parkingType: 'retrieval',
+            orderType: 'retrieval',
+            duration: 30,
+            pickUpTime: new Date(),
+            status: 'accepted',
+            totalAmount: 0,
+            paymentMethod: 'card',
+            paymentStatus: 'paid',
+            bornInCustody: await curbCustody.weHoldTheKeys(customer._id),
+            vehicle: { color: 'Black', model: 'Civic', licensePlate: 'ABC1234' },
+        });
+        // Born in custody means there is no beat 1 to be between — the valet
+        // walks to the car, not to the customer. So the single code must not be
+        // re-minted into a second one halfway through.
+        expect(orderController.retrievalBornInCustody(retrieval)).toBe(true);
+    });
+
+    test('a retrieval once the customer has their keys back is TWO handoffs', async () => {
+        const { customer, order } = await parkedManagedCar();
+        const custody = await CurbCustody.findOne({ customer: customer._id });
+        await curbCustody.giveKeysBack({ custody, order });
+        expect(await curbCustody.weHoldTheKeys(customer._id)).toBe(false);
+
+        const retrieval = await Order.create({
+            customer: customer._id,
+            customerLocation: BLOCK_A,
+            parkingType: 'retrieval',
+            orderType: 'retrieval',
+            duration: 30,
+            pickUpTime: new Date(),
+            status: 'accepted',
+            totalAmount: 500,
+            paymentMethod: 'card',
+            paymentStatus: 'paid',
+            bornInCustody: await curbCustody.weHoldTheKeys(customer._id),
+            vehicle: { color: 'Black', model: 'Civic', licensePlate: 'ABC1234' },
+        });
+        expect(orderController.retrievalBornInCustody(retrieval)).toBe(false);
+    });
+
+    test('asking for the keys back mints a keys-only job the car never moves for', async () => {
+        const { customer, valet } = await parkedManagedCar();
+        const req = { body: { userId: String(customer._id) }, io: mockIo() };
+        const res = mockRes();
+        await custodyController.requestKeys(req, res);
+
+        expect(res.statusCode).toBe(200);
+        expect(res.body.success).toBe(true);
+        const delivery = await Order.findOne({ keyDeliveryOnly: true });
+        expect(delivery).toBeTruthy();
+        expect(delivery.orderType).toBe('retrieval');
+        expect(delivery.totalAmount).toBe(0); // handing back keys we chose to keep is not billable
+        // The CUSTOMER reads this one out — the valet is handing something over.
+        expect(delivery.otp.type).toBe('return_key');
+        // One handoff, so no second code is ever minted.
+        expect(orderController.retrievalBornInCustody(delivery)).toBe(true);
+
+        const custody = await CurbCustody.findOne({ customer: customer._id });
+        expect(custody.keyRequest.requestedAt).toBeTruthy();
+        expect(custody.keysWith).toBe('valet'); // still ours until it is actually handed over
+        expect(String(custody.keyHolder)).toBe(String(valet._id));
+    });
+
+    test('a second key request is refused rather than dispatching two valets', async () => {
+        const { customer } = await parkedManagedCar();
+        await custodyController.requestKeys(
+            { body: { userId: String(customer._id) }, io: mockIo() },
+            mockRes()
+        );
+        const res2 = mockRes();
+        await custodyController.requestKeys(
+            { body: { userId: String(customer._id) }, io: mockIo() },
+            res2
+        );
+        expect(res2.statusCode).toBe(409);
+        expect(await Order.countDocuments({ keyDeliveryOnly: true })).toBe(1);
+    });
+
+    test('the delivery completing hands the keys over and LEAVES the car managed', async () => {
+        const { customer } = await parkedManagedCar();
+        await custodyController.requestKeys(
+            { body: { userId: String(customer._id) }, io: mockIo() },
+            mockRes()
+        );
+        const delivery = await Order.findOne({ keyDeliveryOnly: true });
+        await park(delivery._id, { status: 'completed' });
+
+        const custody = await CurbCustody.findOne({ customer: customer._id });
+        expect(custody.keysWith).toBe('customer');
+        expect(custody.keyHolder).toBeFalsy();
+        // The car never moved. Closing custody here would abandon a car we are
+        // still being paid to move before every sweep.
+        expect(custody.closedAt).toBeFalsy();
+        expect(custody.keyHandoffs.map((h) => h.direction)).toEqual(['to_valet', 'to_customer']);
+
+        // And the park it was linked to must NOT have been completed with it.
+        const parkOrder = await Order.findById(custody.currentOrder).lean();
+        expect(parkOrder.status).not.toBe('completed');
+    });
+
+    test('a sweep move BORROWS the keys and gives them straight back', async () => {
+        const { customer, order } = await parkedManagedCar();
+        const custody = await CurbCustody.findOne({ customer: customer._id });
+        await curbCustody.giveKeysBack({ custody, order });
+
+        // The move the dispatcher books for a customer-held car.
+        const move = await Order.create({
+            customer: customer._id,
+            customerLocation: BLOCK_A,
+            parkingType: 'street',
+            orderType: 'parking',
+            duration: 90,
+            pickUpTime: new Date(),
+            status: 'accepted',
+            totalAmount: 0,
+            paymentMethod: 'card',
+            paymentStatus: 'paid',
+            serviceType: 'park-and-hold',
+            aspMode: true,
+            keysBorrowed: true,
+            coveredBySubscription: custody.subscription,
+            vehicle: { color: 'Black', model: 'Civic', licensePlate: 'ABC1234' },
+        });
+        await park(move._id, { status: 'parked', parkingLocation: BLOCK_B });
+
+        // Borrowing must not silently take them back. A street cleaning
+        // happening on our schedule is not consent to keep somebody's keys.
+        const after = await CurbCustody.findOne({ customer: customer._id });
+        expect(after.keysWith).toBe('customer');
+    });
+
+    test('parking again after taking the keys back hands them over once more', async () => {
+        const { customer, valet, sub, order } = await parkedManagedCar();
+        const custody = await CurbCustody.findOne({ customer: customer._id });
+        await curbCustody.giveKeysBack({ custody, order });
+        expect(await curbCustody.weHoldTheKeys(customer._id)).toBe(false);
+
+        const second = await makePark(customer, valet, sub);
+        await park(second._id, { status: 'parked', parkingLocation: BLOCK_B });
+
+        expect(await curbCustody.weHoldTheKeys(customer._id)).toBe(true);
+    });
+
+    test('we never claim keys for a customer we are not holding a car for', async () => {
+        const stranger = await makeUser();
+        expect(await curbCustody.weHoldTheKeys(stranger._id)).toBe(false);
+        const res = mockRes();
+        await custodyController.requestKeys(
+            { body: { userId: String(stranger._id) }, io: mockIo() },
+            res
+        );
+        expect(res.statusCode).toBe(409);
     });
 });

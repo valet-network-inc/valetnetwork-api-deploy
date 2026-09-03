@@ -139,25 +139,72 @@ const CurbCustodySchema = new mongoose.Schema(
         /**
          * Who has the keys. Recorded, never inferred.
          *
-         *   'customer' — the default, and the safe side. The keys went back at
-         *                park close-out, which is what park-and-hold does today
-         *                on every one of these plans. A sweep move therefore
-         *                needs a real booked ASP order.
-         *   'valet'    — we are holding them. A sweep move is then only a push
-         *                to the valet who already has them, and they re-park
-         *                through the same order — the shape away mode runs.
+         *   'valet'    — WE HOLD THEM. The steady state on these two plans. A
+         *                sweep move is then a push to the valet who already has
+         *                them, and they re-park through the same order. No
+         *                customer involvement at all.
+         *   'customer' — they asked for them back. A sweep move now needs a real
+         *                two-beat order: come for the keys, move the car, hand
+         *                the keys back.
          *
-         * Defaulting to 'customer' is the fail direction that matters: assuming
-         * keys we do not have sends a valet to a locked car. The valet-holds-the-
-         * keys flow is specified but deliberately unbuilt, so nothing sets
-         * 'valet' yet; the dispatcher already handles it for when it lands.
+         * The default flipped to 'valet' on 2026-09-03 (Rishi). Handing keys
+         * back after every park was too much friction, and worse, it meant we
+         * could not reliably move the car before its sweep — the customer had to
+         * be present twice for every cleaning. The release valve is that the
+         * customer can ask for the keys back in one tap from the home screen.
+         *
+         * `arm()` sets this for managed tiers, so a park is what puts the keys in
+         * our hands and a key delivery is what takes them out.
          */
         keysWith: {
             type: String,
             enum: ['customer', 'valet'],
-            default: 'customer',
+            default: 'valet',
         },
         keysWithSetAt: { type: Date },
+        // The valet physically holding them. Distinct from `valet` (who is
+        // working the order) because keys move between valets — a shift ends,
+        // somebody covers — and services/keyTransferController.js already
+        // supports that handoff. Whoever holds the keys is who gets pushed when
+        // the block is about to be swept.
+        keyHolder: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+
+        /**
+         * A customer asking for their keys back.
+         *
+         * Open while a delivery is in flight so the home screen can say "on the
+         * way" and refuse to fire a second one, and so the sweep dispatcher
+         * knows a change of hands is imminent.
+         */
+        keyRequest: {
+            requestedAt: { type: Date },
+            deliveryOrder: { type: mongoose.Schema.Types.ObjectId, ref: 'Order' },
+            deliveredAt: { type: Date },
+            cancelledAt: { type: Date },
+        },
+
+        // Append-only record of every time the keys changed hands, and on whose
+        // verified code. A car we hold the keys to is the highest-trust thing in
+        // this system; when somebody asks where the keys were on Tuesday, this
+        // is the answer.
+        keyHandoffs: [
+            {
+                _id: false,
+                at: { type: Date },
+                // 'to_valet'    — customer handed them over at a park
+                // 'to_customer' — we handed them back
+                // 'valet_swap'  — one valet passed them to another
+                direction: {
+                    type: String,
+                    enum: ['to_valet', 'to_customer', 'valet_swap'],
+                },
+                order: { type: mongoose.Schema.Types.ObjectId, ref: 'Order' },
+                fromValet: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+                toValet: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+                // Which OTP moment proved it. Absent only for an operator fix.
+                verifiedVia: { type: String },
+            },
+        ],
 
         // Where the car is right now.
         spot: {

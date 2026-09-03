@@ -203,6 +203,9 @@ async function bookMove(custody, occurrence, window, { io, notify, now, staggerM
         coveredBySubscription: custody.subscription,
         listPriceCents: listPrice,
         autoBookKey: key,
+        // The customer is holding the keys, so this move borrows them. They go
+        // back at the end of it — a sweep is not consent to keep them.
+        keysBorrowed: custody.keysWith === 'customer',
         otp: {
             code: Math.floor(100000 + Math.random() * 900000).toString(),
             createdAt: otpCreatedAt,

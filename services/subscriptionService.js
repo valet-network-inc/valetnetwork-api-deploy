@@ -187,6 +187,7 @@ async function buildStatusPayload(sub, now = new Date()) {
     // car and cannot read the block yet, and the customer is still never asked
     // to fill that gap; a human is (services/curbSweepDispatcher.js watch()).
     let managed = null;
+    let keys = null;
     if (MANAGED_TIERS.includes(sub.tier)) {
         managed = { active: false, blind: false };
         try {
@@ -208,6 +209,40 @@ async function buildStatusPayload(sub, now = new Date()) {
                     windowsLabel: windows.length ? sweepWindows.describeWindows(windows) : null,
                     blind: custody.rules && custody.rules.source === 'unknown',
                     movesThisPeriod: custody.movesThisPeriod || 0,
+                };
+
+                // Who has the keys, and whether they can be asked for.
+                //
+                // On these plans the valet keeps them after every park — that is
+                // what lets us move the car before a sweep without the customer
+                // being there. Holding somebody's keys is only reasonable while
+                // getting them back is one tap, so the app needs this on the
+                // screen the customer opens first.
+                const kr = custody.keyRequest || {};
+                const requestRunning = !!(kr.requestedAt && !kr.deliveredAt && !kr.cancelledAt);
+                let holderName = null;
+                if (custody.keyHolder) {
+                    try {
+                        const User = require('../models/User');
+                        const v = await User.findById(custody.keyHolder)
+                            .select('firstName lastName')
+                            .lean();
+                        if (v) {
+                            holderName =
+                                [v.firstName, v.lastName].filter(Boolean).join(' ').trim() || null;
+                        }
+                    } catch (nameErr) {
+                        // A missing name is cosmetic. The key state is not.
+                        console.error('buildStatusPayload: key holder lookup failed:', nameErr.message);
+                    }
+                }
+                keys = {
+                    with: custody.keysWith || 'valet',
+                    holderName,
+                    canRequest: custody.keysWith === 'valet' && !requestRunning,
+                    requestedAt: requestRunning ? kr.requestedAt : null,
+                    deliveryOrderId:
+                        requestRunning && kr.deliveryOrder ? String(kr.deliveryOrder) : null,
                 };
             }
         } catch (err) {
@@ -239,6 +274,7 @@ async function buildStatusPayload(sub, now = new Date()) {
         movesPerWeek: sub.movesPerWeek || ASP_MOVES_PER_WEEK,
         homeAddressChangedAt: sub.homeAddressChangedAt,
         managed,
+        keys,
         // The radius the server actually pays coverage inside. Sent so the app's
         // map default and this check can never drift apart.
         homeRadiusMeters: HOME_RADIUS_METERS,
