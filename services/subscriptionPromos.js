@@ -87,8 +87,13 @@ const PROMOS = {
     // A code here has no redemption cap of its own; firstTimeOnly is per
     // customer, not per code, so someone who has already started any plan is
     // turned away by this one exactly as they are by LOLGARAGE.
-    PARKONME: {
-        code: 'PARKONME',
+    //
+    // The 2 is NOT a quantity. HANDSFREE2 buys a different plan from
+    // HANDSFREE — two covered moves instead of one — and reading this one the
+    // same way would have it mean a garage plan that does not exist. It is
+    // the second code for the one Fixed garage plan, and nothing else.
+    LOLGARAGE2: {
+        code: 'LOLGARAGE2',
         kind: 'free_trial',
         trialDays: 30,
         headline: 'First month free',

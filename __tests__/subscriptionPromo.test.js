@@ -385,20 +385,21 @@ describe('HANDSFREE2', () => {
 });
 
 // ---------------------------------------------------------------------------
-// PARKONME — the second door onto the Fixed garage free month
+// LOLGARAGE2 — the second door onto the Fixed garage free month
 // ---------------------------------------------------------------------------
 
 const GARAGE_PLAN = { tier: 'home_garage', interval: 'month' };
 
-describe('PARKONME', () => {
-    it('is found however the customer types it', () => {
-        expect(promos.findPromo('parkonme').code).toBe('PARKONME');
-        expect(promos.findPromo('park-on-me').code).toBe('PARKONME');
-        expect(promos.findPromo('PARK ON ME').code).toBe('PARKONME');
+describe('LOLGARAGE2', () => {
+    it('is found however the customer types it, and does not swallow LOLGARAGE', () => {
+        expect(promos.findPromo('lolgarage').code).toBe('LOLGARAGE');
+        expect(promos.findPromo('lolgarage2').code).toBe('LOLGARAGE2');
+        expect(promos.findPromo('LOLGARAGE-2').code).toBe('LOLGARAGE2');
+        expect(promos.findPromo('lol garage 2').code).toBe('LOLGARAGE2');
     });
 
     it('offers the same free month as LOLGARAGE, converting at $250', () => {
-        const promo = promos.findPromo('PARKONME');
+        const promo = promos.findPromo('LOLGARAGE2');
         expect(promo.kind).toBe('free_trial');
         expect(promo.trialDays).toBe(30);
         const shown = promos.describe(promo, { amountCents: 25000, interval: 'month' });
@@ -408,12 +409,12 @@ describe('PARKONME', () => {
     });
 
     it('covers Fixed garage monthly and nothing else', () => {
-        const promo = promos.findPromo('PARKONME');
+        const promo = promos.findPromo('LOLGARAGE2');
         expect(promos.planMismatch(promo, GARAGE_PLAN)).toBeNull();
         // Fixed garage is not bought by the move, so the sentence must not
         // invent a weekly cadence for it.
         expect(promos.planMismatch(promo, THE_PLAN)).toBe(
-            'PARKONME covers the Fixed garage plan at $250 a month.'
+            'LOLGARAGE2 covers the Fixed garage plan at $250 a month.'
         );
         expect(promos.planMismatch(promo, { ...GARAGE_PLAN, tier: 'valet_anywhere' })).toMatch(
             /\$250 a month/
@@ -422,21 +423,21 @@ describe('PARKONME', () => {
 
     it('is still one free month per customer, whichever garage code they used', async () => {
         const user = await makeCustomer();
-        expect(await promos.promoRedemptionBlock(promos.findPromo('PARKONME'), user._id)).toBeNull();
+        expect(await promos.promoRedemptionBlock(promos.findPromo('LOLGARAGE2'), user._id)).toBeNull();
         await makeSub(user, {
             tier: 'home_garage',
             amountCents: 25000,
             promoCode: 'LOLGARAGE',
             activatedAt: new Date('2026-08-01'),
         });
-        expect(await promos.promoRedemptionBlock(promos.findPromo('PARKONME'), user._id)).toMatch(
+        expect(await promos.promoRedemptionBlock(promos.findPromo('LOLGARAGE2'), user._id)).toMatch(
             /first plan/i
         );
     });
 
     it('quotes $250 with nothing to fix when the customer is already on the plan', async () => {
         const res = mockRes();
-        await subscriptionController.checkPromo({ body: { code: 'parkonme', ...GARAGE_PLAN } }, res);
+        await subscriptionController.checkPromo({ body: { code: 'lolgarage2', ...GARAGE_PLAN } }, res);
         expect(res.statusCode).toBe(200);
         expect(res.body.note).toBeNull();
         expect(res.body.amountCents).toBe(25000);
@@ -446,7 +447,7 @@ describe('PARKONME', () => {
 
     it('snaps a customer who came in on the street-cleaning plan onto Fixed garage', async () => {
         const res = mockRes();
-        await subscriptionController.checkPromo({ body: { code: 'PARKONME', ...THE_PLAN } }, res);
+        await subscriptionController.checkPromo({ body: { code: 'LOLGARAGE2', ...THE_PLAN } }, res);
         expect(res.statusCode).toBe(200);
         expect(res.body.applyTo).toMatchObject(GARAGE_PLAN);
         expect(res.body.amountCents).toBe(25000);
