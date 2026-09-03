@@ -78,31 +78,6 @@ const PROMOS = {
         firstTimeOnly: true,
         active: true,
     },
-
-    // A second door onto the same free month of Fixed garage. Nothing about
-    // the offer differs from LOLGARAGE — it exists so one code can be handed
-    // out in a place the other one has not been, and so the Subscribers tab
-    // says which one brought the customer in (`Subscription.promoCode`).
-    //
-    // A code here has no redemption cap of its own; firstTimeOnly is per
-    // customer, not per code, so someone who has already started any plan is
-    // turned away by this one exactly as they are by LOLGARAGE.
-    //
-    // The 2 is NOT a quantity. HANDSFREE2 buys a different plan from
-    // HANDSFREE — two covered moves instead of one — and reading this one the
-    // same way would have it mean a garage plan that does not exist. It is
-    // the second code for the one Fixed garage plan, and nothing else.
-    LOLGARAGE2: {
-        code: 'LOLGARAGE2',
-        kind: 'free_trial',
-        trialDays: 30,
-        headline: 'First month free',
-        detail:
-            'Your first month of Fixed garage is on us — the street-cleaning moves and a free park and retrieval every day at your spot. Cancel any time before it ends and you are never charged.',
-        appliesTo: { tier: 'home_garage', interval: 'month' },
-        firstTimeOnly: true,
-        active: true,
-    },
 };
 
 // Codes are typed by hand on a phone. Inner spaces and dashes are the

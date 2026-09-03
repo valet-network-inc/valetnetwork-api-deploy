@@ -385,21 +385,21 @@ describe('HANDSFREE2', () => {
 });
 
 // ---------------------------------------------------------------------------
-// LOLGARAGE2 — the second door onto the Fixed garage free month
+// LOLGARAGE — the Fixed garage free month. One code, no cap on how many
+// customers redeem it; the only limit is one free month per customer.
 // ---------------------------------------------------------------------------
 
 const GARAGE_PLAN = { tier: 'home_garage', interval: 'month' };
 
-describe('LOLGARAGE2', () => {
-    it('is found however the customer types it, and does not swallow LOLGARAGE', () => {
+describe('LOLGARAGE', () => {
+    it('is found however the customer types it', () => {
         expect(promos.findPromo('lolgarage').code).toBe('LOLGARAGE');
-        expect(promos.findPromo('lolgarage2').code).toBe('LOLGARAGE2');
-        expect(promos.findPromo('LOLGARAGE-2').code).toBe('LOLGARAGE2');
-        expect(promos.findPromo('lol garage 2').code).toBe('LOLGARAGE2');
+        expect(promos.findPromo('LOL-GARAGE').code).toBe('LOLGARAGE');
+        expect(promos.findPromo('lol garage ').code).toBe('LOLGARAGE');
     });
 
-    it('offers the same free month as LOLGARAGE, converting at $250', () => {
-        const promo = promos.findPromo('LOLGARAGE2');
+    it('is a free month that converts at $250, with a card taken up front', () => {
+        const promo = promos.findPromo('LOLGARAGE');
         expect(promo.kind).toBe('free_trial');
         expect(promo.trialDays).toBe(30);
         const shown = promos.describe(promo, { amountCents: 25000, interval: 'month' });
@@ -409,35 +409,47 @@ describe('LOLGARAGE2', () => {
     });
 
     it('covers Fixed garage monthly and nothing else', () => {
-        const promo = promos.findPromo('LOLGARAGE2');
+        const promo = promos.findPromo('LOLGARAGE');
         expect(promos.planMismatch(promo, GARAGE_PLAN)).toBeNull();
         // Fixed garage is not bought by the move, so the sentence must not
         // invent a weekly cadence for it.
         expect(promos.planMismatch(promo, THE_PLAN)).toBe(
-            'LOLGARAGE2 covers the Fixed garage plan at $250 a month.'
+            'LOLGARAGE covers the Fixed garage plan at $250 a month.'
         );
         expect(promos.planMismatch(promo, { ...GARAGE_PLAN, tier: 'valet_anywhere' })).toMatch(
             /\$250 a month/
         );
     });
 
-    it('is still one free month per customer, whichever garage code they used', async () => {
+    it('has no redemption cap of its own — a second customer redeems it fine', async () => {
+        const first = await makeCustomer();
+        await makeSub(first, {
+            tier: 'home_garage',
+            amountCents: 25000,
+            promoCode: 'LOLGARAGE',
+            activatedAt: new Date('2026-08-01'),
+        });
+        const second = await makeCustomer();
+        expect(await promos.promoRedemptionBlock(promos.findPromo('LOLGARAGE'), second._id)).toBeNull();
+    });
+
+    it('is one free month per customer, and says which limit they hit', async () => {
         const user = await makeCustomer();
-        expect(await promos.promoRedemptionBlock(promos.findPromo('LOLGARAGE2'), user._id)).toBeNull();
+        expect(await promos.promoRedemptionBlock(promos.findPromo('LOLGARAGE'), user._id)).toBeNull();
         await makeSub(user, {
             tier: 'home_garage',
             amountCents: 25000,
             promoCode: 'LOLGARAGE',
             activatedAt: new Date('2026-08-01'),
         });
-        expect(await promos.promoRedemptionBlock(promos.findPromo('LOLGARAGE2'), user._id)).toMatch(
-            /first plan/i
+        expect(await promos.promoRedemptionBlock(promos.findPromo('LOLGARAGE'), user._id)).toMatch(
+            /already used LOLGARAGE/
         );
     });
 
     it('quotes $250 with nothing to fix when the customer is already on the plan', async () => {
         const res = mockRes();
-        await subscriptionController.checkPromo({ body: { code: 'lolgarage2', ...GARAGE_PLAN } }, res);
+        await subscriptionController.checkPromo({ body: { code: 'lolgarage', ...GARAGE_PLAN } }, res);
         expect(res.statusCode).toBe(200);
         expect(res.body.note).toBeNull();
         expect(res.body.amountCents).toBe(25000);
@@ -447,7 +459,7 @@ describe('LOLGARAGE2', () => {
 
     it('snaps a customer who came in on the street-cleaning plan onto Fixed garage', async () => {
         const res = mockRes();
-        await subscriptionController.checkPromo({ body: { code: 'LOLGARAGE2', ...THE_PLAN } }, res);
+        await subscriptionController.checkPromo({ body: { code: 'LOLGARAGE', ...THE_PLAN } }, res);
         expect(res.statusCode).toBe(200);
         expect(res.body.applyTo).toMatchObject(GARAGE_PLAN);
         expect(res.body.amountCents).toBe(25000);
