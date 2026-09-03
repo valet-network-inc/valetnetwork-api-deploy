@@ -383,3 +383,73 @@ describe('HANDSFREE2', () => {
         expect((await User.findById(user._id)).pendingPromoCode).toBe('HANDSFREE2');
     });
 });
+
+// ---------------------------------------------------------------------------
+// PARKONME — the second door onto the Fixed garage free month
+// ---------------------------------------------------------------------------
+
+const GARAGE_PLAN = { tier: 'home_garage', interval: 'month' };
+
+describe('PARKONME', () => {
+    it('is found however the customer types it', () => {
+        expect(promos.findPromo('parkonme').code).toBe('PARKONME');
+        expect(promos.findPromo('park-on-me').code).toBe('PARKONME');
+        expect(promos.findPromo('PARK ON ME').code).toBe('PARKONME');
+    });
+
+    it('offers the same free month as LOLGARAGE, converting at $250', () => {
+        const promo = promos.findPromo('PARKONME');
+        expect(promo.kind).toBe('free_trial');
+        expect(promo.trialDays).toBe(30);
+        const shown = promos.describe(promo, { amountCents: 25000, interval: 'month' });
+        expect(shown.dueTodayCents).toBe(0);
+        expect(shown.thenCents).toBe(25000);
+        expect(shown.requiresCard).toBe(true);
+    });
+
+    it('covers Fixed garage monthly and nothing else', () => {
+        const promo = promos.findPromo('PARKONME');
+        expect(promos.planMismatch(promo, GARAGE_PLAN)).toBeNull();
+        // Fixed garage is not bought by the move, so the sentence must not
+        // invent a weekly cadence for it.
+        expect(promos.planMismatch(promo, THE_PLAN)).toBe(
+            'PARKONME covers the Fixed garage plan at $250 a month.'
+        );
+        expect(promos.planMismatch(promo, { ...GARAGE_PLAN, tier: 'valet_anywhere' })).toMatch(
+            /\$250 a month/
+        );
+    });
+
+    it('is still one free month per customer, whichever garage code they used', async () => {
+        const user = await makeCustomer();
+        expect(await promos.promoRedemptionBlock(promos.findPromo('PARKONME'), user._id)).toBeNull();
+        await makeSub(user, {
+            tier: 'home_garage',
+            amountCents: 25000,
+            promoCode: 'LOLGARAGE',
+            activatedAt: new Date('2026-08-01'),
+        });
+        expect(await promos.promoRedemptionBlock(promos.findPromo('PARKONME'), user._id)).toMatch(
+            /first plan/i
+        );
+    });
+
+    it('quotes $250 with nothing to fix when the customer is already on the plan', async () => {
+        const res = mockRes();
+        await subscriptionController.checkPromo({ body: { code: 'parkonme', ...GARAGE_PLAN } }, res);
+        expect(res.statusCode).toBe(200);
+        expect(res.body.note).toBeNull();
+        expect(res.body.amountCents).toBe(25000);
+        expect(res.body.promo.dueTodayCents).toBe(0);
+        expect(res.body.promo.thenCents).toBe(25000);
+    });
+
+    it('snaps a customer who came in on the street-cleaning plan onto Fixed garage', async () => {
+        const res = mockRes();
+        await subscriptionController.checkPromo({ body: { code: 'PARKONME', ...THE_PLAN } }, res);
+        expect(res.statusCode).toBe(200);
+        expect(res.body.applyTo).toMatchObject(GARAGE_PLAN);
+        expect(res.body.amountCents).toBe(25000);
+        expect(res.body.note).toMatch(/Fixed garage/);
+    });
+});
