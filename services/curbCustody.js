@@ -195,6 +195,7 @@ async function arm({ order }) {
             ],
             openedAt: now,
         });
+        await stampKeysOnOrder(order, custody);
         try {
             await custody.save();
         } catch (err) {
@@ -226,6 +227,7 @@ async function arm({ order }) {
         custody.spot.lng = loc.lng;
         if (loc.streetAddress) custody.spot.streetAddress = loc.streetAddress;
         if (valetIdOf(order)) custody.valet = valetIdOf(order);
+        await stampKeysOnOrder(order, custody);
         await custody.save();
         return custody;
     }
@@ -250,6 +252,7 @@ async function arm({ order }) {
     };
     custody.spotSince = now;
     if (valetIdOf(order)) custody.valet = valetIdOf(order);
+    await stampKeysOnOrder(order, custody);
 
     // The car is somewhere new, so whatever we knew about the old block is now
     // wrong. Drop back to 'resolving' and clear the rules rather than carrying
@@ -273,6 +276,27 @@ async function arm({ order }) {
 
     await custody.save();
     return custody;
+}
+
+/**
+ * Mirror the key decision onto the ORDER.
+ *
+ * The valet's phone has to know, the moment it opens a job, whether this park
+ * ends with the keys in their pocket — it decides whether a return-key OTP is
+ * even offered. It cannot answer that from custody without a round trip, and
+ * getting it wrong is not cosmetic: the app would wait for a handoff nobody is
+ * ever going to walk, and the job would sit on their screen forever.
+ */
+async function stampKeysOnOrder(order, custody) {
+    if (!order || !order._id) return;
+    const stays = custody.keysWith === 'valet';
+    if (order.keysStayWithValet === stays) return;
+    try {
+        await Order.updateOne({ _id: order._id }, { $set: { keysStayWithValet: stays } });
+        order.keysStayWithValet = stays;
+    } catch (err) {
+        console.error('curbCustody.stampKeysOnOrder failed:', err.message);
+    }
 }
 
 /**
@@ -335,6 +359,16 @@ async function giveKeysBack({ custody, order, verifiedVia = 'return_key', now = 
         custody.keyRequest.deliveredAt = now;
     }
     await custody.save();
+    // The park the car is sitting under no longer keeps the keys, so the valet
+    // app must stop suppressing the key handoff on it.
+    try {
+        await Order.updateOne(
+            { _id: custody.currentOrder },
+            { $set: { keysStayWithValet: false } }
+        );
+    } catch (err) {
+        console.error('curbCustody.giveKeysBack: order stamp failed:', err.message);
+    }
     return custody;
 }
 
@@ -884,6 +918,7 @@ module.exports = {
     isSweepReturnLeg,
     takeKeys,
     giveKeysBack,
+    stampKeysOnOrder,
     openFor,
     weHoldTheKeys,
     classify,

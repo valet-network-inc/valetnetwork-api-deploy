@@ -351,6 +351,19 @@ const OrderSchema = new mongoose.Schema({
         },
     },
     /**
+     * This park ends with the keys staying in the valet's pocket.
+     *
+     * Mirrored from the custody row so the valet's phone can answer it the
+     * moment it opens the job, without a round trip. It decides whether a
+     * return-key handoff is offered at all — and a job that waits for a handoff
+     * nobody will ever walk never leaves the valet's screen.
+     */
+    keysStayWithValet: {
+        type: Boolean,
+        default: false,
+    },
+
+    /**
      * A sweep move on a car whose keys the CUSTOMER was holding.
      *
      * We borrow them for the move and hand them straight back at the end of it,

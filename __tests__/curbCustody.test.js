@@ -712,6 +712,34 @@ describe('key custody', () => {
         expect(String(custody.keyHolder)).toBe(String(valet._id));
     });
 
+    test('the park itself carries the key decision, so the phone need not ask', async () => {
+        // The valet app decides whether to offer a return-key handoff the moment
+        // it opens the job. It cannot run a custody lookup to find out, and a
+        // job that waits for a handoff nobody will walk never leaves the screen.
+        const { order, customer } = await parkedManagedCar();
+        let parked = await Order.findById(order._id).lean();
+        expect(parked.keysStayWithValet).toBe(true);
+
+        const custody = await CurbCustody.findOne({ customer: customer._id });
+        await curbCustody.giveKeysBack({ custody, order });
+        parked = await Order.findById(order._id).lean();
+        expect(parked.keysStayWithValet).toBe(false);
+    });
+
+    test('a key delivery is custody from birth, so the customer READS the code', async () => {
+        // The shared handoffWindow — the app copy and the doorman page's twin —
+        // reads a retrieval as beat 1 until custody is true. A key delivery has
+        // no pickup stamp, because nothing was ever collected, so without this
+        // it would hand the customer a keypad for a code they should read aloud.
+        const { customer } = await parkedManagedCar();
+        await custodyController.requestKeys(
+            { body: { userId: String(customer._id) }, io: mockIo() },
+            mockRes()
+        );
+        const delivery = await Order.findOne({ keyDeliveryOnly: true }).lean();
+        expect(await orderController.retrievalHasCustody(delivery)).toBe(true);
+    });
+
     test('the valet closes out without ever handing the keys back', async () => {
         // The shape-match close-out requires `otpVerifiedTimes.returnKey`, which
         // on these plans never happens — nobody walks the keys back. Without a

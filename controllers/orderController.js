@@ -227,6 +227,14 @@ const markCollectVerifiedOnConversation = async (order) => {
 
 const retrievalHasCustody = async (order) => {
     if (order?.orderType !== 'retrieval') return false;
+    // Handing back keys we were already holding. There is no pickup to stamp,
+    // because nothing was ever collected — the valet has had them since the
+    // park. Without this the shared handoffWindow reads it as beat 1 and hands
+    // the CUSTOMER a keypad for a code they are supposed to be reading aloud,
+    // which stalls the handoff at the door with both people staring at a screen.
+    if (order?.keyDeliveryOnly) return true;
+    // Booked while we held the keys, so the valet went straight to the car.
+    if (order?.bornInCustody) return true;
     // Beat 1 stamps a different field depending on how the retrieval was born.
     // A LINKED one comes from `createRetrievalOrder`, whose OTP is minted
     // `type: 'return_key'` -> stamps `returnKey`. A STANDALONE $5 one comes
