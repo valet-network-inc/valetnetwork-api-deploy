@@ -339,40 +339,89 @@ exports.requestPayout = async (req, res) => {
         }
         // Total payout = base earnings + tips (both currently sitting on the
         // valet's account, paid out together).
-        const earningsCents = valet.currentBalance || 0;
-        const tipsCents = valet.currentTipsBalance || 0;
-        const balance = earningsCents + tipsCents;
-        if (balance <= 0) {
+        //
+        // Claim the balance FIRST, in one atomic findOneAndUpdate, and build
+        // the payout row out of the pre-image it hands back. We used to read
+        // the balance, create the ValetPayout, and only then zero the account
+        // — a full DB round-trip in between. Two requests landing inside that
+        // window (two phones signed into the same valet account, a replayed
+        // POST — the endpoint takes a bare userId) both read the same non-zero
+        // balance and each wrote a full-amount 'requested' row. Rishi pays
+        // these out by hand off the dashboard's Payouts tab, so two identical
+        // rows meant paying the same earnings twice. Whoever wins the claim
+        // gets the money; a loser reads back zeros and is refused with the
+        // same 400 a valet with nothing owed already sees, so nothing the
+        // shipped valet app renders changes.
+        const claimed = await User.findOneAndUpdate(
+            {
+                _id: valet._id,
+                $expr: {
+                    $gt: [
+                        {
+                            $add: [
+                                { $ifNull: ['$currentBalance', 0] },
+                                { $ifNull: ['$currentTipsBalance', 0] },
+                            ],
+                        },
+                        0,
+                    ],
+                },
+            },
+            { $set: { currentBalance: 0, currentTipsBalance: 0 } },
+            { new: false } // pre-image: the balances this request is claiming
+        );
+        if (!claimed) {
             return res.status(400).json({
                 success: false,
                 message: 'No balance available to pay out.',
             });
         }
+        const earningsCents = claimed.currentBalance || 0;
+        const tipsCents = claimed.currentTipsBalance || 0;
+        const balance = earningsCents + tipsCents;
 
         // Create the payout record. amount is the combined total. The
         // breakdown (earnings vs tips) is also captured for the admin
         // dashboard so we can see "of $X paid out, $Y was tips".
-        const payout = await ValetPayout.create({
-            valet: valet._id,
-            valetSnapshot: {
-                firstName: valet.firstName,
-                lastName: valet.lastName,
-                phone: valet.phone,
-            },
-            amount: balance,
-            earningsAmount: earningsCents,
-            tipsAmount: tipsCents,
-            method: activeMethod,
-            handle: activeHandle,
-            status: 'requested',
-        });
+        let payout;
+        try {
+            payout = await ValetPayout.create({
+                valet: valet._id,
+                valetSnapshot: {
+                    firstName: valet.firstName,
+                    lastName: valet.lastName,
+                    phone: valet.phone,
+                },
+                amount: balance,
+                earningsAmount: earningsCents,
+                tipsAmount: tipsCents,
+                method: activeMethod,
+                handle: activeHandle,
+                status: 'requested',
+            });
+        } catch (createErr) {
+            // The money is already off the valet's account. If the row didn't
+            // land, his earnings would just vanish — nothing on the Payouts
+            // tab for Rishi to pay and nothing left on the account to request
+            // again. Put it back with $inc, not $set, so anything credited in
+            // the meantime survives.
+            await User.findByIdAndUpdate(valet._id, {
+                $inc: {
+                    currentBalance: earningsCents,
+                    currentTipsBalance: tipsCents,
+                },
+            }).catch((restoreErr) => {
+                console.error(
+                    'requestPayout: FAILED to restore claimed balance for valet',
+                    String(valet._id),
+                    { earningsCents, tipsCents },
+                    restoreErr
+                );
+            });
+            throw createErr;
+        }
 
-        // Zero out both balances. The lifetime counters
-        // (totalEarnings, totalTips) stay unchanged.
-        await User.findByIdAndUpdate(valet._id, {
-            currentBalance: 0,
-            currentTipsBalance: 0,
-        });
+        // The lifetime counters (totalEarnings, totalTips) stay unchanged.
 
         // No email notification — the admin sees this on the dashboard's
         // Payouts tab and acts on it from there. (sendEmailPayoutNotification

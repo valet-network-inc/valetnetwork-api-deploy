@@ -2,6 +2,7 @@ const KeyTransfer = require('../models/KeyTransfer');
 const KeyTransferAudit = require('../models/KeyTransferAudit');
 const Order = require('../models/Order');
 const User = require('../models/User');
+const CurbCustody = require('../models/CurbCustody');
 const admin = require('firebase-admin');
 const { sendPushNotification } = require('./notificationController');
 
@@ -311,10 +312,12 @@ const keyTransferController = {
                 req
             );
 
+            const transferredOrderIds = transfer.keys.map(k => k.orderId);
             await Order.updateMany(
-                { _id: { $in: transfer.keys.map(k => k.orderId) } },
+                { _id: { $in: transferredOrderIds } },
                 { valet: receiverValetId }
             );
+            await moveCurbCustody(transferredOrderIds, transfer.senderValet, receiverValetId);
 
             const senderValet = await User.findById(transfer.senderValet);
             const receiverValet = await User.findById(receiverValetId);
@@ -629,6 +632,54 @@ const keyTransferController = {
 //         console.error('Error sending push notification:', error);
 //     }
 // };
+
+/**
+ * Follow the keys on the $250/$300 managed plans, where WE hold them.
+ *
+ * `CurbCustody` snapshots who is working the car (`valet`) and who is
+ * physically holding its keys (`keyHolder`), and both are only ever refreshed
+ * by a park or a sweep move — neither of which happens when a shift ends and
+ * one valet hands his keys to another. Without this, a 6pm handover leaves the
+ * next morning's "street cleaning, move the car" push (curbSweepDispatcher
+ * pushes `custody.valet`) and the customer's "give me my keys back" job
+ * (custodyController pushes `custody.keyHolder`) both aimed at a valet who gave
+ * the keys away hours ago. The valet who actually has them hears nothing, the
+ * car sits through the sweep, and the customer pays a $65 ticket on the plan
+ * that exists to prevent exactly that.
+ */
+const moveCurbCustody = async (orderIds, fromValetId, toValetId) => {
+    if (!orderIds || orderIds.length === 0) return;
+    try {
+        const rows = await CurbCustody.find({
+            currentOrder: { $in: orderIds },
+            closedAt: { $exists: false },
+        });
+        const now = new Date();
+        for (const custody of rows) {
+            custody.valet = toValetId;
+            // Only name a new key holder if the keys are ours to hand over. On
+            // a row where the customer has taken hers back, `keyHolder` is
+            // deliberately empty, and inventing one here would send the
+            // key-delivery job to a valet with nothing in his pocket.
+            if (custody.keysWith === 'valet') {
+                custody.keyHandoffs.push({
+                    at: now,
+                    direction: 'valet_swap',
+                    order: custody.currentOrder,
+                    fromValet: custody.keyHolder || fromValetId,
+                    toValet: toValetId,
+                    verifiedVia: 'key_transfer_accepted',
+                });
+                custody.keyHolder = toValetId;
+            }
+            await custody.save();
+        }
+    } catch (error) {
+        // The two valets have already swapped the keys in the real world by the
+        // time this runs; bookkeeping must never fail the handover itself.
+        console.error('Error moving curb custody on key transfer:', error);
+    }
+};
 
 const logAuditTrail = async (transferId, senderValetId, receiverValetId, keyCount, keyTags, action, status, reason = null, req = null) => {
     try {

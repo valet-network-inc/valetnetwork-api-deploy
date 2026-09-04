@@ -56,26 +56,46 @@ function haversineMeters(a, b) {
 // Counted by pickUpTime, not createdAt: the scheduler books up to 45 minutes
 // ahead, so a just-past-midnight Monday sweep booked Sunday night must count
 // against the week the move actually happens in.
+//
+// Bounded at BOTH ends. /park books a sweep move up to 8 days out and the order
+// is stamped covered the moment it is made, so with only a lower bound one
+// booking for next Tuesday counted as a move already spent in every week
+// between now and its pickup. That cost the customer twice: the plan refused to
+// cover a move they still had ('weekly_asp_limit_reached', $15 charged), and the
+// auto-sweep booker read the cap as reached and quietly booked nothing on their
+// cleaning day — no order, no valet, no push — leaving the car on the block for
+// a $65 ticket. The upper bound is next week's NY Monday, taken by asking
+// nyStartOfWeek about a moment 8 days on so a DST hour cannot slide it a week.
 async function aspMovesUsedThisWeek(sub, now = new Date()) {
     const weekStart = nyStartOfWeek(now);
+    const weekEnd = nyStartOfWeek(new Date(weekStart.getTime() + 8 * 24 * 60 * 60 * 1000));
     return Order.countDocuments({
         coveredBySubscription: sub._id,
         aspMode: true,
         orderType: 'parking',
         status: { $ne: 'cancelled' },
-        pickUpTime: { $gte: weekStart },
+        pickUpTime: { $gte: weekStart, $lt: weekEnd },
     });
 }
 
 // Covered non-ASP parks already used today (NY day).
+//
+// Bounded at BOTH ends. A park booked for a later day is covered when it is
+// booked, and its pickUpTime sits days out — with only a lower bound the plan's
+// free park read as spent on every day in between, so a $250/$300 customer who
+// booked next Friday was charged $10 a day to park in the meantime, on screens
+// telling them today's free park was already used. It never was. The upper
+// bound is the next NY midnight, taken by asking nyStartOfDay about a moment
+// ~36h on so a DST hour cannot land it on the wrong calendar day.
 async function freeParksUsedToday(sub, now = new Date()) {
     const dayStart = nyStartOfDay(now);
+    const dayEnd = nyStartOfDay(new Date(dayStart.getTime() + 36 * 60 * 60 * 1000));
     return Order.countDocuments({
         coveredBySubscription: sub._id,
         aspMode: { $ne: true },
         orderType: 'parking',
         status: { $ne: 'cancelled' },
-        pickUpTime: { $gte: dayStart },
+        pickUpTime: { $gte: dayStart, $lt: dayEnd },
     });
 }
 

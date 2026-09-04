@@ -126,19 +126,26 @@ async function priceOrderCents(input = {}) {
         // when the customer's own schedule was already right.
         const { countAwayMoves } = require('../controllers/orderController');
         let moves = 0;
+        let counted = false;
         if (Array.isArray(awayDays) && awayDays.length && pickUpTime && awayEndTime) {
             try {
                 moves = countAwayMoves(new Date(pickUpTime), new Date(awayEndTime), awayDays);
+                counted = true;
             } catch (err) {
                 console.error('orderPricing: countAwayMoves failed:', err.message);
                 moves = 0;
             }
         }
 
-        // No schedule yet, or a schedule with no sweep in the window: take the
-        // deposit and let the valet's schedule set the real price. Charging $0
-        // here would fail at Stripe's 50c minimum anyway.
-        if (moves <= 0) {
+        // Nobody has given us sweep days yet (or the ones we got would not
+        // count): take the deposit and let the valet's schedule set the real
+        // price. Charging $0 here would fail at Stripe's 50c minimum anyway.
+        //
+        // Only THIS case may land here. createOrder stamps
+        // awayBilling 'pending_schedule' — the flag that makes the deposit a
+        // deposit rather than the whole bill — solely when awayDays is empty,
+        // and setAwaySchedule is what later collects the balance.
+        if (!counted) {
             return {
                 amountCents: AWAY_DEPOSIT_CENTS,
                 carWatchCents: 0,
@@ -147,10 +154,22 @@ async function priceOrderCents(input = {}) {
             };
         }
 
+        // A schedule whose sweeps all fall outside the trip is an ANSWER, not a
+        // missing schedule — leave Friday, come back Sunday, sweep is Tuesday.
+        // That used to drop into the deposit branch above and charge $1 for
+        // parking, holding and returning the car across the whole trip, with
+        // nothing to true it up (awayDays was non-empty, so no
+        // 'pending_schedule' stamp was written) and the valet paid 70c for the
+        // job. The customer never saw a dollar either: the app floors the
+        // billed moves at one (OrderPreferencesScreen's Math.max(1, ...)), so
+        // the pay button they tapped read $15.00. Charge the one move they
+        // agreed to — we still do the park, the hold and the return.
+        const billedMoves = Math.max(1, moves);
+
         return {
-            amountCents: moves * pricing.aspCents,
+            amountCents: billedMoves * pricing.aspCents,
             carWatchCents: 0,
-            basis: `away_moves:${moves}`,
+            basis: `away_moves:${billedMoves}`,
             pricing,
         };
     }

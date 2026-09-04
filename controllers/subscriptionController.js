@@ -724,42 +724,97 @@ exports.cancelSubscription = async (req, res) => {
         }
 
         const usedCents = await periodUsageCents(sub);
-        const paidCents = sub.amountCents || 0;
         // Cancelling inside a free month refunds nothing because nothing was
         // ever charged — the customer simply stops here.
         const inTrial = !!(sub.trialEndsAt && Date.now() < sub.trialEndsAt.getTime());
-        const refundCents = inTrial ? 0 : Math.max(0, Math.min(paidCents, paidCents - usedCents));
 
-        let refund = { requestedCents: refundCents, status: 'none' };
+        // What the customer ACTUALLY paid for the period being cancelled — not
+        // the plan's list price. Those two come apart routinely: a suspended
+        // street-cleaning day posts a Stripe balance credit, so the period's
+        // invoice settles below sticker, and a mid-period plan change bills a
+        // separate proration invoice on top of the renewal one. Refunding
+        // against the sticker was wrong in both directions: it refused the
+        // refund outright when the invoice came in under list (a $50/mo
+        // subscriber credited $12.50 for a suspended sweep cancelled with a
+        // clean-looking message and got $0 of the $37.50 they were owed), and
+        // it handed back more than was ever collected when usage was low.
+        let collectedCents = null; // null = could not ask Stripe; fall back to list price
+        let refundable = []; // { paymentIntentId, amountCents } for this period, newest first
+        if (stripe && sub.stripeSubscriptionId && !inTrial) {
+            try {
+                const invoices = await stripe.invoices.list({
+                    subscription: sub.stripeSubscriptionId,
+                    status: 'paid',
+                    limit: 12,
+                });
+                const all = invoices.data || [];
+                // Everything settled since this period opened: the renewal
+                // invoice plus any proration invoice a plan change added. A
+                // minute of slack because Stripe stamps the renewal invoice a
+                // beat after the period boundary.
+                const startMs = sub.currentPeriodStart
+                    ? sub.currentPeriodStart.getTime() - 60000
+                    : null;
+                let periodInvoices = startMs
+                    ? all.filter((inv) => (inv.created || 0) * 1000 >= startMs)
+                    : [];
+                // No period stamp on file, or nothing invoiced since it — fall
+                // back to the newest paid invoice, which is what this did before.
+                if (!periodInvoices.length) periodInvoices = all.slice(0, 1);
+
+                collectedCents = periodInvoices.reduce((s, inv) => s + (inv.amount_paid || 0), 0);
+                refundable = periodInvoices
+                    .map((inv) => ({
+                        paymentIntentId:
+                            typeof inv.payment_intent === 'string'
+                                ? inv.payment_intent
+                                : inv.payment_intent && inv.payment_intent.id,
+                        amountCents: inv.amount_paid || 0,
+                    }))
+                    .filter((t) => t.paymentIntentId && t.amountCents > 0);
+            } catch (listErr) {
+                // Stripe unreachable. The customer asked to cancel, so cancel —
+                // falling back to the list-price figure beats stranding them on
+                // a live subscription.
+                console.error('Cancel invoice lookup failed:', listErr.message);
+            }
+        }
+
+        const paidCents = collectedCents !== null ? collectedCents : sub.amountCents || 0;
+        const refundCents = inTrial ? 0 : Math.max(0, paidCents - usedCents);
+
+        let refund = { requestedCents: refundCents, paidCents, status: 'none' };
         if (stripe && sub.stripeSubscriptionId) {
-            // Refund against the period's paid invoice, then cancel at Stripe.
+            // Refund against the period's paid invoices, then cancel at Stripe.
             if (refundCents > 0) {
-                try {
-                    const invoices = await stripe.invoices.list({
-                        subscription: sub.stripeSubscriptionId,
-                        status: 'paid',
-                        limit: 1,
-                    });
-                    const inv = invoices.data[0];
-                    const piId =
-                        inv &&
-                        (typeof inv.payment_intent === 'string'
-                            ? inv.payment_intent
-                            : inv.payment_intent?.id);
-                    if (piId && (inv.amount_paid || 0) >= refundCents) {
-                        await stripe.refunds.create({ payment_intent: piId, amount: refundCents });
-                        refund.status = 'refunded';
-                    } else if ((inv?.amount_paid || 0) === 0) {
-                        // Promo/$0 period — nothing was paid, nothing to refund.
-                        refund = { requestedCents: 0, status: 'none' };
-                    } else {
-                        refund.status = 'failed';
-                        refund.error = 'No refundable payment found for this period';
-                    }
-                } catch (refundErr) {
-                    console.error('Cancel refund failed:', refundErr.message);
+                if (!refundable.length) {
                     refund.status = 'failed';
-                    refund.error = refundErr.message;
+                    refund.error = 'No refundable payment found for this period';
+                } else {
+                    // Spread it across the invoices that actually took money
+                    // this period: after a plan change the period's cash sits
+                    // on two payment intents, not one.
+                    let remaining = refundCents;
+                    let refundedCents = 0;
+                    for (const target of refundable) {
+                        if (remaining <= 0) break;
+                        const amount = Math.min(remaining, target.amountCents);
+                        try {
+                            await stripe.refunds.create({
+                                payment_intent: target.paymentIntentId,
+                                amount,
+                            });
+                            remaining -= amount;
+                            refundedCents += amount;
+                        } catch (refundErr) {
+                            console.error('Cancel refund failed:', refundErr.message);
+                            refund.error = refundErr.message;
+                        }
+                    }
+                    refund.refundedCents = refundedCents;
+                    refund.status = refundedCents > 0 ? 'refunded' : 'failed';
+                    // Part of it stuck. Say so rather than let the total read as paid.
+                    if (remaining > 0 && refundedCents > 0) refund.shortfallCents = remaining;
                 }
             }
             try {
@@ -786,7 +841,16 @@ exports.cancelSubscription = async (req, res) => {
             success: true,
             message:
                 refund.status === 'refunded'
-                    ? `Cancelled — $${(refundCents / 100).toFixed(2)} is on its way back to your card.`
+                    ? `Cancelled — $${(
+                          (refund.refundedCents || refundCents) / 100
+                      ).toFixed(2)} is on its way back to your card.`
+                    : // A refund we could not put through must never read as a
+                      // clean cancel — the customer is owed money and only this
+                      // message tells them (the iOS app shows nothing else).
+                      refund.status === 'failed'
+                    ? `Cancelled — but the $${(refundCents / 100).toFixed(
+                          2
+                      )} we owe you back did not go through. Tap Help and we will send it.`
                     : inTrial
                     ? 'Cancelled — your free month ends here and your card was never charged.'
                     : 'Cancelled. You pay regular rates per park from now on.',

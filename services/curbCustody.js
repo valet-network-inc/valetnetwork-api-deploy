@@ -49,6 +49,12 @@ const NOTE_SPOT_TOLERANCE_M = 40;
 // How far to look for another valet's note on the same block face.
 const BLOCK_NOTE_RADIUS_M = 60;
 
+// A car that has not actually gone anywhere. Only used while a sweep move is
+// outstanding, to tell "the app re-sent the location it already had" apart from
+// "the valet moved the car" — a curb-to-curb alternate-side hop is 10-20m, so
+// anything above this during a move is the move.
+const RESENT_LOCATION_M = 5;
+
 // A car whose recorded spot is further than this from the order's actual
 // parking location has drifted, and a valet would be sent to the wrong place.
 const DRIFT_TOLERANCE_M = 40;
@@ -250,7 +256,38 @@ async function arm({ order }) {
     // car whose keys are in fact in our pocket.
     takeKeys(custody, order, now);
 
-    if (custody.spot && custody.spot.tileKey === tileKey) {
+    // ...EXCEPT once we have asked for the car to be moved off a sweep.
+    //
+    // The tile is ~110m x 85m, and an alternate-side move is by definition a hop
+    // to the OTHER SIDE OF THE SAME STREET — ten to twenty metres. It lands in
+    // the same tile nearly every time. Read as "same spot" it keeps the old
+    // side's windows, keeps `state`, and never drops back to 'resolving', and
+    // nothing else re-reads a row that is neither resolving nor unknown. So
+    // from the first successful sweep move onward the car is scheduled against
+    // the curb it LEFT: it is never moved for the curb it is now on, and the
+    // in-progress watchdog is measured against the same wrong windows, so it
+    // stays quiet while the sweeper writes a $65 ticket the company eats.
+    //
+    // A reminder having gone out is not a heuristic about distance, it is the
+    // fact itself: we told the key holder "move it and record the new spot", so
+    // the next spot they record IS that move, however few metres it is. The
+    // small tolerance below is only there so that re-sending the SAME location
+    // (a status update that carries parkingLocation along unchanged) is not
+    // mistaken for a move and does not blank a perfectly good block reading.
+    const askedToMove = !!custody.lastMoveReminderKey || custody.state === 'moving';
+    const movedMeters =
+        custody.spot && finite(custody.spot.lat) && finite(custody.spot.lng)
+            ? sweepWindows.haversineMeters(
+                  { lat: custody.spot.lat, lng: custody.spot.lng },
+                  { lat: loc.lat, lng: loc.lng }
+              )
+            : Infinity;
+    const sameSpot =
+        custody.spot &&
+        custody.spot.tileKey === tileKey &&
+        (!askedToMove || movedMeters <= RESENT_LOCATION_M);
+
+    if (sameSpot) {
         custody.spot.lat = loc.lat;
         custody.spot.lng = loc.lng;
         if (loc.streetAddress) custody.spot.streetAddress = loc.streetAddress;
@@ -470,7 +507,32 @@ async function resolveRules({ order, note, spot }) {
             lat: ownNote.location.lat,
             lng: ownNote.location.lng,
         });
-        if (away <= NOTE_SPOT_TOLERANCE_M) {
+        // Distance alone cannot see across a street. 40m is half a short
+        // Brooklyn block, so it covers BOTH curbs, and an alternate-side move
+        // is precisely a hop from one curb to the other — the note the valet
+        // photographed on the north side is still "within tolerance" of the
+        // south side it now stands on, and the car would be scheduled against
+        // the sign it was moved AWAY FROM. Time can see what distance cannot:
+        // parkingNoteController hard-requires order.parkingLocation to exist
+        // before it will accept a note, so a note that genuinely describes
+        // where the car stands now is always written AFTER the car arrived
+        // there. One written before is describing the spot it left.
+        //
+        // Rejecting it drops the row to source 'unknown' → state 'blind', which
+        // the watchdog already pages on (no_rules_for_block) and an operator can
+        // close by typing the sign in. A loud "we do not know this curb" beats a
+        // confident schedule for the wrong one.
+        const noteWrittenAt = ownNote.updatedAt || ownNote.createdAt;
+        const arrivedAt = spot.since ? new Date(spot.since).getTime() : null;
+        const predatesThisSpot =
+            !!arrivedAt &&
+            !!noteWrittenAt &&
+            new Date(noteWrittenAt).getTime() < arrivedAt;
+        if (predatesThisSpot) {
+            disputeDetail =
+                `The parking note for this order was filed before the car was moved to where ` +
+                `it stands now, so it describes the spot it left. Ignored.`;
+        } else if (away <= NOTE_SPOT_TOLERANCE_M) {
             // A valet who read the sign and told us there is nothing to read is
             // the ONLY thing that legitimately silences the alarm on a block.
             const status = ownNote.sweepDataStatus;
@@ -645,10 +707,19 @@ async function enrichFromNote({ order, note }) {
 }
 
 async function applyRules(custody, { order, note } = {}) {
+    const spot = custody.spot || {};
     const resolved = await resolveRules({
         order,
         note,
-        spot: custody.spot || {},
+        // `since` is when the car arrived on THIS spot. resolveRules needs it to
+        // tell a note that describes this curb from one filed for the curb the
+        // car was moved off — the two can be twenty metres apart.
+        spot: {
+            lat: spot.lat,
+            lng: spot.lng,
+            tileKey: spot.tileKey,
+            since: custody.spotSince,
+        },
     });
 
     custody.rules = {

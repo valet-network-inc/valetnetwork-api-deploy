@@ -783,7 +783,16 @@ exports.createOrder = async (req, res) => {
                     aspMode: !!aspMode,
                     serviceType: finalServiceType,
                 }),
-            });
+            },
+            // Judged in the day and week the park actually happens. The free
+            // park is once a DAY and the covered move once a WEEK, so a
+            // booking made today for next Friday has to be measured against
+            // next Friday's allowance — asking about today both refuses a
+            // move the plan still owes and lets a second one through free.
+            (() => {
+                const at = new Date(pickUpTime);
+                return Number.isFinite(at.getTime()) ? at : new Date();
+            })());
             console.log('Subscription coverage decision:', coverage.reason);
         }
 
@@ -4018,7 +4027,58 @@ exports.autoCancelStaleOrders = async (io) => {
         for (const order of stale) {
             try {
                 // Refund if paid (best-effort)
-                if (
+                if (order.paymentStatus === 'paid' && order.awayMode && stripe) {
+                    // Same reason cancelOrder walks the ledger: an away order
+                    // can hold two charges — the $1 deposit at booking and the
+                    // balance the valet's schedule triggered — and
+                    // `paymentIntentId` keeps pointing at the deposit. A valet
+                    // can accept an away job, save the sweep days (balance
+                    // charged), then release it back to pending; if nobody else
+                    // takes it, this job cancels it. Refunding the single
+                    // intent would hand back the $1 and keep the ~$44 on a
+                    // cancelled order until the customer noticed and complained.
+                    try {
+                        const owed =
+                            order.awayPaidCents ?? order.totalAmount ?? 0;
+                        const result = await refundAwayCharges(order, owed);
+                        order.awayCharges = result.ledger;
+                        if (!result.ledger.length && order.paymentIntentId) {
+                            // An away order from before the ledger existed has
+                            // nothing to walk. Don't let the customer fall
+                            // through with no refund at all — give the one
+                            // intent we know about back in full, exactly as
+                            // this job always did.
+                            await stripe.refunds.create({
+                                payment_intent: order.paymentIntentId,
+                                reason: 'requested_by_customer',
+                            });
+                            console.log(
+                                'Auto-refunded stale legacy away order',
+                                order._id.toString()
+                            );
+                        } else {
+                            if (result.shortfallCents > 0) {
+                                console.error(
+                                    'Auto-cancel away refund short by',
+                                    result.shortfallCents,
+                                    'cents on order',
+                                    order._id.toString()
+                                );
+                            }
+                            console.log(
+                                'Auto-refunded stale away order',
+                                order._id.toString(),
+                                result.refundedCents
+                            );
+                        }
+                    } catch (refundErr) {
+                        console.error(
+                            'Auto-refund failed for stale away order',
+                            order._id.toString(),
+                            refundErr.message
+                        );
+                    }
+                } else if (
                     order.paymentStatus === 'paid' &&
                     order.paymentIntentId &&
                     stripe

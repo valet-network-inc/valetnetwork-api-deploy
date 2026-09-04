@@ -120,8 +120,26 @@ async function bookOccurrence(sub, day, occurrence, { io, notify, now }) {
     if (activeOrder) return { key, outcome: 'skipped_active_order' };
 
     // Weekly covered-move cap (auto + manual both count).
-    const used = await aspMovesUsedThisWeek(sub, now);
-    if (used >= ASP_MOVES_PER_WEEK) return { key, outcome: 'weekly_cap_reached' };
+    //
+    // The cap is what the customer BOUGHT, not the constant. `movesPerWeek` is
+    // the Stripe quantity on the street_cleaning plan — 1 on the $15/wk ($50/mo,
+    // and the HANDSFREE promo) tier, 2 on the full one — and it is the same
+    // expression evaluateParkCoverage() gates on in subscriptionService.js. Read
+    // the constant here instead and one plan carries two different weekly limits:
+    // a 1-move subscriber who books their manual move on Monday is at used=1,
+    // their quota spent, yet 1 >= 2 is false, so Thursday's tick books and
+    // dispatches a SECOND covered move for free. We pay the valet 70% of the $15
+    // list price for it, plus the auto-return leg — every week, forever. Two
+    // saved cleaning days on the free schedule screen get there with no manual
+    // booking at all.
+    // Counted in the week the move HAPPENS, not the week we are booking in.
+    // A sweep just after midnight on Monday is booked ~45 minutes earlier on
+    // Sunday, so reading the tally at `now` asks about the wrong week — and
+    // then spends, or refuses, the wrong week's quota.
+    const used = await aspMovesUsedThisWeek(sub, occurrence);
+    if (used >= (sub.movesPerWeek || ASP_MOVES_PER_WEEK)) {
+        return { key, outcome: 'weekly_cap_reached' };
+    }
 
     const address = scheduleFor(sub).address;
     if (!address || typeof address.lat !== 'number' || typeof address.lng !== 'number') {

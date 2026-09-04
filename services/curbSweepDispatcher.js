@@ -57,6 +57,14 @@ const BATCH_ALERT_ABOVE = 4;
 
 // How long before an occurrence an unclaimed move stops being normal.
 const UNCLAIMED_LEAD_MS = 20 * 60 * 1000;
+// The same question for a car we hold the keys to, asked later and on a
+// different fact. There is no order for "nobody has accepted this" to be true
+// of, so all we can ask is whether the car has actually moved — and at T-20 a
+// valet working a run legitimately has not reached it yet (the booked path
+// spaces one block's cars 8 minutes apart for exactly that reason). Ten minutes
+// out, with the keys in his pocket, is not normal, and paging any earlier would
+// page on an ordinary Monday until nobody read these any more.
+const PUSH_NOT_MOVED_LEAD_MS = 10 * 60 * 1000;
 // A sweep before this hour cannot be covered by anyone starting their day
 // normally, so it is worth flagging the evening before rather than at 5:40am.
 const EARLY_SWEEP_HOUR = 8;
@@ -123,20 +131,55 @@ async function remindKeyHolder(custody, occurrence, window, { io }) {
     if (custody.lastMoveReminderKey === key) return { outcome: 'already_reminded' };
     if (!custody.valet) return { outcome: 'no_key_holder' };
 
+    // THE PUSH IS THE WHOLE JOB ON THIS PATH. It mints no order, so there is
+    // nothing on the valet's board, nothing for the unclaimed watchdog to find
+    // and nothing a second valet could pick up. If it does not land, the car
+    // sits through the sweep and the customer takes the $65 ticket this plan
+    // exists to prevent — so whether it landed is a fact we have to record.
+    let delivered = false;
+    let failure = 'no push attempted';
     try {
         const User = require('../models/User');
         const valet = await User.findById(custody.valet).select('firebaseUid').lean();
-        if (valet && valet.firebaseUid) {
+        if (!valet || !valet.firebaseUid) {
+            failure = 'valet has no firebaseUid';
+        } else {
             const { sendPushNotification } = require('../controllers/notificationController');
-            await sendPushNotification(
+            const result = await sendPushNotification(
                 valet.firebaseUid,
                 'Street cleaning — move the car',
                 `${custody.spot.streetAddress || 'A car you are holding'} is swept at ` +
                     `${sweepWindows.describeWindows([window])}. Move it and record the new spot.`,
-                { orderId: String(custody.currentOrder), type: 'MANAGED_MOVE_REMINDER' }
+                {
+                    orderId: String(custody.currentOrder),
+                    type: 'MANAGED_MOVE_REMINDER',
+                    // Tapping the banner has to arrive somewhere. The app bails
+                    // out of handleNotificationNavigation the moment
+                    // `screen_name` is missing, so without this the notification
+                    // opens the app and stops — and a valet who swipes it away
+                    // is left with no in-app record of which car to move.
+                    //
+                    // It cannot be ValetOrderScreen: a park where the valet
+                    // keeps the keys is stamped parkClosedAt at park time, which
+                    // is exactly what takes it off the valet board that screen
+                    // reads, so it would open an empty job. My Keys is the one
+                    // shipped screen that lists the cars whose keys he is
+                    // holding, and index 0 is the tab it opens on.
+                    screen_name: 'KeyTransferScreen',
+                    index: '0',
+                }
             );
+            // sendPushNotification RETURNS {success:false} rather than throwing
+            // when the valet has no live token — a reinstall, a logout, or a
+            // token the sender itself retired on a previous failure. Discarding
+            // that return value is how "reminded" came to mean "we tried".
+            delivered = !!(result && result.success);
+            if (!delivered) {
+                failure = (result && (result.message || result.error)) || 'push not delivered';
+            }
         }
     } catch (err) {
+        failure = err.message;
         console.error('curbSweep: key-holder push failed:', err.message);
     }
 
@@ -147,11 +190,45 @@ async function remindKeyHolder(custody, occurrence, window, { io }) {
         });
     }
 
-    custody.lastMoveReminderKey = key;
     custody.reminderSpotKey = custody.spot.tileKey;
     custody.reminderSentAt = new Date();
     custody.state = 'moving';
+    // Stamped ONLY on a delivered push. This key is the "do not say it twice"
+    // gate, so stamping it after a silent failure retires the single attempt
+    // this car ever gets. Leaving it off means the next 60-second tick tries
+    // again for the rest of the window, which is what rescues the valet who
+    // reopens the app at 7:50 for an 8:30 sweep.
+    if (delivered) custody.lastMoveReminderKey = key;
     await custody.save();
+
+    if (!delivered) {
+        // Raised at T-45, while a human still has time to phone the valet.
+        // Deduped by the {kind, custody, dateKey} index, so the retry loop
+        // above cannot turn this into a page a minute.
+        await operatorAlert.raise({
+            kind: 'move_reminder_undelivered',
+            severity: operatorAlert.SEVERITY.PAGE,
+            custody: custody._id,
+            order: custody.currentOrder,
+            customer: custody.customer,
+            dateKey: nyDateKey(occurrence.at),
+            title: 'Nobody was told to move a car we are holding',
+            detail:
+                `${custody.spot.streetAddress || 'A car we hold the keys to'} is swept at ` +
+                `${sweepWindows.describeWindows([window])} and the reminder never reached the ` +
+                `valet (${failure}). This move is a push and nothing else — it is on no job ` +
+                `board — so unless somebody calls him the car takes the ticket.`,
+            payload: {
+                custodyId: String(custody._id),
+                orderId: String(custody.currentOrder),
+                valetId: String(custody.valet),
+                reason: failure,
+                spot: custody.spot,
+            },
+        });
+        return { outcome: 'reminder_undelivered', reason: failure };
+    }
+
     return { outcome: 'reminded' };
 }
 
@@ -484,15 +561,48 @@ async function watch({ now = new Date() } = {}) {
             if (windows.length) {
                 // A sweep is happening right now on the block the car is on and
                 // the car has not moved. A ticket is being written.
+                //
+                // This pages on the PHYSICAL fact — the car arrived on this spot
+                // before the sweeper did and is still sitting on it — and not on
+                // our own bookkeeping. It used to require `reminderSpotKey`,
+                // which only remindKeyHolder and bookMove ever write, i.e. only
+                // from tick(), i.e. only from behind CURB_SWEEP_ENABLED. So the
+                // one case this alarm exists for — the mover never ran, or ran
+                // and came back `no_key_holder`, or threw, or missed the window
+                // because the sign photo landed late — left both fields
+                // undefined and the page stayed silent while the car took a $65
+                // ticket. The docstring at the top of this file promises the
+                // alarm survives the mover being off; this is what makes that
+                // true.
+                //
+                // `spotSince` before the window opened is what keeps it quiet
+                // for the normal case: a valet legally parking behind the
+                // sweeper mid-window has a spotSince inside the window, and that
+                // is a move done right, not a ticket.
                 const inProgress = sweepWindows.sweepInProgress(windows, now);
-                if (inProgress && custody.spot.tileKey === custody.reminderSpotKey) {
+                const parkedBeforeTheSweeper =
+                    inProgress &&
+                    new Date(custody.spotSince || custody.openedAt).getTime() <
+                        inProgress.startedAt.getTime();
+                // A reminder went out for THIS spot and the car is still on it.
+                // Kept as its own condition because a custody row with no tile
+                // (a spot recorded without coordinates) would otherwise match
+                // undefined against undefined and page for nothing.
+                const reminderIgnored =
+                    inProgress &&
+                    !!custody.reminderSpotKey &&
+                    custody.spot.tileKey === custody.reminderSpotKey;
+                if (parkedBeforeTheSweeper || reminderIgnored) {
                     await say(custody, 'inProgressOn', {
                         kind: 'sweep_in_progress',
                         severity: operatorAlert.SEVERITY.PAGE,
                         title: 'A sweep is running and the car has not moved',
                         detail:
                             `${where} is being swept now and the car is still on it. This is a ` +
-                            `ticket in progress.`,
+                            `ticket in progress. ` +
+                            (custody.reminderSentAt
+                                ? 'We asked for a move and it did not happen.'
+                                : 'Nobody was ever asked to move it — no reminder went out.'),
                         payload: { custodyId: String(custody._id), spot: custody.spot },
                     });
                 } else if (inProgress && custody.reminderSentAt) {
@@ -521,6 +631,19 @@ async function watch({ now = new Date() } = {}) {
                             status: 'pending',
                             pickUpTime: { $lte: next.at, $gte: new Date(next.at.getTime() - 3600000) },
                         }).select('_id status');
+                        // The keys-with-valet path books nothing, so the query
+                        // above can never find it and this whole watchdog used
+                        // to skip the plans it matters most on: the first thing
+                        // anyone heard was sweep_in_progress, raised with the
+                        // sweeper already on the block and the ticket being
+                        // written. The car standing on the same tile we pushed
+                        // about is the equivalent fact.
+                        const toldAndStill =
+                            custody.keysWith === 'valet' &&
+                            custody.lastMoveReminderKey === reminderKey(next.at, next.window) &&
+                            !!custody.reminderSpotKey &&
+                            custody.spot.tileKey === custody.reminderSpotKey &&
+                            untilMs <= PUSH_NOT_MOVED_LEAD_MS;
                         if (move) {
                             await say(custody, 'unclaimedOn', {
                                 kind: 'move_unclaimed',
@@ -536,6 +659,25 @@ async function watch({ now = new Date() } = {}) {
                                     custodyId: String(custody._id),
                                     moveOrderId: String(move._id),
                                     at: next.at,
+                                },
+                            });
+                        } else if (toldAndStill) {
+                            await say(custody, 'unclaimedOn', {
+                                kind: 'move_not_made',
+                                severity: operatorAlert.SEVERITY.PAGE,
+                                title: 'The valet was told to move a car and it is still there',
+                                detail:
+                                    `${where} is swept at ` +
+                                    `${sweepWindows.describeWindows([next.window])}, we pushed the ` +
+                                    `valet holding the keys, and the car has not left the block. ` +
+                                    `There is no order to reassign — somebody has to call him.`,
+                                payload: {
+                                    custodyId: String(custody._id),
+                                    orderId: String(custody.currentOrder),
+                                    valetId: String(custody.valet),
+                                    remindedAt: custody.reminderSentAt,
+                                    at: next.at,
+                                    spot: custody.spot,
                                 },
                             });
                         }
