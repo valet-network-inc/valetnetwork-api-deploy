@@ -498,8 +498,30 @@ const resolveDoormanToken = async (token) => {
  * car cannot tell the valet he is the right one. Followed from the leg's own
  * link rather than from whichever of the pair `findOne` happened to return.
  */
+/**
+ * How long a booking whose card has not landed yet still counts as live here.
+ *
+ * `customerActiveOrderQuery` requires `paymentStatus: 'paid'`, which is right
+ * for the customer's own app — it will not show a ticket for a car nobody has
+ * been paid to move. It is wrong for the FRONT DESK, who just booked and is
+ * standing at the screen: between createOrder and the payment confirming, this
+ * page told them "nothing booked". That silence is most of why they said codes
+ * take forever to appear. An abandoned checkout leaves a pending order behind
+ * forever, so the window is short — long enough to cover a card confirming,
+ * not long enough to haunt the desk with last Tuesday's abandoned booking.
+ */
+const PENDING_PAYMENT_GRACE_MS = 10 * 60 * 1000;
+
 const currentHandoff = async (userId) => {
-    const booked = await Order.findOne(customerActiveOrderQuery(userId));
+    let booked = await Order.findOne(customerActiveOrderQuery(userId));
+    if (!booked) {
+        booked = await Order.findOne({
+            customer: userId,
+            status: { $in: ['pending', 'accepted', 'in_progress', 'parked'] },
+            paymentStatus: 'pending',
+            createdAt: { $gte: new Date(Date.now() - PENDING_PAYMENT_GRACE_MS) },
+        }).sort({ createdAt: -1 });
+    }
     if (!booked) return null;
 
     const order = (await liveKeyReturnLeg(booked)) || booked;
