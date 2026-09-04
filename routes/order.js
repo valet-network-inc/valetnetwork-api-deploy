@@ -1,4 +1,5 @@
 const express = require('express');
+const { requireValet } = require('../middleware/requireSelf');
 const router = express.Router();
 const {
     createOrder,
@@ -39,7 +40,15 @@ const photoUpload = multer({
 
 router.post('/createOrder', validateSubscriptionForOrder, createOrder);
 router.post('/createRetrievalOrder', validateSubscriptionForOrder, createRetrievalOrder);
-router.get('/getPendingOrders', getPendingOrders);
+// The open job board. It published every pending order — each customer's
+// ObjectId, their pickup address, their licence plate — to anyone who asked,
+// and those ObjectIds are the input that the other userId-trusting endpoints
+// take. Closing this closes the way an attacker finds who to attack.
+//
+// Only the valet app has ever called it (context/OrderContext.js), and it has
+// sent a Firebase ID token on every request since 2.2.0. The web app does not
+// call it at all.
+router.get('/getPendingOrders', requireValet(), getPendingOrders);
 router.post('/acceptOrder', acceptOrder);
 router.get('/hasActiveOrder', hasActiveOrder);
 router.post('/updateValetLocation', updateValetLocation);

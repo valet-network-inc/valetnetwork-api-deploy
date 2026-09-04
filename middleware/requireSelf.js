@@ -76,3 +76,39 @@ function requireSelf(pick = (req) => req.body?.userId || req.query?.userId) {
 
 module.exports = requireSelf;
 module.exports.callerFirebaseUid = callerFirebaseUid;
+
+/**
+ * "You are a signed-in valet."
+ *
+ * For routes that name nobody — the open job board is the one that matters.
+ * It published every pending order, including each customer's ObjectId, their
+ * pickup address and their licence plate, to anyone who asked. Those ObjectIds
+ * are what made the other unauthenticated endpoints worth attacking: they are
+ * the input those take and trust.
+ *
+ * Safe to enforce on the board because the valet app is its only caller, and
+ * it has attached a token to every request since 2.2.0.
+ */
+function requireValet() {
+    return async function (req, res, next) {
+        try {
+            const uid = await callerFirebaseUid(req);
+            if (!uid) {
+                return res.status(401).json({ success: false, message: 'Sign in again to continue.' });
+            }
+            const user = await User.findOne({ firebaseUid: uid })
+                .select('isValet isDeleted')
+                .lean();
+            if (!user || user.isDeleted || !user.isValet) {
+                return res.status(403).json({ success: false, message: 'Valets only.' });
+            }
+            req.callerUserId = String(user._id);
+            return next();
+        } catch (err) {
+            console.error('requireValet failed:', err.message);
+            return res.status(500).json({ success: false, message: 'Could not verify your account.' });
+        }
+    };
+}
+
+module.exports.requireValet = requireValet;

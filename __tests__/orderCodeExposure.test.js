@@ -24,7 +24,10 @@
  *     document until he accepts.
  *   - the pending feed still names the customer by raw ObjectId. The valet's
  *     Swipe to Accept reads it off that document and writes it into the chat
- *     that the customer's app then finds the job by.
+ *     that the customer's app then finds the job by. It is no longer public,
+ *     though: since 2026-09-04 the board answers only a signed-in valet, which
+ *     is what took those ObjectIds off the open internet and with them the way
+ *     an attacker found which accounts to aim the other endpoints at.
  *   - `hasActiveOrder` still carries the code on the VALET side, because that
  *     is where his app gets the number he reads out at the curb.
  *   - `getOrdersByUser` still carries the code on the CUSTOMER side. It is the
@@ -32,6 +35,40 @@
  *     to get her keys back, and neither can be rebuilt before tomorrow morning.
  *     Stripping it there is a regression, not a fix.
  */
+
+// The valet job board now proves the caller is a signed-in valet, so this
+// suite needs a token. `uid:<firebaseUid>` stands in for a real ID token.
+jest.mock('firebase-admin', () => ({
+    auth: () => ({
+        verifyIdToken: async (token) => {
+            const m = /^uid:(.+)$/.exec(String(token));
+            if (!m) throw new Error('Decoding Firebase ID token failed');
+            return { uid: m[1] };
+        },
+    }),
+    // The order controller reaches for these on paths this suite touches;
+    // a mock that only answers auth() hangs the run rather than failing it.
+    messaging: () => ({
+        send: async () => 'mock',
+        sendEachForMulticast: async () => ({ responses: [], successCount: 0, failureCount: 0 }),
+    }),
+    firestore: () => ({
+        collection: () => ({
+            doc: () => ({
+                get: async () => ({ exists: false, data: () => null }),
+                set: async () => {},
+                update: async () => {},
+                collection: () => ({ add: async () => {}, get: async () => ({ docs: [] }) }),
+            }),
+            add: async () => {},
+            where: () => ({ get: async () => ({ docs: [], empty: true }) }),
+        }),
+    }),
+    apps: [{}],
+    initializeApp: () => {},
+    credential: { cert: () => ({}), applicationDefault: () => ({}) },
+    storage: () => ({ bucket: () => ({ file: () => ({}) }) }),
+}));
 
 const express = require('express');
 const request = require('supertest');
@@ -59,9 +96,13 @@ const makeUser = (isValet = false) => User.create({
     lastName: 'Tester',
     email: `u${new mongoose.Types.ObjectId()}@example.com`,
     phone: String(++phoneSeq),
+    firebaseUid: `uid_${phoneSeq}`,
     verified: true,
     isValet,
 });
+
+/** The header a signed-in valet's app sends. */
+const asValet = (valet) => ['Authorization', `Bearer uid:${valet.firebaseUid}`];
 
 const CURB = { lat: 40.6798, lng: -73.9899, streetAddress: '296 12th St' };
 
@@ -110,7 +151,8 @@ describe('the valet feed', () => {
         const customer = await makeUser();
         await makeOrder(customer._id);
 
-        const res = await request(app).get('/api/order/getPendingOrders');
+        const valet = await makeUser(true);
+        const res = await request(app).get('/api/order/getPendingOrders').set(...asValet(valet));
 
         expect(res.statusCode).toBe(200);
         expect(res.body.orders).toHaveLength(1);
@@ -126,14 +168,33 @@ describe('the valet feed', () => {
         const customer = await makeUser();
         await makeOrder(customer._id);
 
-        const { body } = await request(app).get('/api/order/getPendingOrders');
+        const valet = await makeUser(true);
+        const { body } = await request(app).get('/api/order/getPendingOrders').set(...asValet(valet));
 
         expect(body.orders[0].otp).toBeDefined();
         expect(body.orders[0].otp.type).toBe('order_creation');
         expect(body.orders[0].otp.verified).toBe(false);
     });
 
-    test('and still names the customer by ObjectId, which is not a leak we could close tonight', async () => {
+    test('refuses a caller who is not a signed-in valet at all', async () => {
+        const customer = await makeUser();
+        await makeOrder(customer._id);
+
+        // No token. This is the read that used to hand a stranger every
+        // pending customer's ObjectId — the input every other
+        // userId-trusting endpoint takes and believes.
+        const anon = await request(app).get('/api/order/getPendingOrders');
+        expect(anon.statusCode).toBe(401);
+
+        // A signed-in CUSTOMER is not a valet, and the board is not theirs.
+        const notAValet = await makeUser(false);
+        const wrongRole = await request(app)
+            .get('/api/order/getPendingOrders')
+            .set(...asValet(notAValet));
+        expect(wrongRole.statusCode).toBe(403);
+    });
+
+    test('and still names the customer by ObjectId, now only to a signed-in valet', async () => {
         // Read this one as a record, not as an approval.
         //
         // That id is the key to the rest of the chain: it opens
@@ -163,7 +224,8 @@ describe('the valet feed', () => {
         const customer = await makeUser();
         await makeOrder(customer._id);
 
-        const { body } = await request(app).get('/api/order/getPendingOrders');
+        const valet = await makeUser(true);
+        const { body } = await request(app).get('/api/order/getPendingOrders').set(...asValet(valet));
 
         expect(body.orders[0].customer).toBe(String(customer._id));
     });
