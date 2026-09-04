@@ -111,9 +111,12 @@ function dueNow(custody, now) {
  * runs (orderController's AWAY_MOVE_REMINDER). It creates no order, takes no
  * payment, needs no OTP, cannot be blocked by any live-order guard, cannot be
  * reaped by autoCancelStaleOrders, and does not land in the cancel refund's
- * usage sum. Nothing sets keysWith:'valet' today — the valet-holds-the-keys
- * flow is specified but deliberately unbuilt — so this path is dormant until it
- * lands, and is here so that landing it is a one-field change.
+ * usage sum.
+ *
+ * This is now the PRIMARY path, not a dormant one: `CurbCustody.keysWith`
+ * defaults to 'valet' on the managed tiers, so every car we are holding moves
+ * this way. A `booked` outcome is the exception — it is for a car whose keys
+ * the customer has taken back, where a valet has to be sent to collect them.
  */
 async function remindKeyHolder(custody, occurrence, window, { io }) {
     const key = reminderKey(occurrence.at, window);
