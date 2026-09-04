@@ -776,6 +776,24 @@ describe('key custody', () => {
         expect(closed.otpVerifiedTimes && closed.otpVerifiedTimes.returnKey).toBeFalsy();
     });
 
+    test('a "Just park" on a managed plan still closes out — keys are the test, not serviceType', async () => {
+        // Custody arms on ANY covered park; `classify` never looks at serviceType.
+        // So this customer's keys are taken exactly as they would be on a Park &
+        // Retrieve. Requiring park-and-hold at close-out left the order stuck at
+        // `parked` forever: never off the valet's screen, and on the customer's
+        // side a ticket whose only action was a handoff nobody was walking to.
+        const customer = await makeUser();
+        const valet = await makeUser(true);
+        const sub = await makeSub(customer);
+        const order = await makePark(customer, valet, sub, { serviceType: 'standard' });
+        await park(order._id, { status: 'parked', parkingLocation: BLOCK_A });
+        expect(await curbCustody.weHoldTheKeys(customer._id)).toBe(true);
+
+        await park(order._id, { status: 'parked' });
+        const closed = await Order.findById(order._id).lean();
+        expect(closed.parkClosedAt).toBeTruthy();
+    });
+
     test('street_cleaning keeps its key return — we never hold those', async () => {
         const customer = await makeUser();
         const valet = await makeUser(true);

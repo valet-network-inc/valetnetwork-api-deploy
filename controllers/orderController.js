@@ -1389,10 +1389,17 @@ exports.updateOrder = async (req, res) => {
                 const held = await Order.findById(orderId)
                     .select('customer orderType serviceType parkClosedAt endCustomerName')
                     .lean();
+                // Deliberately NOT gated on serviceType. Custody arms on any
+                // covered park — `classify` never looks at it — so a managed
+                // customer who picks "Just park" has their keys taken exactly
+                // the same way. Requiring park-and-hold here meant that park
+                // never stamped `parkClosedAt`, never left the valet's screen,
+                // and left the customer looking at a ticket whose only action
+                // was a handoff nobody was walking to, with no way to ask for
+                // the car back. Holding the keys is the whole test.
                 const keysStay =
                     held &&
                     held.orderType === 'parking' &&
-                    held.serviceType === 'park-and-hold' &&
                     !held.parkClosedAt &&
                     !held.endCustomerName &&
                     (await curbCustody.weHoldTheKeys(held.customer));
