@@ -82,6 +82,11 @@ const sweepParkingEndingSoon = async (now) => {
             if (!pickUp || Number.isNaN(pickUp.getTime())) continue;
             if (!order.duration || order.duration <= 0) continue;
 
+            // A park on the flat plans has no ending to warn about — we hold
+            // the car until the customer asks for it. `duration` is still
+            // populated for legacy readers, so it has to be ignored here
+            // explicitly rather than trusted.
+            if (order.indefinite) continue;
             const endsAt = new Date(pickUp.getTime() + order.duration * 60000);
             if (!inAlertWindow(endsAt, now, LEAD_PARKING_MIN)) continue;
 

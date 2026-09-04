@@ -351,6 +351,24 @@ const OrderSchema = new mongoose.Schema({
         },
     },
     /**
+     * This park has no end time.
+     *
+     * On the $250 and $300 plans we hold the car and the keys until the
+     * customer asks for it back, so there is nothing to expire and nothing to
+     * extend — a duration was always a fiction on them. Decided by tier and
+     * where the car was left (`subscriptionService.parkIsIndefinite`), NOT by
+     * whether the plan paid for it: the second park of a day is still
+     * indefinite, the customer has just paid for that one.
+     *
+     * `duration` is left populated for every legacy reader; anything that turns
+     * a duration into an ENDING has to check this first.
+     */
+    indefinite: {
+        type: Boolean,
+        default: false,
+    },
+
+    /**
      * This park ends with the keys staying in the valet's pocket.
      *
      * Mirrored from the custody row so the valet's phone can answer it the

@@ -188,6 +188,11 @@ app.use('/api/street-parking', require('./routes/streetParking'));
 app.use('/api/payment', require('./routes/payment'));
 app.use('/api/notification', require('./routes/notification'));
 app.use('/api/subscription', require('./routes/subscription'));
+// "Is this booking covered, and what will it cost" — the answer the clients
+// used to guess at locally, which is how a $250-a-month customer got quoted
+// $10 for a park their plan pays for. The subscription router above has no
+// /quote route, so an unmatched path falls through to this one.
+app.use('/api/subscription/quote', require('./routes/quote'));
 app.use('/api/custody', require('./routes/custody'));
 app.use('/api/cleaning-schedule', require('./routes/cleaningSchedule'));
 app.use('/api/event', require('./routes/eventRoutes'));

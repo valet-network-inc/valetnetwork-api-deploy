@@ -132,6 +132,37 @@ async function evaluateParkCoverage(sub, { aspMode, lat, lng, listPriceCents }, 
     return { covered: true, listPriceCents, reason: 'daily_free_park' };
 }
 
+/**
+ * Does a park on this plan, at this spot, have no end time?
+ *
+ * On the flat plans we hold the car and the keys until the customer asks for it
+ * back, so a duration was always a fiction on them — there is nothing to expire
+ * and nothing to extend. Rishi, 2026-09-04.
+ *
+ * This is NOT the same question as coverage, and the difference matters: the
+ * free park is once a day, but the SECOND park of the day is still indefinite
+ * so long as it is somewhere the plan looks after. The customer pays for that
+ * one; they do not get billed by the hour for it.
+ *
+ *   valet_anywhere — anywhere we operate, which is what its extra $50 buys.
+ *   home_garage    — within HOME_RADIUS_METERS of the fixed address, the same
+ *                    circle `evaluateParkCoverage` pays inside.
+ *
+ * Fails toward FALSE: a park wrongly marked indefinite never expires and never
+ * prompts anyone, so a car could sit on a sweep block with nobody watching the
+ * clock. A park wrongly left finite just shows a duration nobody acts on.
+ */
+function parkIsIndefinite(sub, { lat, lng } = {}, now = new Date()) {
+    if (!sub || !isEntitled(sub, now)) return false;
+    if (!MANAGED_TIERS.includes(sub.tier)) return false;
+    if (sub.tier === 'valet_anywhere') return true;
+
+    const home = sub.homeAddress;
+    if (!home || typeof home.lat !== 'number' || typeof home.lng !== 'number') return false;
+    if (typeof lat !== 'number' || typeof lng !== 'number') return false;
+    return haversineMeters({ lat, lng }, { lat: home.lat, lng: home.lng }) <= HOME_RADIUS_METERS;
+}
+
 // Next auto-ASP occurrence across the schedule, or null.
 function nextAspMove(sub, now = new Date()) {
     const days = sub && sub.aspSchedule && sub.aspSchedule.days;
@@ -327,6 +358,7 @@ module.exports = {
     aspMovesUsedThisWeek,
     freeParksUsedToday,
     evaluateParkCoverage,
+    parkIsIndefinite,
     nextAspMove,
     buildStatusPayload,
     aspListPriceCents,

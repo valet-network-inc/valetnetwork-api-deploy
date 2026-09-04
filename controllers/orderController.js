@@ -741,6 +741,17 @@ exports.createOrder = async (req, res) => {
             console.log('Subscription coverage decision:', coverage.reason);
         }
 
+        // A park on the flat plans has no end time, whether or not the plan
+        // paid for this particular one. Coverage is once a day; being looked
+        // after is the whole month.
+        let indefinitePark = false;
+        if (subscription && (orderType || 'parking') === 'parking' && !awayMode) {
+            indefinitePark = subscriptionService.parkIsIndefinite(subscription, {
+                lat: customerLocation && customerLocation.lat,
+                lng: customerLocation && customerLocation.lng,
+            });
+        }
+
         console.log('Payment determination:', {
             covered: coverage.covered,
             finalIsFreeService,
@@ -844,6 +855,9 @@ exports.createOrder = async (req, res) => {
                           : {}),
                   }
                 : {}),
+            // No end time on the flat plans. Deliberately outside the coverage
+            // stamp below: the second park of a day is paid for AND indefinite.
+            ...(indefinitePark ? { indefinite: true } : {}),
             // Subscription coverage stamp: which plan paid, and what the
             // order would have cost per-use (the value indicator's usage side).
             ...(coverage.covered
