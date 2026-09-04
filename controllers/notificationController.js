@@ -436,6 +436,15 @@ exports.notifyClosestValets = async (req, res) => {
                 ? `${customerName} — move at ${whenLabel || 'the posted time'} from ${
                       order.customerLocation.streetAddress
                   }. Re-park it when the window ends.`
+                : order.indefinite
+                ? // A park on the flat plans has no end. `duration` is still on
+                  // the wire (the field is required, and legacy readers want a
+                  // number) but it is a placeholder, not a time — printing it
+                  // here told the valet the car goes back in 24 hours when in
+                  // fact we hold it, and the keys, until the customer asks.
+                  `${customerName} needs parking at ${
+                      order.customerLocation.streetAddress
+                  }. No end time — keep the keys until they ask for the car back.`
                 : `${customerName} needs parking at ${
                       order.customerLocation.streetAddress
                   }. Duration: ${order.duration / 60} hours`;
