@@ -44,6 +44,7 @@ router.get('/managed-cars', managedCarAdmin.listManagedCars);
 router.get('/managed-cars/:id', managedCarAdmin.getManagedCar);
 router.put('/managed-cars/:id/rules', managedCarAdmin.setManagedCarRules);
 router.post('/managed-cars/:id/close', managedCarAdmin.closeManagedCar);
+router.post('/managed-cars/:id/request-keys', managedCarAdmin.requestKeysForCustomer);
 router.get('/ops-alerts', managedCarAdmin.listOpsAlerts);
 router.post('/ops-alerts/:id/ack', managedCarAdmin.ackOpsAlert);
 

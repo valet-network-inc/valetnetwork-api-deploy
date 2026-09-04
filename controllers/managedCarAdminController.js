@@ -203,6 +203,33 @@ exports.closeManagedCar = async (req, res) => {
     }
 };
 
+/**
+ * POST /api/admin/managed-cars/:id/request-keys
+ *
+ * Ask for the keys back ON THE CUSTOMER'S BEHALF.
+ *
+ * The customer-facing button exists on iOS and is being built for web, but a
+ * customer can always reach us by phone or chat before either is in their hands
+ * — and telling somebody we are holding their car keys and they will have to
+ * wait for an app update is not an answer. This is the same job the customer's
+ * own tap creates, placed by a person instead.
+ */
+exports.requestKeysForCustomer = async (req, res) => {
+    try {
+        const custody = await CurbCustody.findById(req.params.id).select('customer').lean();
+        if (!custody) return res.status(404).json({ success: false, message: 'Not found' });
+        const custodyController = require('./custodyController');
+        // Reuse the customer path exactly, so an operator-placed request and a
+        // customer-placed one are the same object with the same guards — there
+        // is no second way for this to behave.
+        req.body = { userId: String(custody.customer) };
+        return custodyController.requestKeys(req, res);
+    } catch (err) {
+        console.error('requestKeysForCustomer error:', err);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+};
+
 /** GET /api/admin/ops-alerts — the worklist. */
 exports.listOpsAlerts = async (req, res) => {
     try {
