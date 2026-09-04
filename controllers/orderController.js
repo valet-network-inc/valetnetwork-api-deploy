@@ -149,11 +149,57 @@ const withoutOtpCode = (order) => {
     if (!order) return order;
     const plain = typeof order.toJSON === 'function' ? order.toJSON() : { ...order };
     if (plain.otp && typeof plain.otp === 'object') {
+        // When we are keeping the keys there is no key return, so the code
+        // staged on this order belongs to a handoff nobody will walk. Shipped
+        // valet builds decide "does this job still owe an OTP" with a bare
+        // `!!order.otp` (ValetOrderScreen), and their own test for keys-stay is
+        // narrower than the server's — it wants `coveredBySubscription`, which
+        // the SECOND park of a day does not have even though the park is still
+        // indefinite and the keys still stay. The two disagreed and the job
+        // could not be closed: an OTP was demanded that no surface can mint,
+        // so it never left the valet's screen and the customer stayed "in
+        // flight". Removing the husk answers that question correctly on every
+        // phone already out there. The code itself was already stripped below,
+        // so nothing that works today reads what this drops.
+        if (plain.keysStayWithValet) {
+            delete plain.otp;
+            return plain;
+        }
         plain.otp = { ...plain.otp };
         delete plain.otp.code;
     }
     return plain;
 };
+
+/**
+ * The only fields a client may name in `updateOrder`.
+ *
+ * This endpoint used to pass the caller's `updates` object straight into
+ * `findByIdAndUpdate`, so anyone who knew an orderId — and `getPendingOrders`
+ * hands those out unauthenticated — could set ANY field on the document.
+ * `totalAmount` was the expensive one: `valetPayBaseCents` reads it, and the
+ * completion hook pays 70% of it into a valet's withdrawable balance, so a
+ * stranger could mint themselves money. `paymentStatus` bought a free valet,
+ * `otp` bought somebody's car, and `parkingLocation` could hide a car we are
+ * holding on a block nobody then sweeps.
+ *
+ * Everything the shipped clients actually send is here: the valet sends
+ * `status` and `parkingLocation`, the customer sends `review`. The rest are
+ * kept for older builds and for fields that are merely descriptive. Money,
+ * identity, custody and OTP are deliberately absent and must stay that way —
+ * they are set by the server or not at all.
+ */
+const CLIENT_WRITABLE_ORDER_FIELDS = new Set([
+    'status',
+    'parkClosed',
+    'parkClosedAt',
+    'parkingLocation',
+    'review',
+    'vehicle',
+    'notes',
+    'parkingNotes',
+    'customerLocation',
+]);
 
 // Safety valve against one valet hoovering the whole board — not a queue depth
 // we expect anyone to hit. Set VALET_MAX_ACTIVE_ORDERS to another number to
@@ -1364,6 +1410,24 @@ exports.updateOrder = async (req, res) => {
             updates.status = 'parked';
             updates.parkClosedAt = new Date();
             delete updates.parkClosed;
+        }
+
+        // Drop anything the client is not allowed to name, and say so rather
+        // than silently ignoring it — a caller sending `totalAmount` is either
+        // an attacker or a bug, and both want to know it did not take.
+        if (updates && typeof updates === 'object') {
+            const refused = Object.keys(updates).filter(
+                (k) => !CLIENT_WRITABLE_ORDER_FIELDS.has(k)
+            );
+            if (refused.length) {
+                for (const k of refused) delete updates[k];
+                console.warn(
+                    'updateOrder: refused client-supplied fields:',
+                    refused.join(', '),
+                    'order:',
+                    orderId
+                );
+            }
         }
 
         // A body without an `updates` object used to throw here and come back
