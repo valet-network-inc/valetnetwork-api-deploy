@@ -26,6 +26,9 @@ const ParkingNote = require('../models/ParkingNote');
 const StreetParkingMark = require('../models/StreetParkingMark');
 const Subscription = require('../models/Subscription');
 const sweepWindows = require('./sweepWindows');
+// No cycle: subscriptionService requires only models, subscriptionPlans and
+// nyTime — never this file.
+const subscriptionService = require('./subscriptionService');
 const operatorAlert = require('./operatorAlert');
 const { nyDateKey, nyClock } = require('./nyTime');
 
@@ -90,12 +93,37 @@ async function classify(order) {
     if (['cancelled'].includes(order.status)) return null;
     if (order.status === 'completed' && !isSweepReturnLeg(order)) return null;
     if (isEnterprise(order)) return null;
-    if (!order.coveredBySubscription) return null;
+
+    // Custody follows `indefinite`, NOT coverage. They are different questions
+    // and they genuinely diverge:
+    //
+    //   covered    — did the plan PAY for this particular park? Once a day.
+    //   indefinite — is this a car we HOLD until asked? Tier and place, always.
+    //
+    // The SECOND park of a day is charged for and still has no end time, and so
+    // is a Car Watch park (coverage is gated on !carWatch, the indefinite stamp
+    // is not). Keying custody on coverage meant those cars were promised
+    // "Parked until you ask for it back" in the server's own words while no
+    // CurbCustody row existed — so nothing read the block, nothing moved the
+    // car before the sweep, and the watchdog had no row to alarm on. An
+    // unwatched car on a cleaning block is a ticket or a tow.
+    if (!order.coveredBySubscription && !order.indefinite) return null;
     const loc = order.parkingLocation;
     if (!loc || !finite(loc.lat) || !finite(loc.lng)) return null;
 
-    const subId = order.coveredBySubscription._id || order.coveredBySubscription;
-    const sub = await Subscription.findById(subId).select('tier user status').lean();
+    // Prefer the stamp when the plan paid, because it names the exact
+    // subscription that was charged. Fall back to the customer's live plan for
+    // an indefinite park the plan did not pay for — there is no stamp on those.
+    let sub = null;
+    if (order.coveredBySubscription) {
+        const subId = order.coveredBySubscription._id || order.coveredBySubscription;
+        sub = await Subscription.findById(subId).select('tier user status').lean();
+    } else {
+        const live = await subscriptionService.getActiveSubscription(customerIdOf(order));
+        // .lean() below is not available on the doc getActiveSubscription
+        // returns, so take the same shape by hand.
+        sub = live ? { _id: live._id, tier: live.tier, user: live.user, status: live.status } : null;
+    }
     if (!sub || !isManagedTier(sub.tier)) return null;
 
     return { sub, loc };
@@ -773,7 +801,14 @@ async function reconcile({ now = new Date() } = {}) {
         const parked = await Order.find({
             status: 'parked',
             orderType: 'parking',
-            coveredBySubscription: { $exists: true, $ne: null },
+            // Same rule as classify(): a park the plan did not pay for still
+            // has no end time on the flat tiers, and is still a car we hold.
+            // Filtering on coverage alone made this safety net blind to the
+            // exact orders most likely to have been missed.
+            $or: [
+                { coveredBySubscription: { $exists: true, $ne: null } },
+                { indefinite: true },
+            ],
             'parkingLocation.lat': { $exists: true },
         })
             .sort({ updatedAt: -1 })

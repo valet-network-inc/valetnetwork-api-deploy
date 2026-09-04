@@ -229,6 +229,48 @@ describe('opening custody', () => {
 
         expect(await CurbCustody.countDocuments({})).toBe(0);
     });
+
+    // The second park of a day. The plan pays for one, so this one is CHARGED
+    // — but on a flat tier it still has no end time, and the customer is told
+    // so in the server's own words. Keying custody on coverage left exactly
+    // this car with no row: nobody read its block, nothing moved it before the
+    // sweep, and the watchdog had no row to alarm on.
+    test('a charged park that still has no end time is ours to hold', async () => {
+        const customer = await makeUser();
+        const valet = await makeUser(true);
+        const sub = await makeSub(customer);
+        const order = await makePark(customer, valet, sub, {
+            coveredBySubscription: undefined,
+            indefinite: true,
+            totalAmount: 1000,
+        });
+
+        await park(order._id, { status: 'parked', parkingLocation: BLOCK_A });
+
+        const custody = await CurbCustody.findOne({ customer: customer._id });
+        expect(custody).toBeTruthy();
+        expect(custody.tier).toBe('home_garage');
+        // And the keys stay with us, exactly as on a covered park — otherwise
+        // the valet's push says "keep the keys" while their app asks them to
+        // hand them back.
+        expect(custody.keysWith).toBe('valet');
+        const saved = await Order.findById(order._id).lean();
+        expect(saved.keysStayWithValet).toBe(true);
+    });
+
+    test('no end time on a per-use customer opens nothing — there is no plan behind it', async () => {
+        const customer = await makeUser();
+        const valet = await makeUser(true);
+        const sub = await makeSub(customer, 'street_cleaning');
+        const order = await makePark(customer, valet, sub, {
+            coveredBySubscription: undefined,
+            indefinite: true,
+        });
+
+        await park(order._id, { status: 'parked', parkingLocation: BLOCK_A });
+
+        expect(await CurbCustody.countDocuments({})).toBe(0);
+    });
 });
 
 describe('reading the block', () => {
