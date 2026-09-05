@@ -7,6 +7,12 @@ const {
     handleStripeWebhook,
 } = require('../controllers/paymentController');
 
+// DELIBERATELY UNGATED. A stranger holding an order id can mint an intent
+// against somebody else's booking, which is real — but the shipped iOS app
+// calls this with raw `fetch`, not the axios client that carries the token
+// (OrderPreferencesScreen.js:579 and EnterpriseSummonScreen.js:257), so any
+// gate here 401s checkout on every binary in the field. It has to be fixed in
+// the app first and enforced a release later. Raised, not taken.
 router.post('/createPaymentIntent', createPaymentIntent);
 
 // POST /updatePaymentStatus is GONE.

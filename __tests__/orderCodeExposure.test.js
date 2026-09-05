@@ -101,8 +101,9 @@ const makeUser = (isValet = false) => User.create({
     isValet,
 });
 
-/** The header a signed-in valet's app sends. */
+/** The header a signed-in app sends. Same shape for a valet and a customer. */
 const asValet = (valet) => ['Authorization', `Bearer uid:${valet.firebaseUid}`];
+const asUser = asValet;
 
 const CURB = { lat: 40.6798, lng: -73.9899, streetAddress: '296 12th St' };
 
@@ -233,8 +234,9 @@ describe('the valet feed', () => {
 
 describe('the live-order read', () => {
     test('the valet’s half carries the code, because he is the one who reads it out', async () => {
-        // Also a record rather than an approval. `hasActiveOrder` is
-        // unauthenticated and answers on both sides, and the valet's side is
+        // Also a record rather than an approval. `hasActiveOrder` now proves
+        // the caller owns the id it is handed, and answers on both sides; the
+        // valet's side is
         // where his app gets the number he says at the curb:
         // `sendOtpAndMaybeOpenModal(activeOrder?.otp?.code, sendParkHoldCollectOTP)`
         // (hooks/useConversation.js:599,717). That message is also the signal
@@ -250,6 +252,7 @@ describe('the live-order read', () => {
 
         const res = await request(app)
             .get('/api/order/hasActiveOrder')
+            .set(...asUser(valet))
             .query({ userId: String(valet._id), isValet: 'true' });
 
         expect(res.statusCode).toBe(200);
@@ -301,6 +304,7 @@ describe('the order list', () => {
 
         const res = await request(app)
             .get('/api/order/getOrdersByUser')
+            .set(...asUser(valet))
             .query({ userId: String(valet._id), isValet: 'true' });
 
         expect(res.statusCode).toBe(200);
@@ -329,6 +333,7 @@ describe('the order list', () => {
 
         const res = await request(app)
             .get('/api/order/getOrdersByUser')
+            .set(...asUser(customer))
             .query({ userId: String(customer._id), isValet: 'false' });
 
         expect(res.statusCode).toBe(200);

@@ -1,5 +1,6 @@
 const express = require('express');
-const { requireValet } = require('../middleware/requireSelf');
+const requireSelf = require('../middleware/requireSelf');
+const { requireValet, requireOrderOwner } = requireSelf;
 const router = express.Router();
 const {
     createOrder,
@@ -50,10 +51,26 @@ router.post('/createRetrievalOrder', validateSubscriptionForOrder, createRetriev
 // call it at all.
 router.get('/getPendingOrders', requireValet(), getPendingOrders);
 router.post('/acceptOrder', acceptOrder);
-router.get('/hasActiveOrder', hasActiveOrder);
+// Both of these name a user in the QUERY STRING and hand back whole Order
+// documents with the live `otp.code` on them — the six digits that release a
+// car — plus the address it is parked at. A customer ObjectId is not a secret,
+// so until now a stranger holding one could read the code for a car sitting on
+// the street right now.
+//
+// The code STAYS in the body on both. It is not a leak to the two people in
+// the handoff: the valet reads it out to collect the keys
+// (hooks/useConversation.js:727) and the customer reads it out to get them
+// back (UserHomeScreen.js:574, tracking.tsx:236) — and `getOrdersByUser` is
+// the customer's only source once the park is closed out. The fix is proving
+// who is asking, not blanking the number.
+//
+// Every caller in both clients names their OWN id, on both the customer and
+// the valet branch (`isValet` only picks which query runs, never whose id is
+// read), so one pick covers both.
+router.get('/hasActiveOrder', requireSelf((req) => req.query?.userId), hasActiveOrder);
 router.post('/updateValetLocation', updateValetLocation);
 router.post('/updateOrder', updateOrder);
-router.get('/getOrdersByUser', getOrdersByUser);
+router.get('/getOrdersByUser', requireSelf((req) => req.query?.userId), getOrdersByUser);
 router.post('/addVehicleInfo', addVehicleInfo);
 router.post('/checkKeyTagAvailability', checkKeyTagAvailability);
 router.get('/getTodaysParkedCars/:valetId', getTodaysParkedCars);
@@ -67,7 +84,12 @@ router.post('/cancelOrder', cancelOrder);
 router.post('/valetCancelOrder', valetCancelOrder);
 
 // --- Tips (100% pass-through to valet) ---
-router.post('/:orderId/tip', tipController.createTip);
+// A tip charges the customer's saved card off-session. It named only the
+// order, and order ids travel with the order documents themselves, so anybody
+// holding one could tip a valet off somebody else's card. The web client had
+// to start sending its token for this one — createTip was hand rolled around
+// `fetch` and was the only call in that app with no Authorization header.
+router.post('/:orderId/tip', requireOrderOwner(), tipController.createTip);
 router.get('/:orderId/tips', tipController.getOrderTips);
 
 // --- Order handoff photos (pre-pickup + post-park, gates the

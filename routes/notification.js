@@ -1,11 +1,18 @@
 const express = require('express');
 const router = express.Router();
 const { sendNotification, notifyClosestValets, sendUserNotification, sendPushNotification } = require('../controllers/notificationController');
+const requireAdminKey = require('../middleware/requireAdminKey');
 
 router.post('/send', sendNotification);
 router.post('/notify-closest-valets', notifyClosestValets);
 router.post('/send-user', sendUserNotification);
-router.post('/send-push', async (req, res) => {
+// A raw "push anything to anybody" primitive: it takes a firebaseUid or an FCM
+// token straight from the body along with the title and body to show. Nothing
+// in either client calls it — verified by grep across both repos — so it was
+// an open relay for sending our own branded notifications to our own
+// customers. Behind the admin key it stays available as an ops tool and stops
+// being that.
+router.post('/send-push', requireAdminKey, async (req, res) => {
     try {
         const { firebaseUid, fcmToken, title, body, data } = req.body;
         

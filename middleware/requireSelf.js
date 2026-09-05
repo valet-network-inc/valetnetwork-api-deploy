@@ -112,3 +112,51 @@ function requireValet() {
 }
 
 module.exports.requireValet = requireValet;
+
+/**
+ * "You are the customer this ORDER belongs to."
+ *
+ * For routes that name an order rather than a person — tipping, and minting a
+ * payment intent. Both move money on a saved card, and both took the orderId
+ * alone: order ids are handed out with the order documents themselves, so a
+ * stranger holding one could tip a valet off somebody else's card, or mint a
+ * payment intent against their booking.
+ *
+ * @param {(req) => string|undefined} pickOrderId
+ */
+function requireOrderOwner(pickOrderId = (req) => req.params?.orderId || req.body?.orderId) {
+    return async function (req, res, next) {
+        try {
+            const orderId = pickOrderId(req);
+            if (!orderId) {
+                return res.status(400).json({ success: false, message: 'orderId is required' });
+            }
+
+            const uid = await callerFirebaseUid(req);
+            if (!uid) {
+                return res.status(401).json({ success: false, message: 'Sign in again to continue.' });
+            }
+
+            const Order = require('../models/Order');
+            const order = await Order.findById(orderId).select('customer').lean();
+            // Same answer for "no such order" and "not your order", so this
+            // cannot be used to find out which order ids are real.
+            if (!order) {
+                return res.status(403).json({ success: false, message: 'That is not your order.' });
+            }
+
+            const owner = await User.findById(order.customer).select('firebaseUid').lean();
+            if (!owner || !owner.firebaseUid || owner.firebaseUid !== uid) {
+                return res.status(403).json({ success: false, message: 'That is not your order.' });
+            }
+
+            req.callerUserId = String(owner._id);
+            return next();
+        } catch (err) {
+            console.error('requireOrderOwner failed:', err.message);
+            return res.status(500).json({ success: false, message: 'Could not verify your account.' });
+        }
+    };
+}
+
+module.exports.requireOrderOwner = requireOrderOwner;
