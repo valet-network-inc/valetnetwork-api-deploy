@@ -1047,6 +1047,20 @@ exports.getPendingOrders = async (req, res) => {
         // stated time is a job for now.
         const { DISPATCH_LEAD_MS } = require('../services/scheduledDispatch');
         const dispatchHorizon = new Date(Date.now() + DISPATCH_LEAD_MS);
+
+        // Ops can pull one booking forward into the feed ahead of its window —
+        // a valet who wants to take a later job now, while he is between two
+        // others. Named by id in DISPATCH_EARLY_ORDER_IDS (comma-separated)
+        // rather than by a flag on the order, so the booking itself is never
+        // edited, nothing about its time changes, and the release is undone by
+        // clearing the variable. Still pending-and-paid only: this widens the
+        // window, it does not open the feed to anything the gate above keeps
+        // out for other reasons.
+        const earlyIds = (process.env.DISPATCH_EARLY_ORDER_IDS || '')
+            .split(',')
+            .map((s) => s.trim())
+            .filter((s) => /^[a-f0-9]{24}$/i.test(s));
+
         const orders = await Order.find({
             status: 'pending',
             paymentStatus: 'paid',
@@ -1054,6 +1068,7 @@ exports.getPendingOrders = async (req, res) => {
                 { pickUpTime: { $lte: dispatchHorizon } },
                 { pickUpTime: { $exists: false } },
                 { pickUpTime: null },
+                ...(earlyIds.length ? [{ _id: { $in: earlyIds } }] : []),
             ],
         });
 

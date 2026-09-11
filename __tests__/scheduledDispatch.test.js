@@ -245,6 +245,43 @@ describe('the valet feed stops at the dispatch horizon', () => {
         const now = await booking(new Date());
         expect(await feed()).toContain(String(now._id));
     });
+
+    describe('pulled forward by ops (DISPATCH_EARLY_ORDER_IDS)', () => {
+        afterEach(() => { delete process.env.DISPATCH_EARLY_ORDER_IDS; });
+
+        it('shows a named booking ahead of its window, without touching it', async () => {
+            const at = new Date(Date.now() + 100 * MIN);
+            const later = await booking(at);
+            const before = await Order.findById(later._id).lean();
+            process.env.DISPATCH_EARLY_ORDER_IDS = String(later._id);
+
+            expect(await feed()).toContain(String(later._id));
+
+            const after = await Order.findById(later._id).lean();
+            expect(after.pickUpTime.getTime()).toBe(at.getTime());
+            expect(after.updatedAt.getTime()).toBe(before.updatedAt.getTime());
+        });
+
+        it('releases only the ids it names', async () => {
+            const named = await booking(new Date(Date.now() + 100 * MIN));
+            const other = await booking(new Date(Date.now() + 100 * MIN));
+            process.env.DISPATCH_EARLY_ORDER_IDS = ` ${named._id} , not-an-id `;
+
+            const ids = await feed();
+            expect(ids).toContain(String(named._id));
+            expect(ids).not.toContain(String(other._id));
+        });
+
+        it('cannot release a booking that is not pending and paid', async () => {
+            const unpaid = await booking(new Date(Date.now() + 100 * MIN), { paymentStatus: 'pending' });
+            const taken = await booking(new Date(Date.now() + 100 * MIN), { status: 'accepted' });
+            process.env.DISPATCH_EARLY_ORDER_IDS = `${unpaid._id},${taken._id}`;
+
+            const ids = await feed();
+            expect(ids).not.toContain(String(unpaid._id));
+            expect(ids).not.toContain(String(taken._id));
+        });
+    });
 });
 
 describe('auto-cancel and advance bookings coexist', () => {
