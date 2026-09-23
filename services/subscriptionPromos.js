@@ -78,7 +78,34 @@ const PROMOS = {
         firstTimeOnly: true,
         active: true,
     },
+
+    // A week of Fixed garage instead of a month — the code to hand one
+    // customer who wants to try the daily park before paying $250 for it.
+    // Same plan, same card up front, same first-plan-only rule as LOLGARAGE;
+    // it just bills on day 7.
+    LMAOGARAGE: {
+        code: 'LMAOGARAGE',
+        kind: 'free_trial',
+        trialDays: 7,
+        // Every other code runs a month, and the server's own sentences
+        // used to say "free month" for all of them.
+        trialLabel: 'free week',
+        headline: 'First week free',
+        detail:
+            'Your first week of Fixed garage is on us — the street-cleaning moves and a free park and retrieval every day at your spot. Cancel any time before it ends and you are never charged.',
+        appliesTo: { tier: 'home_garage', interval: 'month' },
+        firstTimeOnly: true,
+        active: true,
+    },
 };
+
+// What to call a code's free stretch in a sentence: "free week" for
+// LMAOGARAGE, "free month" for the rest. Takes the promo or the code stamped
+// on a subscription.
+function trialLabel(promoOrCode) {
+    const promo = typeof promoOrCode === 'string' ? PROMOS[normalizeCode(promoOrCode)] : promoOrCode;
+    return (promo && promo.trialLabel) || 'free month';
+}
 
 // Codes are typed by hand on a phone. Inner spaces and dashes are the
 // customer's, not the code's — "hands free 2" and "HANDSFREE-2" are both
@@ -203,4 +230,5 @@ module.exports = {
     planMismatch,
     promoRedemptionBlock,
     describe,
+    trialLabel,
 };

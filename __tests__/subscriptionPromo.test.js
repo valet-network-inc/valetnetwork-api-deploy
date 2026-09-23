@@ -466,3 +466,70 @@ describe('LOLGARAGE', () => {
         expect(res.body.note).toMatch(/Fixed garage/);
     });
 });
+
+// ---------------------------------------------------------------------------
+// LMAOGARAGE — a week of Fixed garage instead of a month.
+// ---------------------------------------------------------------------------
+
+describe('LMAOGARAGE', () => {
+    it('is a free week that converts at $250, with a card taken up front', () => {
+        const promo = promos.findPromo('lmao garage');
+        expect(promo.code).toBe('LMAOGARAGE');
+        expect(promo.kind).toBe('free_trial');
+        expect(promo.trialDays).toBe(7);
+        expect(promo.headline).toBe('First week free');
+        const now = new Date('2026-09-23T16:00:00Z');
+        const shown = promos.describe(promo, { amountCents: 25000, interval: 'month', now });
+        expect(shown.dueTodayCents).toBe(0);
+        expect(shown.thenCents).toBe(25000);
+        expect(shown.trialEndsAt.toISOString()).toBe('2026-09-30T16:00:00.000Z');
+    });
+
+    it('covers Fixed garage monthly and nothing else', () => {
+        const promo = promos.findPromo('LMAOGARAGE');
+        expect(promos.planMismatch(promo, GARAGE_PLAN)).toBeNull();
+        expect(promos.planMismatch(promo, THE_PLAN)).toBe(
+            'LMAOGARAGE covers the Fixed garage plan at $250 a month.'
+        );
+    });
+
+    it('calls itself a free week, and leaves every other code a free month', () => {
+        expect(promos.trialLabel('LMAOGARAGE')).toBe('free week');
+        expect(promos.trialLabel(promos.findPromo('LMAOGARAGE'))).toBe('free week');
+        expect(promos.trialLabel('LOLGARAGE')).toBe('free month');
+        expect(promos.trialLabel('HANDSFREE')).toBe('free month');
+        expect(promos.trialLabel(undefined)).toBe('free month');
+    });
+
+    it('says "free week" when a customer cancels inside it', async () => {
+        const user = await makeCustomer();
+        await makeSub(user, {
+            tier: 'home_garage',
+            amountCents: 25000,
+            promoCode: 'LMAOGARAGE',
+            trialEndsAt: new Date(Date.now() + 3 * 24 * 60 * 60 * 1000),
+        });
+        const res = mockRes();
+        await subscriptionController.cancelSubscription({ body: { userId: user._id.toString() } }, res);
+        expect(res.statusCode).toBe(200);
+        expect(res.body.refund.requestedCents).toBe(0);
+        expect(res.body.message).toBe('Cancelled — your free week ends here and your card was never charged.');
+    });
+
+    it('says "free week" when it blocks a plan switch', async () => {
+        const user = await makeCustomer();
+        await makeSub(user, {
+            tier: 'home_garage',
+            amountCents: 25000,
+            promoCode: 'LMAOGARAGE',
+            trialEndsAt: new Date(Date.now() + 3 * 24 * 60 * 60 * 1000),
+        });
+        const res = mockRes();
+        await subscriptionController.changePlan(
+            { body: { userId: user._id.toString(), tier: 'valet_anywhere', interval: 'month' } },
+            res
+        );
+        expect(res.statusCode).toBe(400);
+        expect(res.body.message).toMatch(/^Your free week is running/);
+    });
+});

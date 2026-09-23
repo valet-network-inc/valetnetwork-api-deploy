@@ -35,6 +35,7 @@ const {
     planMismatch,
     promoRedemptionBlock,
     describe: describePromo,
+    trialLabel,
 } = require('../services/subscriptionPromos');
 const { nyClock } = require('../services/nyTime');
 
@@ -546,7 +547,7 @@ exports.createSubscription = async (req, res) => {
                 automatic_payment_methods: { enabled: true },
                 customer: stripeCustomerId,
                 setup_future_usage: 'off_session',
-                description: `${promo.code} — card check, refunded when your free month starts`,
+                description: `${promo.code} — card check, refunded when your ${trialLabel(promo)} starts`,
                 metadata: {
                     // The webhook keys off this: a card check must never fall
                     // through to the order/guest payment matchers.
@@ -852,7 +853,7 @@ exports.cancelSubscription = async (req, res) => {
                           2
                       )} we owe you back did not go through. Tap Help and we will send it.`
                     : inTrial
-                    ? 'Cancelled — your free month ends here and your card was never charged.'
+                    ? `Cancelled — your ${trialLabel(sub.promoCode)} ends here and your card was never charged.`
                     : 'Cancelled. You pay regular rates per park from now on.',
             usedCents,
             refund,
@@ -894,7 +895,7 @@ exports.changePlan = async (req, res) => {
             });
             return res.status(400).json({
                 success: false,
-                message: `Your free month is running — you can switch plans from ${when}.`,
+                message: `Your ${trialLabel(sub.promoCode)} is running — you can switch plans from ${when}.`,
             });
         }
 
