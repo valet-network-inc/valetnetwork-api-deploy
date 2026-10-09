@@ -245,7 +245,7 @@ describe('POST /api/subscription/quote', () => {
         expect(res.body.detail).toBe('This is your free park for today. Tap Park — nothing to pay.');
         expect(res.body.plan).toEqual({
             tier: 'home_garage',
-            name: 'Fixed garage',
+            name: 'Permanent valet',
             movesPerWeek: 2,
         });
     });

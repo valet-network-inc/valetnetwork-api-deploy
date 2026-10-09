@@ -10,6 +10,9 @@ const {
     updateSchedule,
     getPrefill,
     checkPromo,
+    quotePrice,
+    getNeighborhoodPrices,
+    movePreview,
 } = require('../controllers/subscriptionController');
 
 // Subscriptions v2 (Stripe Billing). The pre-v2 doorman-referral routes
@@ -19,6 +22,10 @@ const {
 
 router.get('/plans', getPlans);
 router.post('/promo', checkPromo);
+// The review card, priced by the server, and the sheet /pricing renders.
+// Both public: they price a plan, and say nothing about anyone's account.
+router.post('/price', quotePrice);
+router.get('/neighborhood-prices', getNeighborhoodPrices);
 router.post('/create', createSubscription);
 router.get('/status/:userId', getSubscriptionStatus);
 
@@ -37,6 +44,8 @@ router.get('/status/:userId', getSubscriptionStatus);
 router.post('/cancel', requireSelf((req) => req.body?.userId), cancelSubscription);
 router.post('/change', requireSelf((req) => req.body?.userId), changePlan);
 
+// What moving the fixed address would cost: it reads the caller's own price.
+router.post('/move-preview', requireSelf((req) => req.body?.userId), movePreview);
 router.put('/schedule', updateSchedule);
 router.get('/prefill/:userId', getPrefill);
 

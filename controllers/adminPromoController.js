@@ -46,7 +46,7 @@ exports.setPendingPromo = async (req, res) => {
             });
         }
 
-        const promo = findPromo(code);
+        const promo = await findPromo(code);
         if (!promo) {
             return res.status(400).json({ success: false, message: `No promo named ${code}` });
         }

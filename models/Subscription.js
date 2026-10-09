@@ -130,6 +130,68 @@ const SubscriptionSchema = new mongoose.Schema(
         homeAddressChangedAt: {
             type: Date,
         },
+        // Neighborhood pricing (2026-10-09). Set on every subscription sold at
+        // the new prices: a purchase, a waitlist start, a change into another
+        // tier. A doc WITHOUT it was sold before and is locked in — its price
+        // never changes, not on an address move and not on an interval change
+        // (services/planPricing.js isLocked).
+        pricing: {
+            model: { type: String }, // 'neighborhood_v1'
+            borough: { type: String },
+            neighborhood: { type: String },
+            // neighborhoodPricing.neighborhoodKey: the unlock row it belongs to.
+            neighborhoodKey: { type: String },
+            // What the customer sees: the neighborhood ("Chelsea", "Park Slope").
+            label: { type: String },
+            // The table's price at sale (or at the last address move).
+            listAmountCents: { type: Number },
+            // The table's monthly commission for that row, same moment.
+            commissionCents: { type: Number },
+            pricedAt: { type: Date },
+        },
+        // A new-price subscription that moved its fixed address to a
+        // different price pays the new one from the next bill. Stripe's item
+        // already carries the new price; amountCents follows when the renewal
+        // lands (subscriptionController applyPendingAmount).
+        pendingAmountCents: {
+            type: Number,
+        },
+        pendingAmountFrom: {
+            type: Date,
+        },
+        // The rep this subscription is credited to: it came through their
+        // invite, or the customer typed a code that carries them.
+        rep: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: 'Rep',
+        },
+        // The neighborhood's monthly commission at the moment of sale. Rep
+        // earnings read this, never the live table, so a later price edit
+        // does not change what a rep was promised.
+        repCommissionCents: {
+            type: Number,
+        },
+        // The neighborhood membership this plan came out of
+        // (models/UnlockMember.js): a waitlist start, an invite, or a
+        // subscriber who joined an unlocked neighborhood.
+        unlockMember: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: 'UnlockMember',
+        },
+        // The customer whose referral code brought this subscriber in. They
+        // earn $50 for each paid month, up to 12 (services/referrals.js).
+        referredBy: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: 'User',
+        },
+        referralCode: {
+            type: String,
+        },
+        // Set the one time this subscription's code was counted against the
+        // code's redemptions, so a replayed activation cannot count it twice.
+        promoRedemptionCountedAt: {
+            type: Date,
+        },
         // Every settled Stripe invoice, for the value indicator's "what you
         // paid" side. Usage lives on Order.coveredBySubscription.
         payments: [
@@ -147,6 +209,8 @@ const SubscriptionSchema = new mongoose.Schema(
 );
 
 SubscriptionSchema.index({ user: 1, status: 1 });
+SubscriptionSchema.index({ rep: 1 }, { sparse: true });
+SubscriptionSchema.index({ referredBy: 1 }, { sparse: true });
 
 // One live subscription per user, enforced by the database. Concurrent
 // purchases both pass the app-level check; the second activation hits this

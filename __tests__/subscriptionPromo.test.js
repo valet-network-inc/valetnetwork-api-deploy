@@ -96,19 +96,19 @@ const THE_PLAN = { tier: 'street_cleaning', interval: 'month', movesPerWeek: 1 }
 
 describe('HANDSFREE lookup', () => {
     it('is found however the customer types it', () => {
-        expect(promos.findPromo('HANDSFREE').code).toBe('HANDSFREE');
-        expect(promos.findPromo(' handsfree ').code).toBe('HANDSFREE');
-        expect(promos.findPromo('HandsFree').code).toBe('HANDSFREE');
+        expect(promos.findStaticPromo('HANDSFREE').code).toBe('HANDSFREE');
+        expect(promos.findStaticPromo(' handsfree ').code).toBe('HANDSFREE');
+        expect(promos.findStaticPromo('HandsFree').code).toBe('HANDSFREE');
     });
 
     it('rejects anything else', () => {
-        expect(promos.findPromo('HANDFREE')).toBeNull();
-        expect(promos.findPromo('')).toBeNull();
-        expect(promos.findPromo(undefined)).toBeNull();
+        expect(promos.findStaticPromo('HANDFREE')).toBeNull();
+        expect(promos.findStaticPromo('')).toBeNull();
+        expect(promos.findStaticPromo(undefined)).toBeNull();
     });
 
     it('is a trial, not a discount — a card is required', () => {
-        const promo = promos.findPromo('HANDSFREE');
+        const promo = promos.findStaticPromo('HANDSFREE');
         expect(promo.kind).toBe('free_trial');
         expect(promo.trialDays).toBe(30);
         const shown = promos.describe(promo, { amountCents: 5000, interval: 'month' });
@@ -120,11 +120,11 @@ describe('HANDSFREE lookup', () => {
 
 describe('which plan HANDSFREE covers', () => {
     it('covers the $50 monthly plan with one move a week', () => {
-        expect(promos.planMismatch(promos.findPromo('HANDSFREE'), THE_PLAN)).toBeNull();
+        expect(promos.planMismatch(promos.findStaticPromo('HANDSFREE'), THE_PLAN)).toBeNull();
     });
 
     it('turns down the two-move, the weekly and the bigger tiers', () => {
-        const promo = promos.findPromo('HANDSFREE');
+        const promo = promos.findStaticPromo('HANDSFREE');
         expect(promos.planMismatch(promo, { ...THE_PLAN, movesPerWeek: 2 })).toMatch(/\$50 a month/);
         expect(promos.planMismatch(promo, { ...THE_PLAN, interval: 'week' })).toMatch(/\$50 a month/);
         expect(promos.planMismatch(promo, { ...THE_PLAN, tier: 'valet_anywhere' })).toMatch(/\$50 a month/);
@@ -135,27 +135,27 @@ describe('which plan HANDSFREE covers', () => {
 describe('who may redeem it', () => {
     it('lets a customer with no history through', async () => {
         const user = await makeCustomer();
-        expect(await promos.promoRedemptionBlock(promos.findPromo('HANDSFREE'), user._id)).toBeNull();
+        expect(await promos.promoRedemptionBlock(promos.findStaticPromo('HANDSFREE'), user._id)).toBeNull();
     });
 
     it('turns away a customer who already used the code', async () => {
         const user = await makeCustomer();
         await makeSub(user, { status: 'cancelled', promoCode: 'HANDSFREE', activatedAt: new Date('2026-07-01') });
-        const blocked = await promos.promoRedemptionBlock(promos.findPromo('HANDSFREE'), user._id);
+        const blocked = await promos.promoRedemptionBlock(promos.findStaticPromo('HANDSFREE'), user._id);
         expect(blocked).toMatch(/already used/i);
     });
 
     it('turns away a customer whose plan has started before', async () => {
         const user = await makeCustomer();
         await makeSub(user, { status: 'cancelled', activatedAt: new Date('2026-06-01') });
-        const blocked = await promos.promoRedemptionBlock(promos.findPromo('HANDSFREE'), user._id);
+        const blocked = await promos.promoRedemptionBlock(promos.findStaticPromo('HANDSFREE'), user._id);
         expect(blocked).toMatch(/first plan/i);
     });
 
     it('ignores an abandoned purchase that never started', async () => {
         const user = await makeCustomer();
         await makeSub(user, { status: 'cancelled' }); // voided incomplete, never activated
-        expect(await promos.promoRedemptionBlock(promos.findPromo('HANDSFREE'), user._id)).toBeNull();
+        expect(await promos.promoRedemptionBlock(promos.findStaticPromo('HANDSFREE'), user._id)).toBeNull();
     });
 
     it('lets a customer who backed out of the payment sheet try again', async () => {
@@ -163,7 +163,7 @@ describe('who may redeem it', () => {
         // What abandoning the sheet leaves behind: the code is stamped on a
         // doc that never went live.
         await makeSub(user, { status: 'cancelled', promoCode: 'HANDSFREE' });
-        expect(await promos.promoRedemptionBlock(promos.findPromo('HANDSFREE'), user._id)).toBeNull();
+        expect(await promos.promoRedemptionBlock(promos.findStaticPromo('HANDSFREE'), user._id)).toBeNull();
     });
 });
 
@@ -305,21 +305,21 @@ const TWO_MOVE_PLAN = { tier: 'street_cleaning', interval: 'month', movesPerWeek
 
 describe('HANDSFREE2', () => {
     it('is found however the customer types it', () => {
-        expect(promos.findPromo('HANDSFREE2').code).toBe('HANDSFREE2');
-        expect(promos.findPromo(' handsfree2 ').code).toBe('HANDSFREE2');
+        expect(promos.findStaticPromo('HANDSFREE2').code).toBe('HANDSFREE2');
+        expect(promos.findStaticPromo(' handsfree2 ').code).toBe('HANDSFREE2');
         // What people actually type when they hear it out loud.
-        expect(promos.findPromo('hands free 2').code).toBe('HANDSFREE2');
-        expect(promos.findPromo('HANDSFREE-2').code).toBe('HANDSFREE2');
+        expect(promos.findStaticPromo('hands free 2').code).toBe('HANDSFREE2');
+        expect(promos.findStaticPromo('HANDSFREE-2').code).toBe('HANDSFREE2');
     });
 
     it('does not swallow the one-move code, and the one-move code does not swallow it', () => {
-        expect(promos.findPromo('HANDSFREE').code).toBe('HANDSFREE');
-        expect(promos.findPromo('HANDSFREE2').appliesTo.movesPerWeek).toBe(2);
-        expect(promos.findPromo('HANDSFREE').appliesTo.movesPerWeek).toBe(1);
+        expect(promos.findStaticPromo('HANDSFREE').code).toBe('HANDSFREE');
+        expect(promos.findStaticPromo('HANDSFREE2').appliesTo.movesPerWeek).toBe(2);
+        expect(promos.findStaticPromo('HANDSFREE').appliesTo.movesPerWeek).toBe(1);
     });
 
     it('is a trial that converts to $100, not $50', () => {
-        const promo = promos.findPromo('HANDSFREE2');
+        const promo = promos.findStaticPromo('HANDSFREE2');
         expect(promo.kind).toBe('free_trial');
         expect(promo.trialDays).toBe(30);
         const shown = promos.describe(promo, { amountCents: 10000, interval: 'month' });
@@ -329,7 +329,7 @@ describe('HANDSFREE2', () => {
     });
 
     it('covers the two-move monthly plan and nothing else', () => {
-        const promo = promos.findPromo('HANDSFREE2');
+        const promo = promos.findStaticPromo('HANDSFREE2');
         expect(promos.planMismatch(promo, TWO_MOVE_PLAN)).toBeNull();
         expect(promos.planMismatch(promo, { ...TWO_MOVE_PLAN, movesPerWeek: 1 })).toMatch(/\$100 a month/);
         expect(promos.planMismatch(promo, { ...TWO_MOVE_PLAN, interval: 'week' })).toMatch(/\$100 a month/);
@@ -339,15 +339,15 @@ describe('HANDSFREE2', () => {
     it('tells the customer how many moves the code is for', () => {
         // The sentence used to be written for HANDSFREE alone and said "one
         // move a week" whichever code produced it.
-        expect(promos.planMismatch(promos.findPromo('HANDSFREE2'), THE_PLAN)).toMatch(/two moves a week/);
-        expect(promos.planMismatch(promos.findPromo('HANDSFREE'), TWO_MOVE_PLAN)).toMatch(/one move a week/);
+        expect(promos.planMismatch(promos.findStaticPromo('HANDSFREE2'), THE_PLAN)).toMatch(/two moves a week/);
+        expect(promos.planMismatch(promos.findStaticPromo('HANDSFREE'), TWO_MOVE_PLAN)).toMatch(/one move a week/);
     });
 
     it('is still one free month per customer', async () => {
         const user = await makeCustomer();
-        expect(await promos.promoRedemptionBlock(promos.findPromo('HANDSFREE2'), user._id)).toBeNull();
+        expect(await promos.promoRedemptionBlock(promos.findStaticPromo('HANDSFREE2'), user._id)).toBeNull();
         await makeSub(user, { status: 'cancelled', activatedAt: new Date('2026-07-01') });
-        expect(await promos.promoRedemptionBlock(promos.findPromo('HANDSFREE2'), user._id)).toMatch(/first plan/i);
+        expect(await promos.promoRedemptionBlock(promos.findStaticPromo('HANDSFREE2'), user._id)).toMatch(/first plan/i);
     });
 
     it('snaps a customer who picked one move onto the two-move plan, priced at $100', async () => {
@@ -385,7 +385,7 @@ describe('HANDSFREE2', () => {
 });
 
 // ---------------------------------------------------------------------------
-// LOLGARAGE — the Fixed garage free month. One code, no cap on how many
+// LOLGARAGE — the Permanent valet free month. One code, no cap on how many
 // customers redeem it; the only limit is one free month per customer.
 // ---------------------------------------------------------------------------
 
@@ -393,13 +393,13 @@ const GARAGE_PLAN = { tier: 'home_garage', interval: 'month' };
 
 describe('LOLGARAGE', () => {
     it('is found however the customer types it', () => {
-        expect(promos.findPromo('lolgarage').code).toBe('LOLGARAGE');
-        expect(promos.findPromo('LOL-GARAGE').code).toBe('LOLGARAGE');
-        expect(promos.findPromo('lol garage ').code).toBe('LOLGARAGE');
+        expect(promos.findStaticPromo('lolgarage').code).toBe('LOLGARAGE');
+        expect(promos.findStaticPromo('LOL-GARAGE').code).toBe('LOLGARAGE');
+        expect(promos.findStaticPromo('lol garage ').code).toBe('LOLGARAGE');
     });
 
     it('is a free month that converts at $250, with a card taken up front', () => {
-        const promo = promos.findPromo('LOLGARAGE');
+        const promo = promos.findStaticPromo('LOLGARAGE');
         expect(promo.kind).toBe('free_trial');
         expect(promo.trialDays).toBe(30);
         const shown = promos.describe(promo, { amountCents: 25000, interval: 'month' });
@@ -408,16 +408,17 @@ describe('LOLGARAGE', () => {
         expect(shown.requiresCard).toBe(true);
     });
 
-    it('covers Fixed garage monthly and nothing else', () => {
-        const promo = promos.findPromo('LOLGARAGE');
+    it('covers Permanent valet monthly and nothing else', () => {
+        const promo = promos.findStaticPromo('LOLGARAGE');
         expect(promos.planMismatch(promo, GARAGE_PLAN)).toBeNull();
-        // Fixed garage is not bought by the move, so the sentence must not
-        // invent a weekly cadence for it.
+        // Permanent valet is not bought by the move, so the sentence must not
+        // invent a weekly cadence for it — and it is priced by its address
+        // (2026-10-09), so the sentence names no one price either.
         expect(promos.planMismatch(promo, THE_PLAN)).toBe(
-            'LOLGARAGE covers the Fixed garage plan at $250 a month.'
+            'LOLGARAGE covers the Permanent valet plan, billed by the month.'
         );
         expect(promos.planMismatch(promo, { ...GARAGE_PLAN, tier: 'valet_anywhere' })).toMatch(
-            /\$250 a month/
+            /billed by the month/
         );
     });
 
@@ -430,50 +431,52 @@ describe('LOLGARAGE', () => {
             activatedAt: new Date('2026-08-01'),
         });
         const second = await makeCustomer();
-        expect(await promos.promoRedemptionBlock(promos.findPromo('LOLGARAGE'), second._id)).toBeNull();
+        expect(await promos.promoRedemptionBlock(promos.findStaticPromo('LOLGARAGE'), second._id)).toBeNull();
     });
 
     it('is one free month per customer, and says which limit they hit', async () => {
         const user = await makeCustomer();
-        expect(await promos.promoRedemptionBlock(promos.findPromo('LOLGARAGE'), user._id)).toBeNull();
+        expect(await promos.promoRedemptionBlock(promos.findStaticPromo('LOLGARAGE'), user._id)).toBeNull();
         await makeSub(user, {
             tier: 'home_garage',
             amountCents: 25000,
             promoCode: 'LOLGARAGE',
             activatedAt: new Date('2026-08-01'),
         });
-        expect(await promos.promoRedemptionBlock(promos.findPromo('LOLGARAGE'), user._id)).toMatch(
+        expect(await promos.promoRedemptionBlock(promos.findStaticPromo('LOLGARAGE'), user._id)).toMatch(
             /already used LOLGARAGE/
         );
     });
 
-    it('quotes $250 with nothing to fix when the customer is already on the plan', async () => {
+    // A shipped app sends no address, and /plans showed it the Brooklyn and
+    // Queens price, so that is the price the code converts at here.
+    it('quotes the /plans price with nothing to fix when the customer is already on the plan', async () => {
         const res = mockRes();
         await subscriptionController.checkPromo({ body: { code: 'lolgarage', ...GARAGE_PLAN } }, res);
         expect(res.statusCode).toBe(200);
         expect(res.body.note).toBeNull();
-        expect(res.body.amountCents).toBe(25000);
+        expect(res.body.amountCents).toBe(30000);
         expect(res.body.promo.dueTodayCents).toBe(0);
-        expect(res.body.promo.thenCents).toBe(25000);
+        expect(res.body.promo.thenCents).toBe(30000);
     });
 
-    it('snaps a customer who came in on the street-cleaning plan onto Fixed garage', async () => {
+    it('snaps a customer who came in on the street-cleaning plan onto Permanent valet', async () => {
         const res = mockRes();
         await subscriptionController.checkPromo({ body: { code: 'LOLGARAGE', ...THE_PLAN } }, res);
         expect(res.statusCode).toBe(200);
         expect(res.body.applyTo).toMatchObject(GARAGE_PLAN);
-        expect(res.body.amountCents).toBe(25000);
-        expect(res.body.note).toMatch(/Fixed garage/);
+        expect(res.body.amountCents).toBe(30000);
+        expect(res.body.note).toMatch(/Permanent valet/);
     });
 });
 
 // ---------------------------------------------------------------------------
-// LMAOGARAGE — a week of Fixed garage instead of a month.
+// LMAOGARAGE — a week of Permanent valet instead of a month.
 // ---------------------------------------------------------------------------
 
 describe('LMAOGARAGE', () => {
     it('is a free week that converts at $250, with a card taken up front', () => {
-        const promo = promos.findPromo('lmao garage');
+        const promo = promos.findStaticPromo('lmao garage');
         expect(promo.code).toBe('LMAOGARAGE');
         expect(promo.kind).toBe('free_trial');
         expect(promo.trialDays).toBe(7);
@@ -485,17 +488,17 @@ describe('LMAOGARAGE', () => {
         expect(shown.trialEndsAt.toISOString()).toBe('2026-09-30T16:00:00.000Z');
     });
 
-    it('covers Fixed garage monthly and nothing else', () => {
-        const promo = promos.findPromo('LMAOGARAGE');
+    it('covers Permanent valet monthly and nothing else', () => {
+        const promo = promos.findStaticPromo('LMAOGARAGE');
         expect(promos.planMismatch(promo, GARAGE_PLAN)).toBeNull();
         expect(promos.planMismatch(promo, THE_PLAN)).toBe(
-            'LMAOGARAGE covers the Fixed garage plan at $250 a month.'
+            'LMAOGARAGE covers the Permanent valet plan, billed by the month.'
         );
     });
 
     it('calls itself a free week, and leaves every other code a free month', () => {
         expect(promos.trialLabel('LMAOGARAGE')).toBe('free week');
-        expect(promos.trialLabel(promos.findPromo('LMAOGARAGE'))).toBe('free week');
+        expect(promos.trialLabel(promos.findStaticPromo('LMAOGARAGE'))).toBe('free week');
         expect(promos.trialLabel('LOLGARAGE')).toBe('free month');
         expect(promos.trialLabel('HANDSFREE')).toBe('free month');
         expect(promos.trialLabel(undefined)).toBe('free month');

@@ -23,9 +23,11 @@ const Subscription = require('../models/Subscription');
 const { adoptFromSubscription } = require('../services/cleaningSchedule');
 const User = require('../models/User');
 const Order = require('../models/Order');
-const stripeModule = require('stripe');
-const stripe = process.env.STRIPE_API_KEY ? stripeModule(process.env.STRIPE_API_KEY) : null;
-const { PLANS, getPlan, priceFor } = require('../services/subscriptionPlans');
+// Stripe through the shared client so tests can hand it a stub
+// (services/stripeClient.js). Null when STRIPE_API_KEY is unset, as before.
+const stripeClient = require('../services/stripeClient');
+const stripe = () => stripeClient.get();
+const { PLANS, OFF_SALE_MESSAGE } = require('../services/subscriptionPlans');
 const {
     isEntitled,
     buildStatusPayload,
@@ -33,10 +35,36 @@ const {
 const {
     findPromo,
     planMismatch,
+    applyToFor,
     promoRedemptionBlock,
     describe: describePromo,
     trialLabel,
+    isDiscount,
+    discountRefusal,
+    ensureStripeCoupon,
+    countRedemption,
 } = require('../services/subscriptionPromos');
+const {
+    getTable,
+    areaFor,
+    basePrice,
+    lowestMonthlyCents,
+    weeklyFromMonthly,
+    publicPrices,
+    contactSalesOf,
+    NOT_OFFERED_MESSAGE,
+} = require('../services/neighborhoodPricing');
+const {
+    hasPoint,
+    dollars,
+    isLocked,
+    quotePlan,
+    priceSentence,
+    checkExpectedAmount,
+    resolveStripePrice,
+    pricingSnapshot,
+} = require('../services/planPricing');
+const { buildPriceQuote, shortDate, perUnit } = require('../services/priceQuote');
 const { nyClock } = require('../services/nyTime');
 
 // A free month needs a card behind it, and an app build that can only open a
@@ -49,19 +77,8 @@ const TRIAL_CARD_CHECK_CENTS = 100;
 // mobile PaymentSheet's saved-card listing breaks on a mismatch.
 const EPHEMERAL_KEY_API_VERSION = '2024-06-20';
 
-// Resolved lookup_key → Stripe price id, cached for the process lifetime
-// (prices are immutable; a catalog change redeploys anyway).
-const priceIdCache = new Map();
-
-async function resolvePriceId(lookupKey) {
-    if (priceIdCache.has(lookupKey)) return priceIdCache.get(lookupKey);
-    const prices = await stripe.prices.list({ lookup_keys: [lookupKey], limit: 1 });
-    if (!prices.data.length || !prices.data[0].active) {
-        throw new Error(`Stripe price not found for lookup key ${lookupKey}`);
-    }
-    priceIdCache.set(lookupKey, prices.data[0].id);
-    return prices.data[0].id;
-}
+// Stripe price ids (catalog lookup keys, and Permanent valet amounts minted on
+// demand) are resolved in services/subscriptionPrices.js.
 
 function validateAspSchedule(aspSchedule) {
     if (!aspSchedule || typeof aspSchedule !== 'object') return 'aspSchedule is required';
@@ -96,14 +113,14 @@ function validateAddress(addr, label) {
 async function ensureStripeCustomer(user) {
     if (user.stripeCustomerId) {
         try {
-            const existing = await stripe.customers.retrieve(user.stripeCustomerId);
+            const existing = await stripe().customers.retrieve(user.stripeCustomerId);
             if (!existing.deleted) return user.stripeCustomerId;
         } catch (err) {
             // Stale id (test→live switch etc.) — fall through and recreate.
             console.log('Stripe customer', user.stripeCustomerId, 'not retrievable, recreating');
         }
     }
-    const created = await stripe.customers.create({
+    const created = await stripe().customers.create({
         metadata: { userId: user._id.toString(), phone: user.phone || '' },
         name: [user.firstName, user.lastName].filter(Boolean).join(' ') || undefined,
         phone: user.phone || undefined,
@@ -117,10 +134,10 @@ async function ensureStripeCustomer(user) {
 // start a free trial without seeing a payment sheet at all.
 async function savedPaymentMethodId(stripeCustomerId) {
     try {
-        const customer = await stripe.customers.retrieve(stripeCustomerId);
+        const customer = await stripe().customers.retrieve(stripeCustomerId);
         const preferred = customer && customer.invoice_settings && customer.invoice_settings.default_payment_method;
         if (preferred) return typeof preferred === 'string' ? preferred : preferred.id;
-        const cards = await stripe.paymentMethods.list({
+        const cards = await stripe().paymentMethods.list({
             customer: stripeCustomerId,
             type: 'card',
             limit: 1,
@@ -137,7 +154,7 @@ async function savedPaymentMethodId(stripeCustomerId) {
 // it the subscription's card so the first real invoice has something to
 // charge. Returns true once the plan has a card behind it.
 async function ensureTrialPaymentMethod(stripeSub, { sub = null, allowSavedCard = false } = {}) {
-    if (!stripe || !stripeSub) return false;
+    if (!stripe() || !stripeSub) return false;
     if (stripeSub.default_payment_method) return true;
     let pmId = null;
     const psi = stripeSub.pending_setup_intent;
@@ -147,7 +164,7 @@ async function ensureTrialPaymentMethod(stripeSub, { sub = null, allowSavedCard 
     // The dollar card check: its card is the one the customer just entered.
     if (!pmId && sub && sub.trialDepositPaymentIntentId) {
         try {
-            const deposit = await stripe.paymentIntents.retrieve(sub.trialDepositPaymentIntentId);
+            const deposit = await stripe().paymentIntents.retrieve(sub.trialDepositPaymentIntentId);
             if (deposit.status === 'succeeded' && deposit.payment_method) {
                 pmId =
                     typeof deposit.payment_method === 'string'
@@ -171,7 +188,7 @@ async function ensureTrialPaymentMethod(stripeSub, { sub = null, allowSavedCard 
     }
     if (!pmId) return false;
     try {
-        await stripe.subscriptions.update(stripeSub.id, { default_payment_method: pmId });
+        await stripe().subscriptions.update(stripeSub.id, { default_payment_method: pmId });
         stripeSub.default_payment_method = pmId;
         return true;
     } catch (err) {
@@ -184,9 +201,9 @@ async function ensureTrialPaymentMethod(stripeSub, { sub = null, allowSavedCard 
 // effort by design: a refund that fails must never stop the plan from
 // starting, and the next status call tries again.
 async function refundTrialDeposit(sub) {
-    if (!stripe || !sub || !sub.trialDepositPaymentIntentId || sub.trialDepositRefundedAt) return;
+    if (!stripe() || !sub || !sub.trialDepositPaymentIntentId || sub.trialDepositRefundedAt) return;
     try {
-        await stripe.refunds.create({ payment_intent: sub.trialDepositPaymentIntentId });
+        await stripe().refunds.create({ payment_intent: sub.trialDepositPaymentIntentId });
         sub.trialDepositRefundedAt = new Date();
         await sub.save();
         console.log(`Refunded trial card check for subscription ${sub._id}`);
@@ -201,15 +218,20 @@ async function refundTrialDeposit(sub) {
     }
 }
 
-// POST /api/subscription/promo  { code, tier, interval, movesPerWeek?, userId? }
+// POST /api/subscription/promo  { code, tier, interval, movesPerWeek?, userId?, homeAddress? }
 //
 // What a code does, before the customer commits to it. The purchase itself
 // re-checks everything — this exists so the review screen can say "free until
 // September 19, then $50 a month" instead of taking the code on faith.
+//
+// Clients built for neighborhood pricing ask POST /price instead, which
+// answers with the whole review card. This stays for the builds already
+// shipped; they send no homeAddress, and get the Brooklyn/Queens price for
+// Permanent valet — the same number /plans showed them.
 exports.checkPromo = async (req, res) => {
-    const { code, tier, interval, movesPerWeek, userId } = req.body || {};
+    const { code, tier, interval, movesPerWeek, userId, homeAddress } = req.body || {};
     try {
-        const promo = findPromo(code);
+        const promo = await findPromo(code);
         if (!promo) {
             return res.status(400).json({ success: false, message: 'That code is not valid.' });
         }
@@ -220,21 +242,23 @@ exports.checkPromo = async (req, res) => {
 
         // A code locked to one plan snaps the customer onto that plan rather
         // than turning them away at the last screen.
-        const applyTo = promo.appliesTo
-            ? {
-                  tier: promo.appliesTo.tier,
-                  interval: promo.appliesTo.interval,
-                  movesPerWeek: promo.appliesTo.movesPerWeek,
-              }
-            : null;
+        const applyTo = applyToFor(promo, { tier, interval, movesPerWeek });
         const mismatch = planMismatch(promo, { tier, interval, movesPerWeek });
         const target = applyTo || { tier, interval, movesPerWeek };
-        const price = priceFor(target.tier, target.interval);
-        const plan = getPlan(target.tier);
-        if (!price || !plan) {
-            return res.status(400).json({ success: false, message: 'Unknown tier or interval' });
+        const table = await getTable();
+        const quote = quotePlan(table, { ...target, homeAddress: hasPoint(homeAddress) ? homeAddress : null });
+        let amountCents;
+        if (!quote.error) {
+            amountCents = quote.amountCents;
+        } else if (quote.code === 'ADDRESS_REQUIRED') {
+            amountCents = basePrice(table, target.interval);
+        } else {
+            return res.status(400).json({ success: false, code: quote.code, message: quote.error });
         }
-        const amountCents = price.amountCents * (plan.perMove ? target.movesPerWeek || 1 : 1);
+        const refusal = discountRefusal(promo, amountCents);
+        if (refusal) {
+            return res.status(400).json({ success: false, message: refusal });
+        }
 
         res.status(200).json({
             success: true,
@@ -249,61 +273,113 @@ exports.checkPromo = async (req, res) => {
     }
 };
 
-// GET /api/subscription/plans
-exports.getPlans = async (req, res) => {
-    const plans = Object.values(PLANS)
-        .sort((a, b) => a.rank - b.rank)
-        .map((p) => ({
-            tier: p.tier,
-            name: p.name,
-            blurb: p.blurb,
-            features: p.features,
-            // Per-move plans are bought with quantity = moves/week (1-2);
-            // amounts here are PER MOVE for those.
-            perMove: !!p.perMove,
-            weekly: { amountCents: p.weekly.amountCents },
-            monthly: { amountCents: p.monthly.amountCents },
-            // $30/wk ≈ $130/mo vs $100/mo — same ratio on every tier.
-            monthlySavesPct: 23,
-        }));
-    res.status(200).json({
-        success: true,
-        plans,
-        cancelPolicy:
-            'Cancel anytime — you are refunded for services not rendered, priced at regular per-park rates.',
-    });
+// POST /api/subscription/price
+// { tier, interval, movesPerWeek?, address?, promoCode?, userId? }
+//
+// The review card, priced by the server (services/priceQuote.js). Public: it
+// prices a plan and reads a code, and says nothing about anybody's account
+// beyond whether a first-plan-only code is still theirs to use.
+exports.quotePrice = async (req, res) => {
+    try {
+        const b = req.body || {};
+        const { status, body } = await buildPriceQuote({
+            tier: b.tier,
+            interval: b.interval,
+            movesPerWeek: b.movesPerWeek,
+            address: b.address || b.homeAddress,
+            promoCode: b.promoCode,
+            userId: b.userId,
+        });
+        res.status(status).json(body);
+    } catch (err) {
+        console.error('quotePrice error:', err);
+        res.status(500).json({ success: false, message: 'Could not price that plan', error: err.message });
+    }
 };
 
-// Resolve the Stripe item config + local amount for a plan choice.
-// street_cleaning is priced per weekly move (quantity 1-2); other tiers are
-// flat (quantity 1).
-async function resolvePlanPurchase(tier, interval, movesPerWeek) {
-    const plan = getPlan(tier);
-    const price = priceFor(tier, interval);
-    if (!plan || !price) return null;
-    const quantity = plan.perMove ? (movesPerWeek === 1 ? 1 : 2) : 1;
-    const priceId = await resolvePriceId(price.lookupKey);
-    return {
-        plan,
-        quantity,
-        priceId,
-        amountCents: price.amountCents * quantity,
-        movesPerWeek: plan.perMove ? quantity : 2,
-    };
+// GET /api/subscription/neighborhood-prices — the sheet valetnetwork.co/pricing renders.
+exports.getNeighborhoodPrices = async (req, res) => {
+    try {
+        const table = await getTable();
+        res.status(200).json({ success: true, ...publicPrices(table) });
+    } catch (err) {
+        console.error('getNeighborhoodPrices error:', err);
+        res.status(500).json({ success: false, message: 'Could not load prices', error: err.message });
+    }
+};
+
+// GET /api/subscription/plans
+//
+// Permanent valet is priced by its address, so its amounts here are the
+// Brooklyn/Queens price — exactly what an app built before neighborhood
+// pricing shows, and right for every customer in those two boroughs — plus
+// `fromAmountCents`, the cheapest price anywhere, for the "From $300" label.
+// Valet anywhere is no longer sold and is left out.
+exports.getPlans = async (req, res) => {
+    try {
+        const table = await getTable();
+        const fromMonthly = lowestMonthlyCents(table);
+        const fromWeekly = weeklyFromMonthly(fromMonthly, table);
+        const plans = Object.values(PLANS)
+            .filter((p) => p.onSale !== false)
+            .sort((a, b) => a.rank - b.rank)
+            .map((p) => ({
+                tier: p.tier,
+                name: p.name,
+                blurb: p.blurb,
+                features: p.features,
+                // Per-move plans are bought with quantity = moves/week (1-2);
+                // amounts here are PER MOVE for those.
+                perMove: !!p.perMove,
+                pricedByAddress: !!p.pricedByAddress,
+                weekly: p.pricedByAddress
+                    ? { amountCents: basePrice(table, 'week'), fromAmountCents: fromWeekly }
+                    : { amountCents: p.weekly.amountCents },
+                monthly: p.pricedByAddress
+                    ? { amountCents: basePrice(table, 'month'), fromAmountCents: fromMonthly }
+                    : { amountCents: p.monthly.amountCents },
+                ...(p.pricedByAddress ? { fromAmountCents: fromMonthly } : {}),
+                // $30/wk ≈ $130/mo vs $100/mo — same ratio on every tier.
+                monthlySavesPct: 23,
+            }));
+        res.status(200).json({
+            success: true,
+            plans,
+            cancelPolicy:
+                'Cancel anytime — you are refunded for services not rendered, priced at regular per-park rates.',
+            contactSales: contactSalesOf(table),
+            neighborhoodPricing: true,
+        });
+    } catch (err) {
+        console.error('getPlans error:', err);
+        res.status(500).json({ success: false, message: 'Could not load plans', error: err.message });
+    }
+};
+
+// A plan choice priced and matched to its Stripe price. street_cleaning is
+// priced per weekly move (quantity 1-2); other tiers are flat (quantity 1).
+// Permanent valet is priced at its address from the live table, unless `legacy`
+// says this is a locked subscription keeping its old catalog price.
+async function resolvePlanPurchase(table, choice) {
+    const quote = quotePlan(table, choice);
+    if (quote.error) return quote;
+    return { ...quote, priceId: await resolveStripePrice(quote) };
 }
 
 // POST /api/subscription/create
-// { userId, tier, interval, movesPerWeek?, aspSchedule, homeAddress?, promoCode? }
+// { userId, tier, interval, movesPerWeek?, aspSchedule, homeAddress?, promoCode?, expectedAmountCents? }
 exports.createSubscription = async (req, res) => {
     let {
         userId, tier, interval, aspSchedule, homeAddress, promoCode, movesPerWeek,
         // Newer app builds can present a payment sheet in setup mode, which
         // is what a $0-today trial needs to take a card.
         supportsSetupIntent,
+        // The recurring amount the client showed (planPricing.checkExpectedAmount).
+        expectedAmountCents,
     } = req.body;
 
     try {
-        if (!stripe) {
+        if (!stripe()) {
             return res.status(503).json({
                 success: false,
                 message: 'Stripe API key not configured. Payment service unavailable.',
@@ -312,10 +388,31 @@ exports.createSubscription = async (req, res) => {
         if (!userId || !tier || !interval) {
             return res.status(400).json({ success: false, message: 'userId, tier and interval are required' });
         }
-        const purchase = await resolvePlanPurchase(tier, interval, movesPerWeek);
-        if (!purchase) {
-            return res.status(400).json({ success: false, message: 'Unknown tier or interval' });
+        // Valet anywhere is no longer sold (Rishi, 2026-10-09). Its current
+        // subscribers keep it; nobody new can buy it.
+        if (tier === 'valet_anywhere') {
+            return res.status(400).json({ success: false, code: 'NOT_ON_SALE', message: OFF_SALE_MESSAGE });
         }
+        // Permanent valet is priced by its address, so the address is checked
+        // before anything is priced.
+        if (tier === 'home_garage') {
+            const homeError = validateAddress(homeAddress, 'homeAddress');
+            if (homeError) return res.status(400).json({ success: false, message: homeError });
+        }
+        const table = await getTable();
+        const quote = quotePlan(table, {
+            tier,
+            interval,
+            movesPerWeek,
+            homeAddress: tier === 'home_garage' ? homeAddress : null,
+        });
+        if (quote.error) {
+            return res.status(quote.status).json({ success: false, code: quote.code, message: quote.error });
+        }
+        // Never charge a number the customer was not shown.
+        const priceGuard = checkExpectedAmount(table, quote, expectedAmountCents);
+        if (priceGuard) return res.status(priceGuard.status).json(priceGuard.body);
+        const purchase = { ...quote, priceId: await resolveStripePrice(quote) };
 
         // A sweep schedule is only asked for on the plan that is sold by the
         // move, where the customer's own days are what the auto-booker runs on.
@@ -362,10 +459,7 @@ exports.createSubscription = async (req, res) => {
         // valet_anywhere buyer today sends an address they never chose and we
         // stored it. Drop it rather than 400 — a shipped client must never be
         // rejected for a field it was always going to send.
-        if (tier === 'home_garage') {
-            const homeError = validateAddress(homeAddress, 'homeAddress');
-            if (homeError) return res.status(400).json({ success: false, message: homeError });
-        } else if (homeAddress) {
+        if (tier !== 'home_garage' && homeAddress) {
             homeAddress = undefined;
         }
 
@@ -391,7 +485,7 @@ exports.createSubscription = async (req, res) => {
         for (const old of abandoned) {
             if (old.stripeSubscriptionId) {
                 try {
-                    await stripe.subscriptions.cancel(old.stripeSubscriptionId);
+                    await stripe().subscriptions.cancel(old.stripeSubscriptionId);
                 } catch (err) {
                     // Already canceled/expired on Stripe's side — fine.
                 }
@@ -422,7 +516,7 @@ exports.createSubscription = async (req, res) => {
         const accountCode = typedCode ? '' : String(user.pendingPromoCode || '').trim();
         const codeToApply = typedCode || accountCode;
         if (codeToApply) {
-            const candidate = findPromo(codeToApply);
+            const candidate = await findPromo(codeToApply);
             const mismatch = candidate
                 ? planMismatch(candidate, {
                       tier,
@@ -432,11 +526,16 @@ exports.createSubscription = async (req, res) => {
                 : null;
             const blocked =
                 candidate && !mismatch ? await promoRedemptionBlock(candidate, user._id) : null;
+            // A percent or dollar code that would leave the first bill under
+            // a dollar is refused: a free first period has to be a trial.
+            const unusable =
+                candidate && !mismatch && !blocked ? discountRefusal(candidate, purchase.amountCents) : null;
 
             let failure = null;
             if (!candidate) failure = { message: 'That code is not valid.' };
             else if (mismatch) failure = { message: mismatch, applyTo: candidate.appliesTo || null };
             else if (blocked) failure = { message: blocked };
+            else if (unusable) failure = { message: unusable };
 
             if (failure) {
                 if (typedCode) {
@@ -448,6 +547,7 @@ exports.createSubscription = async (req, res) => {
             } else {
                 promo = candidate;
                 if (promo.kind === 'coupon') discounts = [{ coupon: promo.couponId }];
+                if (isDiscount(promo)) discounts = [{ coupon: await ensureStripeCoupon(promo) }];
                 if (accountCode) {
                     console.log(`Account promo ${promo.code} applied for user ${user._id}`);
                 }
@@ -455,7 +555,7 @@ exports.createSubscription = async (req, res) => {
         }
         const isTrial = !!promo && promo.kind === 'free_trial';
 
-        const stripeSub = await stripe.subscriptions.create({
+        const stripeSub = await stripe().subscriptions.create({
             customer: stripeCustomerId,
             items: [{ price: priceId, quantity: purchase.quantity }],
             payment_behavior: 'default_incomplete',
@@ -476,6 +576,7 @@ exports.createSubscription = async (req, res) => {
                 tier,
                 interval,
                 ...(promo ? { promoCode: promo.code } : {}),
+                ...(promo && promo.rep ? { repId: String(promo.rep) } : {}),
             },
             expand: ['latest_invoice.payment_intent', 'pending_setup_intent'],
         });
@@ -502,6 +603,17 @@ exports.createSubscription = async (req, res) => {
             ...(homeAddress ? { homeAddress } : {}),
             ...(promo ? { promoCode: promo.code } : {}),
             ...(stripeSub.trial_end ? { trialEndsAt: new Date(stripeSub.trial_end * 1000) } : {}),
+            pricing: pricingSnapshot(purchase),
+            // A code that carries a rep credits the sale to them, with the
+            // neighborhood's commission as it stands today.
+            ...(promo && promo.rep
+                ? {
+                      rep: promo.rep,
+                      ...(typeof purchase.commissionCents === 'number'
+                          ? { repCommissionCents: purchase.commissionCents }
+                          : {}),
+                  }
+                : {}),
         });
         await sub.save();
 
@@ -531,7 +643,7 @@ exports.createSubscription = async (req, res) => {
                 thenCents: purchase.amountCents,
                 thenInterval: interval,
             };
-            const trialEphemeralKey = await stripe.ephemeralKeys.create(
+            const trialEphemeralKey = await stripe().ephemeralKeys.create(
                 { customer: stripeCustomerId },
                 { apiVersion: EPHEMERAL_KEY_API_VERSION }
             );
@@ -539,7 +651,7 @@ exports.createSubscription = async (req, res) => {
             // The card is verified with a dollar that comes straight back
             // once the plan is running. The sheet's Apple Pay works on this
             // unchanged, and a saved card is one tap in the same sheet.
-            const deposit = await stripe.paymentIntents.create({
+            const deposit = await stripe().paymentIntents.create({
                 amount: TRIAL_CARD_CHECK_CENTS,
                 currency: 'usd',
                 automatic_payment_methods: { enabled: true },
@@ -593,7 +705,7 @@ exports.createSubscription = async (req, res) => {
             });
         }
 
-        const ephemeralKey = await stripe.ephemeralKeys.create(
+        const ephemeralKey = await stripe().ephemeralKeys.create(
             { customer: stripeCustomerId },
             { apiVersion: EPHEMERAL_KEY_API_VERSION }
         );
@@ -637,9 +749,9 @@ exports.getSubscriptionStatus = async (req, res) => {
 
         // An incomplete doc can be waiting on webhook delivery — reconcile
         // against Stripe so the post-purchase poll converges fast.
-        if (sub.status === 'incomplete' && stripe && sub.stripeSubscriptionId) {
+        if (sub.status === 'incomplete' && stripe() && sub.stripeSubscriptionId) {
             try {
-                const stripeSub = await stripe.subscriptions.retrieve(sub.stripeSubscriptionId, {
+                const stripeSub = await stripe().subscriptions.retrieve(sub.stripeSubscriptionId, {
                     expand: ['pending_setup_intent'],
                 });
                 if (stripeSub.status === 'trialing') {
@@ -740,9 +852,9 @@ exports.cancelSubscription = async (req, res) => {
         // it handed back more than was ever collected when usage was low.
         let collectedCents = null; // null = could not ask Stripe; fall back to list price
         let refundable = []; // { paymentIntentId, amountCents } for this period, newest first
-        if (stripe && sub.stripeSubscriptionId && !inTrial) {
+        if (stripe() && sub.stripeSubscriptionId && !inTrial) {
             try {
-                const invoices = await stripe.invoices.list({
+                const invoices = await stripe().invoices.list({
                     subscription: sub.stripeSubscriptionId,
                     status: 'paid',
                     limit: 12,
@@ -784,7 +896,7 @@ exports.cancelSubscription = async (req, res) => {
         const refundCents = inTrial ? 0 : Math.max(0, paidCents - usedCents);
 
         let refund = { requestedCents: refundCents, paidCents, status: 'none' };
-        if (stripe && sub.stripeSubscriptionId) {
+        if (stripe() && sub.stripeSubscriptionId) {
             // Refund against the period's paid invoices, then cancel at Stripe.
             if (refundCents > 0) {
                 if (!refundable.length) {
@@ -800,7 +912,7 @@ exports.cancelSubscription = async (req, res) => {
                         if (remaining <= 0) break;
                         const amount = Math.min(remaining, target.amountCents);
                         try {
-                            await stripe.refunds.create({
+                            await stripe().refunds.create({
                                 payment_intent: target.paymentIntentId,
                                 amount,
                             });
@@ -818,7 +930,7 @@ exports.cancelSubscription = async (req, res) => {
                 }
             }
             try {
-                await stripe.subscriptions.cancel(sub.stripeSubscriptionId);
+                await stripe().subscriptions.cancel(sub.stripeSubscriptionId);
             } catch (cancelErr) {
                 // Already canceled at Stripe is fine; anything else is logged
                 // but the local cancel still proceeds (webhook would confirm).
@@ -867,13 +979,21 @@ exports.cancelSubscription = async (req, res) => {
     }
 };
 
-// POST /api/subscription/change  { userId, tier, interval, movesPerWeek?, homeAddress? }
+// POST /api/subscription/change
+// { userId, tier, interval, movesPerWeek?, homeAddress?, expectedAmountCents? }
 //
 // Seamless upgrade/downgrade: swaps the Stripe price in place with immediate
 // proration (the saved card is charged or credited the difference), then
 // mirrors the new plan locally. No new payment sheet needed.
+//
+// Pricing (2026-10-09): a subscription sold before neighborhood pricing is
+// locked in. Switching its interval within the same tier keeps the old
+// catalog price ($250/$75 Permanent valet). Switching to a different tier is a
+// new plan at today's prices, and from then on it is a new-price
+// subscription. Nobody can switch INTO Valet anywhere; a Valet anywhere
+// subscriber can still switch its interval at the old price.
 exports.changePlan = async (req, res) => {
-    const { userId, tier, interval, movesPerWeek, homeAddress } = req.body;
+    const { userId, tier, interval, movesPerWeek, homeAddress, expectedAmountCents } = req.body;
     try {
         const sub = await Subscription.findOne({
             user: userId,
@@ -898,21 +1018,16 @@ exports.changePlan = async (req, res) => {
             });
         }
 
-        if (!stripe) {
+        if (!stripe()) {
             return res.status(503).json({ success: false, message: 'Payment service unavailable' });
         }
 
-        const purchase = await resolvePlanPurchase(
-            tier || sub.tier,
-            interval || sub.interval,
-            movesPerWeek ?? sub.movesPerWeek
-        );
-        if (!purchase) {
-            return res.status(400).json({ success: false, message: 'Unknown tier or interval' });
+        const targetTier = tier || sub.tier;
+        if (targetTier === 'valet_anywhere' && sub.tier !== 'valet_anywhere') {
+            return res.status(400).json({ success: false, code: 'NOT_ON_SALE', message: OFF_SALE_MESSAGE });
         }
 
-        // Moving into Fixed garage needs the fixed spot.
-        const targetTier = tier || sub.tier;
+        // Moving into Permanent valet needs the fixed spot.
         if (targetTier === 'home_garage' && !sub.homeAddress?.streetAddress && !homeAddress) {
             const homeError = validateAddress(homeAddress, 'homeAddress');
             return res.status(400).json({ success: false, message: homeError });
@@ -921,6 +1036,27 @@ exports.changePlan = async (req, res) => {
             const homeError = validateAddress(homeAddress, 'homeAddress');
             if (homeError) return res.status(400).json({ success: false, message: homeError });
         }
+
+        const sameTier = targetTier === sub.tier;
+        const legacy = sameTier && (isLocked(sub) || sub.tier === 'valet_anywhere');
+        const spot =
+            homeAddress ||
+            (sub.homeAddress && hasPoint(sub.homeAddress)
+                ? { streetAddress: sub.homeAddress.streetAddress, lat: sub.homeAddress.lat, lng: sub.homeAddress.lng }
+                : null);
+        const table = await getTable();
+        const purchase = await resolvePlanPurchase(table, {
+            tier: targetTier,
+            interval: interval || sub.interval,
+            movesPerWeek: movesPerWeek ?? sub.movesPerWeek,
+            homeAddress: targetTier === 'home_garage' ? spot : null,
+            legacy,
+        });
+        if (purchase.error) {
+            return res.status(purchase.status).json({ success: false, code: purchase.code, message: purchase.error });
+        }
+        const priceGuard = checkExpectedAmount(table, purchase, expectedAmountCents, { action: 'switch plans' });
+        if (priceGuard) return res.status(priceGuard.status).json(priceGuard.body);
         // Schedule can't exceed the new plan's weekly moves.
         if ((sub.aspSchedule?.days?.length || 0) > purchase.movesPerWeek) {
             return res.status(400).json({
@@ -929,9 +1065,9 @@ exports.changePlan = async (req, res) => {
             });
         }
 
-        const stripeSub = await stripe.subscriptions.retrieve(sub.stripeSubscriptionId);
+        const stripeSub = await stripe().subscriptions.retrieve(sub.stripeSubscriptionId);
         const itemId = stripeSub.items.data[0].id;
-        const updated = await stripe.subscriptions.update(sub.stripeSubscriptionId, {
+        const updated = await stripe().subscriptions.update(sub.stripeSubscriptionId, {
             items: [{ id: itemId, price: purchase.priceId, quantity: purchase.quantity }],
             proration_behavior: 'always_invoice',
             payment_behavior: 'allow_incomplete',
@@ -943,6 +1079,11 @@ exports.changePlan = async (req, res) => {
         sub.amountCents = purchase.amountCents;
         sub.movesPerWeek = purchase.movesPerWeek;
         sub.stripePriceId = purchase.priceId;
+        // The Stripe item now carries this price, settled by proration, so a
+        // price that was waiting for the next bill is superseded.
+        sub.pendingAmountCents = undefined;
+        sub.pendingAmountFrom = undefined;
+        if (!purchase.legacy) sub.pricing = pricingSnapshot(purchase);
         if (homeAddress) {
             sub.homeAddress = homeAddress;
             sub.homeAddressChangedAt = sub.homeAddressChangedAt || new Date();
@@ -970,9 +1111,136 @@ exports.changePlan = async (req, res) => {
     }
 };
 
-// PUT /api/subscription/schedule  { userId, aspSchedule?, homeAddress? }
+// What moving a Permanent valet subscription to `homeAddress` does to its price.
+// Shared by PUT /schedule (which acts on it) and POST /move-preview (which
+// only shows it), so the price the customer sees before saving is the one
+// saving applies.
+//
+//   { offered: false }                         not offered at the address
+//   { offered: true, locked: true }            sold before neighborhood pricing: price untouched
+//   { offered: true, locked: false, quote, nextBaseCents, priceChanges, inTrial, effectiveFrom }
+function movePricing(table, sub, homeAddress, now = new Date()) {
+    const area = areaFor(table, homeAddress);
+    if (!area) return { offered: false, area: null };
+    const label = { borough: area.borough, neighborhood: area.neighborhood, label: area.label };
+    if (isLocked(sub)) return { offered: true, locked: true, area: label };
+    const quote = quotePlan(table, { tier: 'home_garage', interval: sub.interval, homeAddress });
+    // The amount the next bill would carry if they stayed put: a price an
+    // earlier move left waiting, or what they pay now.
+    const nextBaseCents = sub.pendingAmountCents ?? sub.amountCents;
+    const inTrial = !!(sub.trialEndsAt && now.getTime() < sub.trialEndsAt.getTime());
+    return {
+        offered: true,
+        locked: false,
+        area: label,
+        quote,
+        nextBaseCents,
+        priceChanges: quote.amountCents !== nextBaseCents,
+        inTrial,
+        // Nothing has been charged inside a trial, so the new price is simply
+        // the price the trial converts at.
+        effectiveFrom: inTrial ? sub.trialEndsAt : sub.currentPeriodEnd || null,
+    };
+}
+
+// The sentence under the new price, before Save and after it (NewMove:
+// "From your next bill on Nov 9. Until then you pay $525/mo.").
+function moveNote(sub, move) {
+    const unit = perUnit(sub.interval);
+    if (!move.priceChanges || move.locked) {
+        return `Your price stays ${dollars(move.locked ? sub.amountCents : move.nextBaseCents)}${unit}.`;
+    }
+    if (!move.effectiveFrom) return 'From your next bill.';
+    if (move.inTrial) {
+        return `From ${shortDate(move.effectiveFrom)}, when your ${trialLabel(sub.promoCode)} ends.`;
+    }
+    return `From your next bill on ${shortDate(move.effectiveFrom)}. Until then you pay ${dollars(
+        move.nextBaseCents
+    )}${unit}.`;
+}
+
+// POST /api/subscription/move-preview  { userId, homeAddress }
+//
+// What moving the fixed address would cost, before the customer saves it.
+exports.movePreview = async (req, res) => {
+    const { userId, homeAddress } = req.body || {};
+    try {
+        const homeError = validateAddress(homeAddress, 'homeAddress');
+        if (homeError) return res.status(400).json({ success: false, message: homeError });
+        const sub = await Subscription.findOne({
+            user: userId,
+            status: { $in: ['active', 'past_due'] },
+        });
+        if (!sub) {
+            return res.status(404).json({ success: false, message: 'No subscription found' });
+        }
+        const locked = isLocked(sub);
+        // Only Permanent valet is priced by its address. Any other plan keeps
+        // its price wherever the address goes.
+        if (sub.tier !== 'home_garage') {
+            return res.status(200).json({
+                success: true,
+                available: true,
+                area: null,
+                priceChanges: false,
+                currentAmountCents: sub.amountCents,
+                nextAmountCents: sub.pendingAmountCents ?? sub.amountCents,
+                effectiveFrom: null,
+                locked,
+                note: `Your price stays ${dollars(sub.amountCents)}${perUnit(sub.interval)}.`,
+            });
+        }
+        const table = await getTable();
+        const move = movePricing(table, sub, homeAddress);
+        if (!move.offered) {
+            return res.status(200).json({
+                success: true,
+                available: false,
+                message: NOT_OFFERED_MESSAGE,
+                area: null,
+                priceChanges: false,
+                currentAmountCents: sub.amountCents,
+                nextAmountCents: null,
+                effectiveFrom: null,
+                locked,
+                note: NOT_OFFERED_MESSAGE,
+            });
+        }
+        const shownCents = move.locked ? sub.amountCents : move.quote.amountCents;
+        res.status(200).json({
+            success: true,
+            available: true,
+            area: move.area,
+            // "Permanent valet in SoHo · $775/mo", the card above the note.
+            priceLine: {
+                label: `${PLANS.home_garage.name} in ${move.area.label}`,
+                amountCents: shownCents,
+                amount: `${dollars(shownCents)}${perUnit(sub.interval)}`,
+            },
+            priceChanges: !move.locked && move.priceChanges,
+            currentAmountCents: sub.amountCents,
+            nextAmountCents: move.locked ? sub.amountCents : move.quote.amountCents,
+            effectiveFrom: !move.locked && move.priceChanges ? move.effectiveFrom : null,
+            locked: move.locked,
+            note: moveNote(sub, move),
+        });
+    } catch (err) {
+        console.error('movePreview error:', err);
+        res.status(500).json({ success: false, message: 'Could not price that address', error: err.message });
+    }
+};
+
+// PUT /api/subscription/schedule  { userId, aspSchedule?, homeAddress?, expectedAmountCents? }
+//
+// A Permanent valet subscription sold at neighborhood prices that moves its
+// fixed address to a different price pays the new price from the next bill
+// (Rishi, 2026-10-09): the Stripe item is swapped with no proration, so the
+// period already paid for is untouched and the renewal bills the new amount.
+// Inside a trial nothing was charged, so the new price applies at once. A
+// subscription sold before is locked in: its address moves, its price does
+// not.
 exports.updateSchedule = async (req, res) => {
-    const { userId, aspSchedule, homeAddress } = req.body;
+    const { userId, aspSchedule, homeAddress, expectedAmountCents } = req.body;
     try {
         const sub = await Subscription.findOne({
             user: userId,
@@ -1020,12 +1288,60 @@ exports.updateSchedule = async (req, res) => {
                 }
                 sub.homeAddressChangedAt = new Date();
             }
+
+            if (sub.tier === 'home_garage') {
+                const table = await getTable();
+                const move = movePricing(table, sub, homeAddress);
+                if (!move.offered) {
+                    return res
+                        .status(400)
+                        .json({ success: false, code: 'NOT_OFFERED', message: NOT_OFFERED_MESSAGE });
+                }
+                if (!move.locked && move.priceChanges) {
+                    // Money moves on this one, so the client must show the new
+                    // price first. One that cannot (a shipped build) is told
+                    // to update rather than have the price changed under it.
+                    const priceGuard = checkExpectedAmount(table, move.quote, expectedAmountCents, {
+                        action: 'move your fixed address',
+                        requireExpected: true,
+                    });
+                    if (priceGuard) return res.status(priceGuard.status).json(priceGuard.body);
+                    if (!stripe()) {
+                        return res.status(503).json({ success: false, message: 'Payment service unavailable' });
+                    }
+                    const priceId = await resolveStripePrice(move.quote);
+                    if (sub.stripeSubscriptionId) {
+                        const stripeSub = await stripe().subscriptions.retrieve(sub.stripeSubscriptionId);
+                        const itemId = stripeSub.items.data[0].id;
+                        await stripe().subscriptions.update(sub.stripeSubscriptionId, {
+                            items: [{ id: itemId, price: priceId, quantity: 1 }],
+                            proration_behavior: 'none',
+                        });
+                    }
+                    sub.stripePriceId = priceId;
+                    if (move.inTrial || move.quote.amountCents === sub.amountCents) {
+                        // Inside a trial, or moving back to the price they pay
+                        // today: nothing waits for the next bill.
+                        sub.amountCents = move.quote.amountCents;
+                        sub.pendingAmountCents = undefined;
+                        sub.pendingAmountFrom = undefined;
+                    } else {
+                        sub.pendingAmountCents = move.quote.amountCents;
+                        sub.pendingAmountFrom = sub.currentPeriodEnd || new Date();
+                    }
+                }
+                if (!move.locked) {
+                    sub.pricing = pricingSnapshot(move.quote);
+                }
+                req.moveNote = moveNote(sub, move);
+            }
             sub.homeAddress = homeAddress;
         }
         await sub.save();
 
         res.status(200).json({
             success: true,
+            ...(req.moveNote ? { message: req.moveNote } : {}),
             subscription: await buildStatusPayload(sub),
         });
     } catch (err) {
@@ -1147,9 +1463,9 @@ async function activateLocal(sub, invoice, stripeSub) {
             sub.status = 'cancelled';
             sub.cancelledAt = new Date();
             await sub.save();
-            if (stripe && sub.stripeSubscriptionId) {
+            if (stripe() && sub.stripeSubscriptionId) {
                 try {
-                    await stripe.subscriptions.cancel(sub.stripeSubscriptionId);
+                    await stripe().subscriptions.cancel(sub.stripeSubscriptionId);
                 } catch (cancelErr) {
                     console.error('Failed to void duplicate stripe sub:', cancelErr.message);
                 }
@@ -1164,7 +1480,29 @@ async function activateLocal(sub, invoice, stripeSub) {
         // its job. Leaving it would quietly discount the NEXT plan.
         $unset: { pendingPromoCode: 1, pendingPromoSetAt: 1 },
     });
+    // Bookkeeping that must never undo an activation: an admin code's
+    // redemption count.
+    try {
+        await countRedemption(sub);
+    } catch (err) {
+        console.error(`activateLocal: could not count the code on ${sub._id}:`, err.message);
+    }
     console.log(`Subscription ${sub._id} active (tier ${sub.tier}, user ${sub.user})`);
+}
+
+// A fixed-address move left a new price waiting for the next bill
+// (updateSchedule). Stripe's item already carries it, so the renewal invoice
+// is billed at it; this is where the local mirror catches up.
+function applyPendingAmount(sub, invoice, now = new Date()) {
+    if (sub.pendingAmountCents === undefined || sub.pendingAmountCents === null) return false;
+    if (!invoice || invoice.billing_reason !== 'subscription_cycle') return false;
+    // A day of slack for a renewal that lands a little before the period end.
+    const from = sub.pendingAmountFrom ? sub.pendingAmountFrom.getTime() : 0;
+    if (now.getTime() < from - 24 * 60 * 60 * 1000) return false;
+    sub.amountCents = sub.pendingAmountCents;
+    sub.pendingAmountCents = undefined;
+    sub.pendingAmountFrom = undefined;
+    return true;
 }
 
 function subscriptionIdFromInvoice(invoice) {
@@ -1191,11 +1529,11 @@ function subscriptionIdFromInvoice(invoice) {
 // record the payment for the value indicator.
 async function applyInvoicePaid(invoice) {
     let stripeSubId = subscriptionIdFromInvoice(invoice);
-    if (!stripeSubId && stripe && invoice.id) {
+    if (!stripeSubId && stripe() && invoice.id) {
         // Unrecognized payload shape — re-fetch through the pinned SDK,
         // whose response shape we control.
         try {
-            const fresh = await stripe.invoices.retrieve(invoice.id);
+            const fresh = await stripe().invoices.retrieve(invoice.id);
             stripeSubId = subscriptionIdFromInvoice(fresh);
         } catch (err) {
             console.error('invoice.paid: invoice refetch failed', invoice.id, err.message);
@@ -1210,9 +1548,9 @@ async function applyInvoicePaid(invoice) {
     }
 
     let stripeSub = null;
-    if (stripe) {
+    if (stripe()) {
         try {
-            stripeSub = await stripe.subscriptions.retrieve(stripeSubId);
+            stripeSub = await stripe().subscriptions.retrieve(stripeSubId);
         } catch (err) {
             console.error('invoice.paid: could not retrieve subscription', stripeSubId, err.message);
         }
@@ -1232,6 +1570,7 @@ async function applyInvoicePaid(invoice) {
             return { handled: true, subscriptionId: sub._id, ignored: 'trial_awaiting_card' };
         }
     }
+    applyPendingAmount(sub, invoice);
     await activateLocal(sub, invoice, stripeSub);
     return { handled: true, subscriptionId: sub._id };
 }
@@ -1253,9 +1592,9 @@ async function applyInvoicePaymentFailed(invoice) {
 
     // Deliveries are unordered and retried for days — check what Stripe
     // thinks NOW before pausing entitlements off a possibly-stale failure.
-    if (stripe) {
+    if (stripe()) {
         try {
-            const fresh = await stripe.subscriptions.retrieve(stripeSubId);
+            const fresh = await stripe().subscriptions.retrieve(stripeSubId);
             if (['active', 'trialing'].includes(fresh.status)) {
                 return { handled: true, subscriptionId: sub._id, ignored: 'stale_event' };
             }
@@ -1288,9 +1627,9 @@ async function applySubscriptionUpdated(stripeSub, isDeletion = false) {
     // For live updates, mirror Stripe's CURRENT state rather than the event
     // payload — deliveries are unordered, and a refetch through the pinned
     // SDK also normalizes payload-shape differences across API versions.
-    if (!isDeletion && stripe) {
+    if (!isDeletion && stripe()) {
         try {
-            stripeSub = await stripe.subscriptions.retrieve(stripeSub.id);
+            stripeSub = await stripe().subscriptions.retrieve(stripeSub.id);
         } catch (err) {
             console.error('subscription.updated: refetch failed', stripeSub.id, err.message);
         }
@@ -1355,9 +1694,9 @@ exports.applyTrialCardCheckPaid = async (paymentIntent) => {
     const sub = await Subscription.findById(subId);
     if (!sub) return { handled: false, reason: 'unknown_subscription' };
     if (sub.status === 'cancelled') return { handled: true, ignored: 'terminal' };
-    if (!stripe || !sub.stripeSubscriptionId) return { handled: false, reason: 'no_stripe' };
+    if (!stripe() || !sub.stripeSubscriptionId) return { handled: false, reason: 'no_stripe' };
     try {
-        const stripeSub = await stripe.subscriptions.retrieve(sub.stripeSubscriptionId, {
+        const stripeSub = await stripe().subscriptions.retrieve(sub.stripeSubscriptionId, {
             expand: ['pending_setup_intent'],
         });
         if (!['trialing', 'active'].includes(stripeSub.status)) {
@@ -1393,6 +1732,9 @@ async function applyStripeSubscriptionEvent(event) {
 }
 
 exports.applyStripeSubscriptionEvent = applyStripeSubscriptionEvent;
+exports.activateLocal = activateLocal;
+exports.ensureStripeCustomer = ensureStripeCustomer;
+exports.applyPendingAmount = applyPendingAmount;
 exports.applyInvoicePaid = applyInvoicePaid;
 exports.applyInvoicePaymentFailed = applyInvoicePaymentFailed;
 exports.applySubscriptionUpdated = applySubscriptionUpdated;

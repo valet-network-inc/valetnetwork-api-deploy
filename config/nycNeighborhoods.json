@@ -1,0 +1,670 @@
+{
+ "about": "The neighborhoods that unlock Permanent valet outside Manhattan (Rishi, 2026-10-09). Names and order are the rep portal's Unlocks list. Manhattan's 18 rows live in neighborhoodPrices.json, where their prices are. An address in Brooklyn or Queens belongs to the neighborhood with the nearest centre. Centres are each neighborhood's commonly mapped centre point (NYC neighborhood tabulation areas and the city's own neighborhood names), rounded to about 100 m; they only have to be right relative to each other, because the borough outline has already decided the borough.",
+ "boroughs": {
+  "Brooklyn": [
+   {
+    "name": "Bath Beach",
+    "centroid": [
+     40.602,
+     -74.006
+    ]
+   },
+   {
+    "name": "Bay Ridge",
+    "centroid": [
+     40.634,
+     -74.028
+    ]
+   },
+   {
+    "name": "Bedford-Stuyvesant",
+    "centroid": [
+     40.687,
+     -73.942
+    ]
+   },
+   {
+    "name": "Bensonhurst",
+    "centroid": [
+     40.605,
+     -73.993
+    ]
+   },
+   {
+    "name": "Bergen Beach",
+    "centroid": [
+     40.623,
+     -73.906
+    ]
+   },
+   {
+    "name": "Boerum Hill",
+    "centroid": [
+     40.686,
+     -73.984
+    ]
+   },
+   {
+    "name": "Borough Park",
+    "centroid": [
+     40.633,
+     -73.993
+    ]
+   },
+   {
+    "name": "Brighton Beach",
+    "centroid": [
+     40.578,
+     -73.96
+    ]
+   },
+   {
+    "name": "Brooklyn Heights",
+    "centroid": [
+     40.696,
+     -73.995
+    ]
+   },
+   {
+    "name": "Brownsville",
+    "centroid": [
+     40.663,
+     -73.91
+    ]
+   },
+   {
+    "name": "Bushwick",
+    "centroid": [
+     40.695,
+     -73.918
+    ]
+   },
+   {
+    "name": "Canarsie",
+    "centroid": [
+     40.64,
+     -73.9
+    ]
+   },
+   {
+    "name": "Carroll Gardens",
+    "centroid": [
+     40.679,
+     -73.999
+    ]
+   },
+   {
+    "name": "Clinton Hill",
+    "centroid": [
+     40.689,
+     -73.966
+    ]
+   },
+   {
+    "name": "Cobble Hill",
+    "centroid": [
+     40.686,
+     -73.996
+    ]
+   },
+   {
+    "name": "Coney Island",
+    "centroid": [
+     40.575,
+     -73.986
+    ]
+   },
+   {
+    "name": "Crown Heights",
+    "centroid": [
+     40.67,
+     -73.944
+    ]
+   },
+   {
+    "name": "Cypress Hills",
+    "centroid": [
+     40.683,
+     -73.88
+    ]
+   },
+   {
+    "name": "Ditmas Park",
+    "centroid": [
+     40.636,
+     -73.964
+    ]
+   },
+   {
+    "name": "Downtown Brooklyn",
+    "centroid": [
+     40.693,
+     -73.987
+    ]
+   },
+   {
+    "name": "DUMBO",
+    "centroid": [
+     40.703,
+     -73.989
+    ]
+   },
+   {
+    "name": "Dyker Heights",
+    "centroid": [
+     40.621,
+     -74.01
+    ]
+   },
+   {
+    "name": "East Flatbush",
+    "centroid": [
+     40.648,
+     -73.932
+    ]
+   },
+   {
+    "name": "East New York",
+    "centroid": [
+     40.665,
+     -73.882
+    ]
+   },
+   {
+    "name": "Flatbush",
+    "centroid": [
+     40.652,
+     -73.959
+    ]
+   },
+   {
+    "name": "Flatlands",
+    "centroid": [
+     40.621,
+     -73.933
+    ]
+   },
+   {
+    "name": "Fort Greene",
+    "centroid": [
+     40.69,
+     -73.976
+    ]
+   },
+   {
+    "name": "Gerritsen Beach",
+    "centroid": [
+     40.588,
+     -73.923
+    ]
+   },
+   {
+    "name": "Gowanus",
+    "centroid": [
+     40.674,
+     -73.99
+    ]
+   },
+   {
+    "name": "Gravesend",
+    "centroid": [
+     40.595,
+     -73.974
+    ]
+   },
+   {
+    "name": "Greenpoint",
+    "centroid": [
+     40.73,
+     -73.954
+    ]
+   },
+   {
+    "name": "Greenwood Heights",
+    "centroid": [
+     40.655,
+     -73.995
+    ]
+   },
+   {
+    "name": "Kensington",
+    "centroid": [
+     40.642,
+     -73.977
+    ]
+   },
+   {
+    "name": "Manhattan Beach",
+    "centroid": [
+     40.578,
+     -73.94
+    ]
+   },
+   {
+    "name": "Marine Park",
+    "centroid": [
+     40.607,
+     -73.923
+    ]
+   },
+   {
+    "name": "Midwood",
+    "centroid": [
+     40.621,
+     -73.959
+    ]
+   },
+   {
+    "name": "Mill Basin",
+    "centroid": [
+     40.608,
+     -73.913
+    ]
+   },
+   {
+    "name": "Park Slope",
+    "centroid": [
+     40.671,
+     -73.978
+    ]
+   },
+   {
+    "name": "Prospect Heights",
+    "centroid": [
+     40.677,
+     -73.967
+    ]
+   },
+   {
+    "name": "Prospect Lefferts Gardens",
+    "centroid": [
+     40.659,
+     -73.952
+    ]
+   },
+   {
+    "name": "Red Hook",
+    "centroid": [
+     40.676,
+     -74.011
+    ]
+   },
+   {
+    "name": "Sea Gate",
+    "centroid": [
+     40.577,
+     -74.01
+    ]
+   },
+   {
+    "name": "Sheepshead Bay",
+    "centroid": [
+     40.59,
+     -73.945
+    ]
+   },
+   {
+    "name": "Sunset Park",
+    "centroid": [
+     40.645,
+     -74.011
+    ]
+   },
+   {
+    "name": "Vinegar Hill",
+    "centroid": [
+     40.703,
+     -73.982
+    ]
+   },
+   {
+    "name": "Williamsburg",
+    "centroid": [
+     40.713,
+     -73.957
+    ]
+   },
+   {
+    "name": "Windsor Terrace",
+    "centroid": [
+     40.654,
+     -73.977
+    ]
+   }
+  ],
+  "Queens": [
+   {
+    "name": "Astoria",
+    "centroid": [
+     40.765,
+     -73.923
+    ]
+   },
+   {
+    "name": "Auburndale",
+    "centroid": [
+     40.76,
+     -73.79
+    ]
+   },
+   {
+    "name": "Bayside",
+    "centroid": [
+     40.768,
+     -73.772
+    ]
+   },
+   {
+    "name": "Bellerose",
+    "centroid": [
+     40.73,
+     -73.723
+    ]
+   },
+   {
+    "name": "Briarwood",
+    "centroid": [
+     40.709,
+     -73.815
+    ]
+   },
+   {
+    "name": "Broad Channel",
+    "centroid": [
+     40.605,
+     -73.82
+    ]
+   },
+   {
+    "name": "Cambria Heights",
+    "centroid": [
+     40.692,
+     -73.738
+    ]
+   },
+   {
+    "name": "College Point",
+    "centroid": [
+     40.787,
+     -73.846
+    ]
+   },
+   {
+    "name": "Corona",
+    "centroid": [
+     40.747,
+     -73.86
+    ]
+   },
+   {
+    "name": "Douglaston",
+    "centroid": [
+     40.765,
+     -73.743
+    ]
+   },
+   {
+    "name": "East Elmhurst",
+    "centroid": [
+     40.761,
+     -73.87
+    ]
+   },
+   {
+    "name": "Elmhurst",
+    "centroid": [
+     40.737,
+     -73.88
+    ]
+   },
+   {
+    "name": "Far Rockaway",
+    "centroid": [
+     40.6,
+     -73.755
+    ]
+   },
+   {
+    "name": "Floral Park",
+    "centroid": [
+     40.724,
+     -73.705
+    ]
+   },
+   {
+    "name": "Flushing",
+    "centroid": [
+     40.76,
+     -73.83
+    ]
+   },
+   {
+    "name": "Forest Hills",
+    "centroid": [
+     40.719,
+     -73.845
+    ]
+   },
+   {
+    "name": "Fresh Meadows",
+    "centroid": [
+     40.735,
+     -73.793
+    ]
+   },
+   {
+    "name": "Glen Oaks",
+    "centroid": [
+     40.745,
+     -73.712
+    ]
+   },
+   {
+    "name": "Glendale",
+    "centroid": [
+     40.702,
+     -73.881
+    ]
+   },
+   {
+    "name": "Hollis",
+    "centroid": [
+     40.712,
+     -73.762
+    ]
+   },
+   {
+    "name": "Howard Beach",
+    "centroid": [
+     40.658,
+     -73.838
+    ]
+   },
+   {
+    "name": "Jackson Heights",
+    "centroid": [
+     40.755,
+     -73.885
+    ]
+   },
+   {
+    "name": "Jamaica",
+    "centroid": [
+     40.702,
+     -73.79
+    ]
+   },
+   {
+    "name": "Jamaica Estates",
+    "centroid": [
+     40.717,
+     -73.785
+    ]
+   },
+   {
+    "name": "Kew Gardens",
+    "centroid": [
+     40.709,
+     -73.83
+    ]
+   },
+   {
+    "name": "Kew Gardens Hills",
+    "centroid": [
+     40.727,
+     -73.82
+    ]
+   },
+   {
+    "name": "Laurelton",
+    "centroid": [
+     40.672,
+     -73.748
+    ]
+   },
+   {
+    "name": "Little Neck",
+    "centroid": [
+     40.763,
+     -73.733
+    ]
+   },
+   {
+    "name": "Long Island City",
+    "centroid": [
+     40.745,
+     -73.948
+    ]
+   },
+   {
+    "name": "Maspeth",
+    "centroid": [
+     40.724,
+     -73.91
+    ]
+   },
+   {
+    "name": "Middle Village",
+    "centroid": [
+     40.717,
+     -73.879
+    ]
+   },
+   {
+    "name": "Ozone Park",
+    "centroid": [
+     40.679,
+     -73.845
+    ]
+   },
+   {
+    "name": "Queens Village",
+    "centroid": [
+     40.721,
+     -73.745
+    ]
+   },
+   {
+    "name": "Rego Park",
+    "centroid": [
+     40.727,
+     -73.86
+    ]
+   },
+   {
+    "name": "Richmond Hill",
+    "centroid": [
+     40.696,
+     -73.829
+    ]
+   },
+   {
+    "name": "Ridgewood",
+    "centroid": [
+     40.704,
+     -73.905
+    ]
+   },
+   {
+    "name": "Rockaway Beach",
+    "centroid": [
+     40.586,
+     -73.816
+    ]
+   },
+   {
+    "name": "Rosedale",
+    "centroid": [
+     40.659,
+     -73.737
+    ]
+   },
+   {
+    "name": "South Jamaica",
+    "centroid": [
+     40.685,
+     -73.795
+    ]
+   },
+   {
+    "name": "South Ozone Park",
+    "centroid": [
+     40.674,
+     -73.813
+    ]
+   },
+   {
+    "name": "Springfield Gardens",
+    "centroid": [
+     40.665,
+     -73.763
+    ]
+   },
+   {
+    "name": "St. Albans",
+    "centroid": [
+     40.695,
+     -73.76
+    ]
+   },
+   {
+    "name": "Sunnyside",
+    "centroid": [
+     40.744,
+     -73.92
+    ]
+   },
+   {
+    "name": "Whitestone",
+    "centroid": [
+     40.792,
+     -73.81
+    ]
+   },
+   {
+    "name": "Woodhaven",
+    "centroid": [
+     40.69,
+     -73.858
+    ]
+   },
+   {
+    "name": "Woodside",
+    "centroid": [
+     40.746,
+     -73.903
+    ]
+   }
+  ]
+ },
+ "notOffered": [
+  {
+   "borough": "Staten Island",
+   "name": "Staten Island"
+  },
+  {
+   "borough": "Bronx",
+   "name": "The Bronx"
+  }
+ ]
+}

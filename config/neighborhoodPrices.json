@@ -1,0 +1,286 @@
+{
+ "about": "Seed for the NeighborhoodPricing document (Mongo). The live numbers are edited in the rep portal's admin section or PUT /api/admin/sales/pricing; this file is only read when no document exists yet. Source: valetnetwork.co/pricing (vnweb-gh src/app/pricing/prices.json, pulled 2026-10-07) — monthlyCents = the sheet's Price column (`sell`), commissionCents = its Commission column (`markup`), garageCents = its Average garage monthly column. Rishi, 2026-10-09: every new Permanent valet subscriber pays the sheet's Price, $300 in Brooklyn and Queens.",
+ "centroids": "scripts/pull_garage_rates.py in the main folder: every garage on the sheet was counted toward its nearest centroid, and an address is priced the same way.",
+ "brooklynQueens": {
+  "monthlyCents": 30000,
+  "commissionCents": 5000,
+  "garageLowCents": 27500,
+  "garageHighCents": 52500
+ },
+ "manhattan": [
+  {
+   "neighborhood": "Financial District and Battery Park City",
+   "monthlyCents": 40000,
+   "commissionCents": 7500,
+   "garageCents": 49900,
+   "centroids": [
+    [
+     40.7075,
+     -74.0113
+    ],
+    [
+     40.712,
+     -74.0165
+    ]
+   ]
+  },
+  {
+   "neighborhood": "Tribeca",
+   "monthlyCents": 67500,
+   "commissionCents": 12500,
+   "garageCents": 85000,
+   "centroids": [
+    [
+     40.7163,
+     -74.0086
+    ]
+   ]
+  },
+  {
+   "neighborhood": "SoHo",
+   "monthlyCents": 77500,
+   "commissionCents": 15000,
+   "garageCents": 97500,
+   "centroids": [
+    [
+     40.7233,
+     -74.003
+    ]
+   ]
+  },
+  {
+   "neighborhood": "Chinatown",
+   "monthlyCents": 47500,
+   "commissionCents": 7500,
+   "garageCents": 60000,
+   "centroids": [
+    [
+     40.7158,
+     -73.997
+    ]
+   ]
+  },
+  {
+   "neighborhood": "Lower East Side",
+   "monthlyCents": 42500,
+   "commissionCents": 7500,
+   "garageCents": 52500,
+   "centroids": [
+    [
+     40.718,
+     -73.988
+    ]
+   ]
+  },
+  {
+   "neighborhood": "East Village",
+   "monthlyCents": 35000,
+   "commissionCents": 5000,
+   "garageCents": 42500,
+   "centroids": [
+    [
+     40.7265,
+     -73.9815
+    ]
+   ]
+  },
+  {
+   "neighborhood": "West Village",
+   "monthlyCents": 72500,
+   "commissionCents": 15000,
+   "garageCents": 90000,
+   "centroids": [
+    [
+     40.7336,
+     -74.0027
+    ]
+   ]
+  },
+  {
+   "neighborhood": "Greenwich Village",
+   "monthlyCents": 60000,
+   "commissionCents": 10000,
+   "garageCents": 75000,
+   "centroids": [
+    [
+     40.7308,
+     -73.996
+    ]
+   ]
+  },
+  {
+   "neighborhood": "Chelsea",
+   "monthlyCents": 52500,
+   "commissionCents": 10000,
+   "garageCents": 65000,
+   "centroids": [
+    [
+     40.7465,
+     -74.0014
+    ],
+    [
+     40.74,
+     -73.999
+    ]
+   ]
+  },
+  {
+   "neighborhood": "Flatiron and Gramercy",
+   "monthlyCents": 52500,
+   "commissionCents": 10000,
+   "garageCents": 65000,
+   "centroids": [
+    [
+     40.7389,
+     -73.988
+    ]
+   ]
+  },
+  {
+   "neighborhood": "Murray Hill and Kips Bay",
+   "monthlyCents": 35000,
+   "commissionCents": 5000,
+   "garageCents": 45000,
+   "centroids": [
+    [
+     40.747,
+     -73.978
+    ]
+   ]
+  },
+  {
+   "neighborhood": "Midtown East",
+   "monthlyCents": 35000,
+   "commissionCents": 5000,
+   "garageCents": 45000,
+   "centroids": [
+    [
+     40.7549,
+     -73.968
+    ]
+   ]
+  },
+  {
+   "neighborhood": "Midtown West, Hell’s Kitchen and Hudson Yards",
+   "monthlyCents": 35000,
+   "commissionCents": 5000,
+   "garageCents": 44700,
+   "centroids": [
+    [
+     40.759,
+     -73.985
+    ],
+    [
+     40.7638,
+     -73.9918
+    ],
+    [
+     40.754,
+     -74.001
+    ]
+   ]
+  },
+  {
+   "neighborhood": "Upper East Side",
+   "monthlyCents": 55000,
+   "commissionCents": 10000,
+   "garageCents": 70000,
+   "centroids": [
+    [
+     40.768,
+     -73.962
+    ],
+    [
+     40.78,
+     -73.953
+    ]
+   ]
+  },
+  {
+   "neighborhood": "Upper West Side",
+   "monthlyCents": 55000,
+   "commissionCents": 10000,
+   "garageCents": 69000,
+   "centroids": [
+    [
+     40.776,
+     -73.982
+    ],
+    [
+     40.787,
+     -73.9754
+    ],
+    [
+     40.796,
+     -73.969
+    ]
+   ]
+  },
+  {
+   "neighborhood": "Harlem, Morningside Heights and Hamilton Heights",
+   "monthlyCents": 35000,
+   "commissionCents": 5000,
+   "garageCents": 41200,
+   "centroids": [
+    [
+     40.809,
+     -73.962
+    ],
+    [
+     40.8116,
+     -73.9465
+    ],
+    [
+     40.803,
+     -73.95
+    ],
+    [
+     40.8255,
+     -73.9475
+    ]
+   ]
+  },
+  {
+   "neighborhood": "East Harlem",
+   "monthlyCents": 35000,
+   "commissionCents": 5000,
+   "garageCents": 45000,
+   "centroids": [
+    [
+     40.7957,
+     -73.9389
+    ]
+   ]
+  },
+  {
+   "neighborhood": "Washington Heights and Inwood",
+   "monthlyCents": 37500,
+   "commissionCents": 7500,
+   "garageCents": 47500,
+   "centroids": [
+    [
+     40.8417,
+     -73.9393
+    ],
+    [
+     40.85,
+     -73.934
+    ],
+    [
+     40.8677,
+     -73.9212
+    ]
+   ]
+  }
+ ],
+ "weeklyShare": 0.3,
+ "weeklyRoundCents": 500,
+ "contactSales": {
+  "label": "Contact sales",
+  "phone": "+19796616772",
+  "email": "rishi@valetnetwork.co",
+  "subject": "Subscription",
+  "message": "Hey Rishi, this is {name}. I’d like help with the subscription and was wondering if it could be cheaper in any way. Thanks!",
+  "prompt": "Questions?"
+ }
+}

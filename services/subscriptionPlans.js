@@ -11,6 +11,13 @@
 //   home_garage      → + first park (+its retrieval) of each day free at the
 //                      customer's home address
 //   valet_anywhere   → + that free daily park works anywhere we operate
+//
+// Neighborhood pricing (Rishi, 2026-10-09): home_garage is now sold as
+// Permanent valet and priced by its fixed address from the live table in
+// services/neighborhoodPricing.js ($300 in Brooklyn and Queens, the sheet's
+// Price in Manhattan), and Valet anywhere is no longer sold. The amounts below stay because existing
+// subscribers are locked in at them: a subscription with no `pricing` on it
+// keeps billing at these catalog prices, interval changes included.
 
 const TIERS = ['street_cleaning', 'home_garage', 'valet_anywhere'];
 
@@ -36,13 +43,17 @@ const PLANS = {
     },
     home_garage: {
         tier: 'home_garage',
-        name: 'Fixed garage',
+        name: 'Permanent valet',
         blurb: 'Everything in Street cleaning, plus a free park & retrieval every day at your fixed spot.',
         features: [
             'Everything in Street cleaning moves',
             'Pick one fixed spot — first park & retrieval there is free every day',
             'The spot can be changed once a month',
         ],
+        // The price of a new subscription comes from the address
+        // (services/planPricing.js). These are the $250/$75 catalog prices
+        // that locked, pre-October subscribers still pay.
+        pricedByAddress: true,
         weekly: { amountCents: 7500, lookupKey: 'vn_home_garage_weekly' },
         monthly: { amountCents: 25000, lookupKey: 'vn_home_garage_monthly' },
         rank: 2,
@@ -56,6 +67,9 @@ const PLANS = {
             'Free daily park & retrieval anywhere in the service area',
             'Coverage grows as we do',
         ],
+        // Not sold any more (Rishi, 2026-10-09). Current subscribers keep it at
+        // these prices; /plans leaves it out and /create refuses it.
+        onSale: false,
         weekly: { amountCents: 9000, lookupKey: 'vn_valet_anywhere_weekly' },
         monthly: { amountCents: 30000, lookupKey: 'vn_valet_anywhere_monthly' },
         rank: 3,
@@ -81,6 +95,13 @@ function priceFor(tier, interval) {
     return null;
 }
 
+function isOnSale(tier) {
+    const plan = getPlan(tier);
+    return !!plan && plan.onSale !== false;
+}
+
+const OFF_SALE_MESSAGE = 'Valet anywhere is no longer offered. Permanent valet is.';
+
 function tierRank(tier) {
     const plan = getPlan(tier);
     return plan ? plan.rank : 0;
@@ -93,5 +114,7 @@ module.exports = {
     HOME_RADIUS_METERS,
     getPlan,
     priceFor,
+    isOnSale,
+    OFF_SALE_MESSAGE,
     tierRank,
 };

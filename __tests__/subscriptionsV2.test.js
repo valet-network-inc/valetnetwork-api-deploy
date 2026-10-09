@@ -1183,7 +1183,7 @@ describe('status payload', () => {
         expect(payload.valueIndicator.usageCents).toBe(2800);
         expect(payload.valueIndicator.paidCents).toBe(7500);
         expect(payload.valueIndicator.usageCount).toBe(2);
-        expect(payload.tierName).toBe('Fixed garage');
+        expect(payload.tierName).toBe('Permanent valet');
         expect(payload.nextAspMove).toBeTruthy();
         expect(payload.aspMovesPerWeek).toBe(2);
     });

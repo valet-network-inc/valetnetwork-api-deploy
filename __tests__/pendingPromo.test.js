@@ -373,7 +373,7 @@ describe('a plan that went live through the webhook mirror', () => {
         after.cancelledAt = new Date();
         await after.save();
         const promos = require('../services/subscriptionPromos');
-        const blocked = await promos.promoRedemptionBlock(promos.findPromo('HANDSFREE'), user._id);
+        const blocked = await promos.promoRedemptionBlock(promos.findStaticPromo('HANDSFREE'), user._id);
         expect(blocked).toMatch(/already used/i);
     });
 });

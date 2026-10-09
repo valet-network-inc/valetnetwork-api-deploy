@@ -14,9 +14,16 @@
 //
 // The customer-facing promise: free for 30 days, cancel before it ends and
 // nothing is ever charged.
+//
+// Codes made without a deploy (2026-10-09) live in Mongo (models/PromoCode.js)
+// and are read first: percent off or dollars off, a free trial, or a rep's
+// code that only credits the sale. findPromo became async for them.
 
+const mongoose = require('mongoose');
 const { getPlan, priceFor } = require('./subscriptionPlans');
 const Subscription = require('../models/Subscription');
+const PromoCode = require('../models/PromoCode');
+const stripeClient = require('./stripeClient');
 
 const PROMOS = {
     HANDSFREE: {
@@ -56,11 +63,12 @@ const PROMOS = {
         active: true,
     },
 
-    // The same free month on the Fixed garage plan — the $250 one, where the
-    // covered moves come with a free park and retrieval every day at one spot.
+    // The same free month on the Fixed garage plan, where the covered moves
+    // come with a free park and retrieval every day at one spot. Since
+    // 2026-10-09 it converts at the price of the customer's fixed address.
     //
     // It exists because the plan is the hardest of the three to buy on faith:
-    // $250 is four times the street-cleaning plan, and the part that justifies
+    // $250 was four times the street-cleaning plan, and the part that justifies
     // it is the daily park, which nobody believes until they have used it for a
     // few weeks. A month of actually living with it is the argument.
     //
@@ -73,14 +81,14 @@ const PROMOS = {
         trialDays: 30,
         headline: 'First month free',
         detail:
-            'Your first month of Fixed garage is on us — the street-cleaning moves and a free park and retrieval every day at your spot. Cancel any time before it ends and you are never charged.',
+            'Your first month of Permanent valet is on us — the street-cleaning moves and a free park and retrieval every day at your spot. Cancel any time before it ends and you are never charged.',
         appliesTo: { tier: 'home_garage', interval: 'month' },
         firstTimeOnly: true,
         active: true,
     },
 
     // A week of Fixed garage instead of a month — the code to hand one
-    // customer who wants to try the daily park before paying $250 for it.
+    // customer who wants to try the daily park before paying for it.
     // Same plan, same card up front, same first-plan-only rule as LOLGARAGE;
     // it just bills on day 7.
     LMAOGARAGE: {
@@ -92,7 +100,7 @@ const PROMOS = {
         trialLabel: 'free week',
         headline: 'First week free',
         detail:
-            'Your first week of Fixed garage is on us — the street-cleaning moves and a free park and retrieval every day at your spot. Cancel any time before it ends and you are never charged.',
+            'Your first week of Permanent valet is on us — the street-cleaning moves and a free park and retrieval every day at your spot. Cancel any time before it ends and you are never charged.',
         appliesTo: { tier: 'home_garage', interval: 'month' },
         firstTimeOnly: true,
         active: true,
@@ -136,7 +144,9 @@ function envCouponPromos() {
         }));
 }
 
-function findPromo(code) {
+// The built-in table and the env codes, no database. Kept separate so the
+// admin endpoint can refuse a new code that would shadow a built-in one.
+function findStaticPromo(code) {
     const c = normalizeCode(code);
     if (!c) return null;
     const promo = PROMOS[c];
@@ -144,38 +154,119 @@ function findPromo(code) {
     return envCouponPromos().find((p) => p.code === c) || null;
 }
 
+// A PromoCode document in the shape the rest of this file works with.
+function fromDoc(doc) {
+    const a = doc.appliesTo || {};
+    const appliesTo =
+        a.tier || a.interval || a.movesPerWeek
+            ? { tier: a.tier || undefined, interval: a.interval || undefined, movesPerWeek: a.movesPerWeek || undefined }
+            : null;
+    return {
+        code: doc.code,
+        kind: doc.kind,
+        percentOff: doc.percentOff,
+        amountOffCents: doc.amountOffCents,
+        duration: doc.duration || 'once',
+        durationInMonths: doc.durationInMonths,
+        trialDays: doc.trialDays,
+        appliesTo,
+        firstTimeOnly: !!doc.firstTimeOnly,
+        headline: doc.headline || null,
+        detail: doc.detail || null,
+        rep: doc.rep || null,
+        stripeCouponId: doc.stripeCouponId || null,
+        promoCodeId: doc._id,
+        active: true,
+        source: 'db',
+    };
+}
+
+// A code from the database, if one is live under this name. A code that is
+// switched off, expired or used up reads as no code at all, so a built-in
+// code of the same name (there should never be one) is the fallback.
+async function findDbPromo(c) {
+    // No connection means no admin codes to find. Without this a script or
+    // test that never connected would wait out Mongoose's buffering timeout
+    // on every lookup.
+    if (mongoose.connection.readyState !== 1) return null;
+    const doc = await PromoCode.findOne({ code: c, active: true }).lean();
+    if (!doc) return null;
+    if (doc.expiresAt && new Date(doc.expiresAt).getTime() <= Date.now()) return null;
+    if (doc.maxRedemptions && (doc.redemptions || 0) >= doc.maxRedemptions) return null;
+    return fromDoc(doc);
+}
+
+// Admin-made codes first, then the built-in table, then the env coupons.
+async function findPromo(code) {
+    const c = normalizeCode(code);
+    if (!c) return null;
+    const fromDb = await findDbPromo(c);
+    if (fromDb) return fromDb;
+    return findStaticPromo(c);
+}
+
 // Does the promo cover the plan the customer picked? Returns null when it
 // does, or the sentence to show them when it does not.
 function planMismatch(promo, { tier, interval, movesPerWeek }) {
     const wants = promo && promo.appliesTo;
     if (!wants) return null;
-    const plan = getPlan(wants.tier);
-    const price = priceFor(wants.tier, wants.interval);
-    const dollars = price ? Math.round((price.amountCents * (wants.movesPerWeek || 1)) / 100) : null;
-    const name = plan ? plan.name : wants.tier;
     const fits =
         (!wants.tier || tier === wants.tier) &&
         (!wants.interval || interval === wants.interval) &&
         (!wants.movesPerWeek || Number(movesPerWeek) === wants.movesPerWeek);
     if (fits) return null;
+
+    const plan = wants.tier ? getPlan(wants.tier) : null;
+    const unit = wants.interval === 'week' ? 'week' : 'month';
+    // An admin's code can pin the interval alone.
+    if (!plan) {
+        return wants.interval
+            ? `${promo.code} covers plans billed by the ${unit}.`
+            : `${promo.code} does not cover this plan.`;
+    }
+    const name = plan.name;
+    const billed = wants.interval ? `, billed by the ${unit}` : '';
+    // Permanent valet is priced by its address, so there is no one number to
+    // quote for it here. Naming one would be wrong for most of Manhattan.
+    if (plan.pricedByAddress || !wants.interval) {
+        return `${promo.code} covers the ${name} plan${billed}.`;
+    }
     // Describe the plan the code actually covers. This sentence used to be
     // written for HANDSFREE alone and said "one move a week, billed monthly"
     // no matter which promo produced it — with a second code in the table it
     // would have told a two-move customer the wrong thing about their own
     // offer.
-    const unit = wants.interval === 'week' ? 'week' : 'month';
+    const price = priceFor(wants.tier, wants.interval);
     // Only a per-move plan is bought by the move. Spelling a weekly cadence on
-    // a flat plan describes a product we do not sell — LOLGARAGE is for Fixed
-    // garage, which has no moves-per-week to name, and would otherwise be
-    // advertised to the customer as "one move a week" at $250.
+    // a flat plan describes a product we do not sell.
     const perMove = plan && plan.perMove;
     if (!perMove) {
-        return `${promo.code} covers the ${name} plan at $${dollars} a ${unit}.`;
+        return `${promo.code} covers the ${name} plan at $${Math.round(price.amountCents / 100)} a ${unit}.`;
     }
-    const moves = wants.movesPerWeek || 1;
+    if (!wants.movesPerWeek) {
+        return `${promo.code} covers the ${name} plan${billed}.`;
+    }
+    const moves = wants.movesPerWeek;
+    const dollars = Math.round((price.amountCents * moves) / 100);
     const spelled = ['', 'one', 'two', 'three', 'four'][moves] || String(moves);
     const cadence = `${spelled} move${moves === 1 ? '' : 's'} a week`;
     return `${promo.code} covers the ${name} plan at $${dollars} a ${unit} — ${cadence}.`;
+}
+
+// The plan a code puts the customer on. A code locked to one plan snaps the
+// customer onto it rather than turning them away at the last screen; a field
+// the code leaves open keeps the customer's own choice. Null when the code
+// covers any plan.
+function applyToFor(promo, choice = {}) {
+    const wants = promo && promo.appliesTo;
+    if (!wants) return null;
+    const tier = wants.tier || choice.tier;
+    return {
+        tier,
+        interval: wants.interval || choice.interval,
+        // Moves a week only mean something on the plan the customer picked.
+        movesPerWeek: wants.movesPerWeek ?? (tier === choice.tier ? choice.movesPerWeek : undefined),
+    };
 }
 
 // Has this customer already had their free month? Trial codes are for a
@@ -198,37 +289,203 @@ async function promoRedemptionBlock(promo, userId) {
         : `${promo.code} is for a first plan, and yours has already started once.`;
 }
 
+// ---------------------------------------------------------------------------
+// Percent and amount codes
+// ---------------------------------------------------------------------------
+
+const UNUSABLE_MESSAGE = "That code can't be used on this plan.";
+
+// Stripe's floor is 50 cents; a dollar is the same nominal line the trial
+// card check uses. Below it, a first invoice can settle with no
+// PaymentIntent and no card, and the plan lapses on the second bill.
+const MIN_FIRST_INVOICE_CENTS = 100;
+
+function isDiscount(promo) {
+    return !!promo && (promo.kind === 'percent_off' || promo.kind === 'amount_off');
+}
+
+function money(cents) {
+    const n = (cents || 0) / 100;
+    return Number.isInteger(n) ? `$${n}` : `$${n.toFixed(2)}`;
+}
+
+/** One bill at `amountCents` with the code's discount taken off. */
+function discountedCents(promo, amountCents) {
+    if (promo.kind === 'percent_off') {
+        return Math.round((amountCents * (100 - promo.percentOff)) / 100);
+    }
+    if (promo.kind === 'amount_off') return Math.max(0, amountCents - promo.amountOffCents);
+    return amountCents;
+}
+
+/**
+ * A percent/amount code that would leave the first bill under $1 is refused.
+ * A free first period has to be a free_trial code — for the card-on-file
+ * reason at the top of this file. Returns the sentence, or null.
+ */
+function discountRefusal(promo, amountCents) {
+    if (!isDiscount(promo) || typeof amountCents !== 'number') return null;
+    return discountedCents(promo, amountCents) < MIN_FIRST_INVOICE_CENTS ? UNUSABLE_MESSAGE : null;
+}
+
+function discountHeadline(promo, interval) {
+    const off = promo.kind === 'percent_off' ? `${promo.percentOff}% off` : `${money(promo.amountOffCents)} off`;
+    if (promo.duration === 'forever') return off;
+    if (promo.duration === 'repeating') {
+        const n = promo.durationInMonths || 1;
+        return `${off} for ${n} month${n === 1 ? '' : 's'}`;
+    }
+    return `${off} your first ${interval === 'week' ? 'week' : 'month'}`;
+}
+
+function addMonths(date, n) {
+    const d = new Date(date.getTime());
+    d.setUTCMonth(d.getUTCMonth() + n);
+    return d;
+}
+
+// When full price starts again, or null when it never does.
+function discountEndsAt(promo, interval, now) {
+    if (promo.duration === 'forever') return null;
+    if (promo.duration === 'repeating') return addMonths(now, promo.durationInMonths || 1);
+    return interval === 'week' ? new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000) : addMonths(now, 1);
+}
+
 // What the customer is shown before they subscribe.
 function describe(promo, { amountCents, interval, now = new Date() } = {}) {
+    const thenInterval = interval || (promo.appliesTo && promo.appliesTo.interval) || 'month';
     const base = {
         code: promo.code,
         kind: promo.kind,
         headline: promo.headline,
         detail: promo.detail,
     };
+    if (isDiscount(promo)) {
+        const hasAmount = typeof amountCents === 'number';
+        const due = hasAmount ? discountedCents(promo, amountCents) : null;
+        const endsAt = discountEndsAt(promo, thenInterval, now);
+        return {
+            ...base,
+            headline: promo.headline || discountHeadline(promo, thenInterval),
+            detail:
+                promo.detail ||
+                (promo.duration === 'forever'
+                    ? 'Taken off every bill.'
+                    : promo.duration === 'repeating'
+                    ? `Taken off every bill for ${promo.durationInMonths || 1} month${(promo.durationInMonths || 1) === 1 ? '' : 's'}.`
+                    : 'Taken off your first bill.'),
+            percentOff: promo.kind === 'percent_off' ? promo.percentOff : null,
+            amountOffCents: promo.kind === 'amount_off' ? promo.amountOffCents : null,
+            duration: promo.duration,
+            durationInMonths: promo.duration === 'repeating' ? promo.durationInMonths : null,
+            dueTodayCents: due,
+            discountCents: hasAmount ? amountCents - due : null,
+            // After the discount runs out; a forever discount never does.
+            thenCents: hasAmount ? (promo.duration === 'forever' ? due : amountCents) : null,
+            thenFrom: endsAt,
+            thenInterval,
+            requiresCard: true,
+        };
+    }
+    if (promo.kind === 'rep') {
+        // A rep's code is credit, not a discount. The customer pays the price.
+        return {
+            ...base,
+            headline: promo.headline || 'Code applied',
+            detail: promo.detail || null,
+            dueTodayCents: amountCents ?? null,
+            discountCents: 0,
+            thenCents: amountCents ?? null,
+            thenInterval,
+            requiresCard: true,
+        };
+    }
     if (promo.kind !== 'free_trial') {
         return { ...base, dueTodayCents: null, requiresCard: true };
     }
     const endsAt = new Date(now.getTime() + promo.trialDays * 24 * 60 * 60 * 1000);
     return {
         ...base,
+        headline: promo.headline || `First ${promo.trialDays} days free`,
+        detail:
+            promo.detail ||
+            'Your card is saved now and charged when the free time ends. Cancel before then and you are never charged.',
         trialDays: promo.trialDays,
         trialEndsAt: endsAt,
         dueTodayCents: 0,
         // What lands on the card when the free month ends.
         thenCents: amountCents ?? null,
-        thenInterval: interval || (promo.appliesTo && promo.appliesTo.interval) || 'month',
+        thenInterval,
         // A card is taken up front so the plan converts instead of lapsing.
         requiresCard: true,
     };
 }
 
+/**
+ * The Stripe coupon behind a percent/amount code, minted the first time the
+ * code is used and stored on it. The idempotency key makes two first uses
+ * at the same moment get the same coupon back.
+ */
+async function ensureStripeCoupon(promo) {
+    if (!isDiscount(promo)) return null;
+    if (promo.stripeCouponId) return promo.stripeCouponId;
+    const stripe = stripeClient.get();
+    if (!stripe) throw new Error('Stripe API key not configured');
+    const id = String(promo.promoCodeId || promo.code);
+    const coupon = await stripe.coupons.create(
+        {
+            ...(promo.kind === 'percent_off'
+                ? { percent_off: promo.percentOff }
+                : { amount_off: promo.amountOffCents, currency: 'usd' }),
+            duration: promo.duration || 'once',
+            ...(promo.duration === 'repeating' ? { duration_in_months: promo.durationInMonths || 1 } : {}),
+            name: promo.code,
+            metadata: { promoCode: promo.code, promoCodeId: id },
+        },
+        { idempotencyKey: `promo-coupon-${id}` }
+    );
+    if (promo.promoCodeId) {
+        await PromoCode.updateOne(
+            { _id: promo.promoCodeId, stripeCouponId: { $exists: false } },
+            { $set: { stripeCouponId: coupon.id } }
+        );
+    }
+    promo.stripeCouponId = coupon.id;
+    return coupon.id;
+}
+
+/**
+ * Count the subscription's code against the code's redemptions — once, when
+ * the plan activates. The guard field makes a replayed webhook a no-op.
+ * Built-in codes have no document, so for them this only stamps the guard.
+ */
+async function countRedemption(sub) {
+    if (!sub || !sub.promoCode || sub.promoRedemptionCountedAt) return false;
+    const now = new Date();
+    const claimed = await Subscription.updateOne(
+        { _id: sub._id, promoRedemptionCountedAt: { $exists: false } },
+        { $set: { promoRedemptionCountedAt: now } }
+    );
+    if (!claimed.modifiedCount) return false;
+    sub.promoRedemptionCountedAt = now;
+    await PromoCode.updateOne({ code: normalizeCode(sub.promoCode) }, { $inc: { redemptions: 1 } });
+    return true;
+}
+
 module.exports = {
     PROMOS,
+    UNUSABLE_MESSAGE,
     normalizeCode,
     findPromo,
+    findStaticPromo,
     planMismatch,
+    applyToFor,
     promoRedemptionBlock,
     describe,
     trialLabel,
+    isDiscount,
+    discountedCents,
+    discountRefusal,
+    ensureStripeCoupon,
+    countRedemption,
 };
