@@ -14,16 +14,8 @@
 
 const TIERS = ['street_cleaning', 'home_garage', 'valet_anywhere'];
 
-// Every plan covers street-cleaning moves, so every plan carries the same
-// promise: New York suspends alternate side ~40 days a year, and a move the
-// customer paid for that never happened comes back to them. Stated as its own
-// field rather than only in `features` so the subscription screen can pull it
-// out and give it its own row instead of burying it in a bullet list.
-const SUSPENSION_GUARANTEE = {
-    headline: 'Suspended days are credited back',
-    detail:
-        'New York suspends street cleaning around 40 days a year. When it does, no valet comes, nothing happens to your car — and that day’s share of your plan is credited to your next bill automatically.',
-};
+// No plan credits or refunds a day the city suspends street cleaning
+// (Rishi, 2026-10-09). The valet simply doesn't come that day.
 
 const PLANS = {
     street_cleaning: {
@@ -34,7 +26,6 @@ const PLANS = {
             'Pick 1 or 2 covered moves a week to match your sign',
             'Valet takes the car, waits out the sweep, parks it back',
             'You never touch the app on cleaning day',
-            'City suspends a cleaning day? That move is credited back',
         ],
         // Priced PER WEEKLY MOVE via Stripe quantity: 1 move = $15/wk or
         // $50/mo, 2 moves = $30/wk or $100/mo (weekly stays 30% of monthly).
@@ -51,7 +42,6 @@ const PLANS = {
             'Everything in Street cleaning moves',
             'Pick one fixed spot — first park & retrieval there is free every day',
             'The spot can be changed once a month',
-            'City suspends a cleaning day? That move is credited back',
         ],
         weekly: { amountCents: 7500, lookupKey: 'vn_home_garage_weekly' },
         monthly: { amountCents: 25000, lookupKey: 'vn_home_garage_monthly' },
@@ -65,7 +55,6 @@ const PLANS = {
             'Everything in Home garage',
             'Free daily park & retrieval anywhere in the service area',
             'Coverage grows as we do',
-            'City suspends a cleaning day? That move is credited back',
         ],
         weekly: { amountCents: 9000, lookupKey: 'vn_valet_anywhere_weekly' },
         monthly: { amountCents: 30000, lookupKey: 'vn_valet_anywhere_monthly' },
@@ -100,7 +89,6 @@ function tierRank(tier) {
 module.exports = {
     TIERS,
     PLANS,
-    SUSPENSION_GUARANTEE,
     ASP_MOVES_PER_WEEK,
     HOME_RADIUS_METERS,
     getPlan,

@@ -10,7 +10,8 @@ const mongoose = require('mongoose');
  *
  *   - the customer app, to say "stay put" instead of "move your car"
  *   - the subscription scheduler, to NOT dispatch and pay a valet for a move
- *     that was never needed, and to credit the customer for the missed day
+ *     that was never needed (it no longer credits the customer for the day;
+ *     see services/subscriptionCredits.js)
  *
  * Keyed on a plain 'YYYY-MM-DD' string rather than a Date. Suspensions are
  * calendar facts in New York local time; storing them as Dates invites a

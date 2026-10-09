@@ -159,20 +159,20 @@ function section(title) {
     );
 
     /* ------------------------------------------------------------------ */
-    section('6. Every plan states the suspension credit');
+    section('6. No plan promises a credit for a suspended day');
     const plans = await api('GET', '/api/subscription/plans');
     check('plans endpoint live', plans.status === 200);
-    const allMention = (plans.json?.plans || []).every((p) =>
-        (p.features || []).some((f) => /credited back/i.test(f))
+    const noneMention = (plans.json?.plans || []).every((p) =>
+        !(p.features || []).some((f) => /credit|refund/i.test(f) && /suspend/i.test(f))
     );
     check(
-        'all three plans say suspended days are credited back',
-        allMention,
+        'no plan says a suspended day is credited or refunded',
+        noneMention,
         (plans.json?.plans || []).map((p) => p.features)
     );
     check(
-        'the guarantee is its own field for the subscriptions screen to highlight',
-        !!plans.json?.suspensionGuarantee?.headline,
+        'the response carries no suspension guarantee',
+        plans.json?.suspensionGuarantee === undefined,
         plans.json?.suspensionGuarantee
     );
 

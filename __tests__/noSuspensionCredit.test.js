@@ -56,3 +56,16 @@ test('the scheduler no longer calls the credit at all', () => {
     // The suspended-day skip itself is still there.
     expect(src).toMatch(/outcome: 'suspended'/);
 });
+
+test('no plan, and nothing /plans returns, promises a credit for a suspended day', () => {
+    const { PLANS } = require('../services/subscriptionPlans');
+    const catalog = require('../services/subscriptionPlans');
+    for (const plan of Object.values(PLANS)) {
+        for (const line of [plan.blurb, ...plan.features]) {
+            expect(line).not.toMatch(/credited back|credit back|refund/i);
+        }
+    }
+    expect(catalog.SUSPENSION_GUARANTEE).toBeUndefined();
+    const controller = fs.readFileSync(path.join(__dirname, '../controllers/subscriptionController.js'), 'utf8');
+    expect(controller).not.toMatch(/suspensionGuarantee|SUSPENSION_GUARANTEE/);
+});

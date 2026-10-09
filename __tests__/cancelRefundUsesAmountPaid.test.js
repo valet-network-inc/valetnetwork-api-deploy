@@ -6,8 +6,9 @@
  *
  * The two figures come apart constantly in production:
  *
- *   - a city-suspended street-cleaning day posts a Stripe balance credit, so
- *     the next invoice settles under list ($50 plan, $37.50 collected);
+ *   - a city-suspended street-cleaning day used to post a Stripe balance
+ *     credit (stopped 2026-10-09), so an invoice could settle under list
+ *     ($50 plan, $37.50 collected); any credit on the account does the same;
  *   - changePlan bills with proration_behavior 'always_invoice', so the
  *     period's money ends up split across the renewal invoice and a small
  *     proration invoice.

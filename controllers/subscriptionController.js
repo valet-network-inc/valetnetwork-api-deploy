@@ -25,7 +25,7 @@ const User = require('../models/User');
 const Order = require('../models/Order');
 const stripeModule = require('stripe');
 const stripe = process.env.STRIPE_API_KEY ? stripeModule(process.env.STRIPE_API_KEY) : null;
-const { PLANS, getPlan, priceFor , SUSPENSION_GUARANTEE } = require('../services/subscriptionPlans');
+const { PLANS, getPlan, priceFor } = require('../services/subscriptionPlans');
 const {
     isEntitled,
     buildStatusPayload,
@@ -269,8 +269,6 @@ exports.getPlans = async (req, res) => {
     res.status(200).json({
         success: true,
         plans,
-        suspensionGuarantee: SUSPENSION_GUARANTEE,
-
         cancelPolicy:
             'Cancel anytime — you are refunded for services not rendered, priced at regular per-park rates.',
     });
@@ -731,8 +729,9 @@ exports.cancelSubscription = async (req, res) => {
 
         // What the customer ACTUALLY paid for the period being cancelled — not
         // the plan's list price. Those two come apart routinely: a suspended
-        // street-cleaning day posts a Stripe balance credit, so the period's
-        // invoice settles below sticker, and a mid-period plan change bills a
+        // street-cleaning day used to post a Stripe balance credit (stopped
+        // 2026-10-09), so the period's invoice settled below sticker, and a
+        // mid-period plan change bills a
         // separate proration invoice on top of the renewal one. Refunding
         // against the sticker was wrong in both directions: it refused the
         // refund outright when the invoice came in under list (a $50/mo
