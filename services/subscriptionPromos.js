@@ -472,6 +472,138 @@ async function countRedemption(sub) {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Admin: making and editing codes
+// ---------------------------------------------------------------------------
+
+const DURATIONS = ['once', 'repeating', 'forever'];
+
+/**
+ * Check an admin's new code and save it. Returns { code } or { error }.
+ *   { code, kind, percentOff?, amountOffCents?, duration?, durationInMonths?,
+ *     trialDays?, appliesTo?, firstTimeOnly?, maxRedemptions?, expiresAt?,
+ *     rep?, headline?, detail? }
+ * A name that a built-in or env code already uses is refused: the customer
+ * would type one and get the other.
+ */
+async function createCode(input = {}, createdBy = 'admin') {
+    const code = normalizeCode(input.code);
+    if (!/^[A-Z0-9]{3,24}$/.test(code)) return { error: 'A code is 3 to 24 letters or digits.' };
+    if (findStaticPromo(code)) return { error: `${code} is a built-in code.` };
+    if (await PromoCode.exists({ code })) return { error: `${code} already exists.` };
+
+    const kind = input.kind;
+    const doc = { code, kind, createdBy };
+    if (kind === 'percent_off') {
+        const pct = Number(input.percentOff);
+        // 100% would make the first bill $0, which only a trial may do.
+        if (!Number.isInteger(pct) || pct < 1 || pct > 99) return { error: 'Percent off is 1 to 99.' };
+        doc.percentOff = pct;
+    } else if (kind === 'amount_off') {
+        const cents = Number(input.amountOffCents);
+        if (!Number.isInteger(cents) || cents < 100) return { error: 'Amount off is at least $1, in cents.' };
+        doc.amountOffCents = cents;
+    } else if (kind === 'free_trial') {
+        const days = Number(input.trialDays);
+        if (!Number.isInteger(days) || days < 1 || days > 90) return { error: 'A free trial is 1 to 90 days.' };
+        doc.trialDays = days;
+    } else if (kind === 'rep') {
+        if (!input.rep || !mongoose.isValidObjectId(input.rep)) return { error: 'A rep code needs the rep.' };
+    } else {
+        return { error: 'kind is percent_off, amount_off, free_trial or rep.' };
+    }
+    if (input.rep !== undefined && input.rep !== null && input.rep !== '') {
+        if (!mongoose.isValidObjectId(input.rep)) return { error: 'rep must be a rep id.' };
+        doc.rep = input.rep;
+    }
+    if (isDiscount(doc)) {
+        const duration = input.duration || 'once';
+        if (!DURATIONS.includes(duration)) return { error: 'duration is once, repeating or forever.' };
+        doc.duration = duration;
+        if (duration === 'repeating') {
+            const months = Number(input.durationInMonths);
+            if (!Number.isInteger(months) || months < 1 || months > 24) {
+                return { error: 'A repeating discount lasts 1 to 24 months.' };
+            }
+            doc.durationInMonths = months;
+        }
+    }
+    const a = input.appliesTo || {};
+    if (a.tier && !getPlan(a.tier)) return { error: `${a.tier} is not a plan.` };
+    if (a.interval && !['week', 'month'].includes(a.interval)) return { error: 'interval is week or month.' };
+    if (a.tier || a.interval || a.movesPerWeek) {
+        doc.appliesTo = {
+            ...(a.tier ? { tier: a.tier } : {}),
+            ...(a.interval ? { interval: a.interval } : {}),
+            ...(a.movesPerWeek ? { movesPerWeek: Number(a.movesPerWeek) } : {}),
+        };
+    }
+    doc.firstTimeOnly = !!input.firstTimeOnly;
+    if (input.maxRedemptions) {
+        const max = Number(input.maxRedemptions);
+        if (!Number.isInteger(max) || max < 1) return { error: 'maxRedemptions is a whole number.' };
+        doc.maxRedemptions = max;
+    }
+    if (input.expiresAt) {
+        const at = new Date(input.expiresAt);
+        if (!Number.isFinite(at.getTime())) return { error: 'expiresAt is not a date.' };
+        doc.expiresAt = at;
+    }
+    if (input.headline) doc.headline = String(input.headline).trim();
+    if (input.detail) doc.detail = String(input.detail).trim();
+    try {
+        return { code: (await PromoCode.create(doc)).toObject() };
+    } catch (err) {
+        if (err && err.code === 11000) return { error: `${code} already exists.` };
+        throw err;
+    }
+}
+
+/**
+ * Switch a code on or off, or change its cap, expiry or wording. Its terms
+ * (kind, amount, duration) do not change once made: a customer may already
+ * hold a Stripe coupon minted from them. Returns { code } or { error }.
+ */
+async function updateCode(rawCode, patch = {}) {
+    const code = normalizeCode(rawCode);
+    const set = {};
+    const unset = {};
+    if (patch.active !== undefined) set.active = !!patch.active;
+    if (patch.maxRedemptions !== undefined) {
+        if (patch.maxRedemptions === null) unset.maxRedemptions = 1;
+        else if (!Number.isInteger(Number(patch.maxRedemptions)) || Number(patch.maxRedemptions) < 1) {
+            return { error: 'maxRedemptions is a whole number.' };
+        } else set.maxRedemptions = Number(patch.maxRedemptions);
+    }
+    if (patch.expiresAt !== undefined) {
+        if (patch.expiresAt === null) unset.expiresAt = 1;
+        else {
+            const at = new Date(patch.expiresAt);
+            if (!Number.isFinite(at.getTime())) return { error: 'expiresAt is not a date.' };
+            set.expiresAt = at;
+        }
+    }
+    for (const field of ['headline', 'detail']) {
+        if (patch[field] !== undefined) set[field] = String(patch[field] || '').trim();
+    }
+    const updated = await PromoCode.findOneAndUpdate(
+        { code },
+        { ...(Object.keys(set).length ? { $set: set } : {}), ...(Object.keys(unset).length ? { $unset: unset } : {}) },
+        { new: true }
+    ).lean();
+    if (!updated) return { error: `No code named ${code}.` };
+    return { code: updated };
+}
+
+/** Every admin code, newest first, and the built-in ones for reference. */
+async function listCodes() {
+    const codes = await PromoCode.find({}).sort({ createdAt: -1 }).lean();
+    const builtIn = Object.values(PROMOS)
+        .filter((p) => p.active)
+        .map((p) => ({ code: p.code, kind: p.kind, trialDays: p.trialDays, appliesTo: p.appliesTo, builtIn: true }));
+    return { codes, builtIn };
+}
+
 module.exports = {
     PROMOS,
     UNUSABLE_MESSAGE,
@@ -488,4 +620,7 @@ module.exports = {
     discountRefusal,
     ensureStripeCoupon,
     countRedemption,
+    createCode,
+    updateCode,
+    listCodes,
 };

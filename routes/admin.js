@@ -24,6 +24,7 @@ const aspSuspensionAdmin = require('../controllers/aspSuspensionAdminController'
 const managedCarAdmin = require('../controllers/managedCarAdminController');
 const adminSubscription = require('../controllers/adminSubscriptionController');
 const adminPromo = require('../controllers/adminPromoController');
+const adminSales = require('../controllers/adminSalesController');
 const requireAdminKey = require('../middleware/requireAdminKey');
 
 // Everything below this line needs the `x-admin-key` header. Only the four
@@ -109,6 +110,14 @@ router.get('/subscriptions', adminSubscription.getSubscriptionOverview);
 // "Have a code?" field on the build already on their phone.
 router.get('/pending-promo', adminPromo.listPendingPromo);
 router.post('/pending-promo', adminPromo.setPendingPromo);
+// --- Prices, codes and Contact sales ----------------------------------
+// The same edits the rep portal's admin section makes, for ops scripts.
+router.get('/sales/pricing', adminSales.getPricing);
+router.put('/sales/pricing', adminSales.putPricing);
+router.get('/sales/codes', adminSales.getCodes);
+router.post('/sales/codes', adminSales.postCode);
+router.patch('/sales/codes/:code', adminSales.patchCode);
+
 // Where paying customers stop — built from server-side stamps only.
 router.get('/checkout-funnel', getCheckoutFunnel);
 
