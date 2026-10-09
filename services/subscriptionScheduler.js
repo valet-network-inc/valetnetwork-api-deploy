@@ -15,8 +15,9 @@
 //      bookings count against it).
 //   5. A subscriber with any live order is skipped and retried next tick
 //      until the window closes — the car is already in our care.
-//   6. Days the city has suspended are never booked, and the customer is
-//      credited that day's share of the plan instead.
+//   6. Days the city has suspended are never booked. Nothing is credited
+//      for them (Rishi, 2026-10-09: no refund and no credit when the city
+//      suspends street cleaning, on any plan).
 //
 // The days themselves come from `User.cleaningSchedule` — the schedule belongs
 // to the person, not the plan, so the free reminder and the paid move can
@@ -41,7 +42,6 @@ const { ASP_MOVES_PER_WEEK } = require('./subscriptionPlans');
 const { nyDateKey, nextNyOccurrence } = require('./nyTime');
 const { isManagedTier } = require('./curbCustody');
 const { getSuspension } = require('./aspSuspensions');
-const { creditSuspendedDay } = require('./subscriptionCredits');
 
 const LEAD_MS = 45 * 60 * 1000; // start trying 45 min before the sweep
 const LATE_GRACE_MS = 5 * 60 * 1000; // stop trying 5 min after it starts
@@ -147,8 +147,11 @@ async function bookOccurrence(sub, day, occurrence, { io, notify, now }) {
     }
 
     // The city suspends alternate side ~40 days a year. Dispatching on one of
-    // those costs a valet fee for a move nobody needed, so skip it and hand
-    // the customer back that day's share of what they paid.
+    // those costs a valet fee for a move nobody needed, so skip it. The
+    // customer is not credited for the day: Rishi, 2026-10-09, "there aren't
+    // any refunds for if the city suspends a street cleaning day. no credit
+    // back either" — and that holds for subscribers who signed up under the
+    // old promise too.
     //
     // Note the fail direction: getSuspension() returns null on any error, so a
     // database blip books the move rather than skipping it. Booking needlessly
@@ -156,7 +159,6 @@ async function bookOccurrence(sub, day, occurrence, { io, notify, now }) {
     // is the one thing the plan exists to prevent.
     const suspension = await getSuspension(nyDateKey(occurrence));
     if (suspension) {
-        await creditSuspendedDay(sub, occurrence, suspension);
         return { key, outcome: 'suspended', reason: suspension.reason };
     }
 

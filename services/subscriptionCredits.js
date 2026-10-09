@@ -1,31 +1,16 @@
 /**
- * Crediting a subscriber for a street-cleaning day the city suspended.
+ * What one street-cleaning move is worth on a plan.
  *
- * If the sweep does not happen, no valet moves the car and the customer has
- * paid for a move they did not get. That day comes back.
+ * This file used to credit a subscriber for every day the city suspended
+ * street cleaning. That credit is discontinued (see creditSuspendedDay below);
+ * the per-move maths stays because it is still the honest value of a move.
  *
- * TWO THINGS WORTH KNOWING ABOUT THE MATH
- *
- * 1. It is not a flat $12.50. A month contains four OR five of any given
- *    weekday — 4.33 on average — so a plan billed at $50/month for one move a
- *    week is worth $12.50 a move in a four-move month and $10.00 in a
- *    five-move one. Hardcoding $12.50 quietly over-refunds every five-move
- *    month, and that error grows with the subscriber count. So the value of a
- *    move is always `period price ÷ moves actually scheduled in that period`.
- *
- * 2. It is a Stripe customer balance credit, not a card refund. Refunds cost
- *    the processing fee again, take days, and give the customer's bank a
- *    reason to ask questions. A credit lands on the next invoice as a line
- *    that says what it was for, and costs nothing.
+ * It is not a flat $12.50. A month contains four OR five of any given
+ * weekday — 4.33 on average — so a plan billed at $50/month for one move a
+ * week is worth $12.50 a move in a four-move month and $10.00 in a five-move
+ * one. So the value of a move is always `period price ÷ moves actually
+ * scheduled in that period`.
  */
-
-const Stripe = require('stripe');
-const AspCredit = require('../models/AspCredit');
-const { nyDateKey } = require('./nyTime');
-
-const stripe = process.env.STRIPE_API_KEY
-    ? new Stripe(process.env.STRIPE_API_KEY)
-    : null;
 
 /**
  * How many scheduled moves fall inside this billing period.
@@ -65,82 +50,15 @@ function perMoveCents(sub) {
 }
 
 /**
- * Credit one suspended day, once.
- *
- * Idempotent on (subscription, date): the scheduler retries an occurrence
- * every minute across its window, and a customer must not be credited
- * forty times for one holiday. The unique index on AspCredit is what actually
- * guarantees that; the pre-check is only there to save the round trip.
+ * Discontinued (Rishi, 2026-10-09): "there aren't any refunds for if the city
+ * suspends a street cleaning day. no credit back either." That holds on every
+ * plan, for subscribers who signed up under the old promise as well as new
+ * ones. The scheduler no longer calls this. It stays as a no-op rather than
+ * being deleted so nothing that still imports it can post a credit, and the
+ * AspCredit ledger keeps the credits that were already posted.
  */
-async function creditSuspendedDay(sub, occurrence, suspension) {
-    const dateKey = nyDateKey(occurrence);
-
-    try {
-        const already = await AspCredit.findOne({
-            subscription: sub._id,
-            date: dateKey,
-        }).lean();
-        if (already) return { credited: false, reason: 'already_credited' };
-
-        const amountCents = perMoveCents(sub);
-        if (amountCents <= 0) {
-            console.warn(
-                `Auto-ASP credit: could not price a move for subscription ${sub._id} — skipping credit for ${dateKey}`
-            );
-            return { credited: false, reason: 'unpriceable' };
-        }
-
-        // Write the ledger row FIRST. If Stripe then fails we retry the
-        // transfer, not the decision — the alternative is a duplicate credit
-        // whenever Stripe times out after succeeding.
-        const record = await AspCredit.create({
-            subscription: sub._id,
-            user: sub.user,
-            date: dateKey,
-            amountCents,
-            reason: suspension.reason,
-            stripeStatus: 'pending',
-        });
-
-        if (!stripe || !sub.stripeCustomerId) {
-            await AspCredit.updateOne(
-                { _id: record._id },
-                { $set: { stripeStatus: 'skipped', note: 'No Stripe customer on file' } }
-            );
-            return { credited: true, amountCents, stripe: false };
-        }
-
-        const tx = await stripe.customers.createBalanceTransaction(
-            sub.stripeCustomerId,
-            {
-                // Negative reduces what they owe. Stripe's sign convention here
-                // is the opposite of what it reads like.
-                amount: -amountCents,
-                currency: 'usd',
-                description: `Street cleaning suspended ${dateKey} — ${suspension.reason}`,
-                metadata: {
-                    subscriptionId: String(sub._id),
-                    date: dateKey,
-                    reason: suspension.reason,
-                },
-            }
-        );
-
-        await AspCredit.updateOne(
-            { _id: record._id },
-            { $set: { stripeStatus: 'applied', stripeTransactionId: tx.id } }
-        );
-
-        console.log(
-            `Auto-ASP: credited ${(amountCents / 100).toFixed(2)} to subscription ${sub._id} for suspended ${dateKey} (${suspension.reason})`
-        );
-        return { credited: true, amountCents, stripe: true };
-    } catch (err) {
-        // E11000 means another tick won the race — the correct outcome.
-        if (err && err.code === 11000) return { credited: false, reason: 'already_credited' };
-        console.error(`Auto-ASP credit failed for ${dateKey}:`, err.message);
-        return { credited: false, reason: 'error', error: err.message };
-    }
+async function creditSuspendedDay() {
+    return { credited: false, reason: 'discontinued' };
 }
 
 module.exports = {
