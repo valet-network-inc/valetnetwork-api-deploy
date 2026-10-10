@@ -48,7 +48,9 @@ function priceLineLabel(quote) {
 const MINUS = '\u2212';
 
 function line(label, amountCents, kind, amount) {
-    return { label, amountCents, amount: amount || dollars(amountCents), kind };
+    const shown = amount || dollars(amountCents);
+    // `value` is the app's name for the same printed amount.
+    return { label, amountCents, amount: shown, value: shown, kind };
 }
 
 /**
@@ -215,8 +217,10 @@ async function buildPriceQuote({
                           count: waitlist.count,
                           needed: waitlist.needed,
                           unlocked: false,
+                          live: false,
                           startsAt: waitlist.startsAt || null,
                           message: waitlist.note,
+                          note: waitlist.note,
                       },
                   }
                 : {}),

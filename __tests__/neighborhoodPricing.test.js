@@ -240,8 +240,8 @@ describe('POST /price', () => {
         expect(status).toBe(200);
         expect(body.available).toBe(true);
         expect(body.lines).toEqual([
-            { label: 'Permanent valet in Chelsea', amountCents: 52500, amount: '$525/mo', kind: 'price' },
-            { label: 'Due today', amountCents: 52500, amount: '$525', kind: 'total' },
+            { label: 'Permanent valet in Chelsea', amountCents: 52500, amount: '$525/mo', value: '$525/mo', kind: 'price' },
+            { label: 'Due today', amountCents: 52500, amount: '$525', value: '$525', kind: 'total' },
         ]);
         expect(body.cta).toBe('Subscribe · $525/mo');
         expect(body.contactSales.label).toBe('Contact sales');
@@ -251,9 +251,9 @@ describe('POST /price', () => {
         await PromoCode.create({ code: 'SAVE20', kind: 'percent_off', percentOff: 20, duration: 'once' });
         const { body } = await buildPriceQuote({ ...GARAGE, address: CHELSEA, promoCode: 'save20', now: NOW });
         expect(body.lines).toEqual([
-            { label: 'Permanent valet in Chelsea', amountCents: 52500, amount: '$525/mo', kind: 'price' },
-            { label: 'SAVE20 · 20% off your first month', amountCents: -10500, amount: '−$105', kind: 'discount' },
-            { label: 'Due today', amountCents: 42000, amount: '$420', kind: 'total' },
+            { label: 'Permanent valet in Chelsea', amountCents: 52500, amount: '$525/mo', value: '$525/mo', kind: 'price' },
+            { label: 'SAVE20 · 20% off your first month', amountCents: -10500, amount: '−$105', value: '−$105', kind: 'discount' },
+            { label: 'Due today', amountCents: 42000, amount: '$420', value: '$420', kind: 'total' },
         ]);
         expect(body.note).toBe('Then $525/mo from Nov 9.');
         expect(body.cta).toBe('Subscribe · $420 today');
