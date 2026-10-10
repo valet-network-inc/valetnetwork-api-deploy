@@ -122,7 +122,8 @@ async function statusFor(rep) {
 async function pdfFor(rep) {
     const doc = await current();
     const PDFDocument = require('pdfkit');
-    const a = parse(doc.text, { name: rep.name, date: rep.agreement.signedAt });
+    const signed = isSigned(rep, doc);
+    const a = parse(doc.text, { name: rep.name, date: signed ? rep.agreement.signedAt : new Date() });
     const pdf = new PDFDocument({ size: 'LETTER', margins: { top: 60, bottom: 60, left: 64, right: 64 } });
     const chunks = [];
     const done = new Promise((resolve, reject) => {
@@ -148,18 +149,24 @@ async function pdfFor(rep) {
         }
     }
     if (a.note) pdf.moveDown(0.4).font('Helvetica-Oblique').fontSize(9).text(a.note);
-    pdf.moveDown(1.2).font('Helvetica-Bold').fontSize(12).text('Signed');
-    pdf.moveDown(0.3).font('Helvetica').fontSize(10.5);
-    pdf.text(`The Rep: ${rep.agreement.signedName}`);
-    pdf.text(`Date: ${longDate(rep.agreement.signedAt)}`);
-    pdf.text(`Signed electronically by typing their full name. Agreement version ${rep.agreement.version}.`);
+    if (signed) {
+        pdf.moveDown(1.2).font('Helvetica-Bold').fontSize(12).text('Signed');
+        pdf.moveDown(0.3).font('Helvetica').fontSize(10.5);
+        pdf.text(`The Rep: ${rep.agreement.signedName}`);
+        pdf.text(`Date: ${longDate(rep.agreement.signedAt)}`);
+        pdf.text(`Signed electronically by typing their full name. Agreement version ${rep.agreement.version}.`);
+    } else {
+        pdf.moveDown(1.2).font('Helvetica-Bold').fontSize(12).text('Not signed yet');
+        pdf.font('Helvetica').fontSize(10.5);
+    }
     pdf.moveDown(0.6).text('Valet Network, Inc. · 21-31 24th Street, Astoria, NY 11105 · rishi@valetnetwork.co');
     pdf.end();
     return done;
 }
 
 function pdfFilename(rep) {
-    return `Commission agreement · ${rep.name} · ${isoDay(rep.agreement.signedAt)}.pdf`;
+    const at = rep.agreement && rep.agreement.signedAt;
+    return at ? `Commission agreement · ${rep.name} · ${isoDay(at)}.pdf` : 'Commission agreement (draft).pdf';
 }
 
 /** Email the signed copy. Returns { status, sentTo, error? }. Never throws. */

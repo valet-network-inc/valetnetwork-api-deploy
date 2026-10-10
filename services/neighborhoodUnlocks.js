@@ -893,6 +893,7 @@ async function memberView(member, now = new Date()) {
 
     return {
         id: String(member._id),
+        _id: String(member._id),
         status: member.status,
         source: member.source,
         variant,
@@ -906,6 +907,10 @@ async function memberView(member, now = new Date()) {
         homeAddress: member.homeAddress,
         vehicle: member.vehicle || null,
         card,
+        cardBrand: member.cardBrand || null,
+        cardLast4: member.cardLast4 || null,
+        startedAt: member.startedAt || null,
+        unlock: { label: name, count, needed: UNLOCK_AT, unlocked, startsAt },
         rep: rep ? { firstName: rep } : null,
         copy,
         after,

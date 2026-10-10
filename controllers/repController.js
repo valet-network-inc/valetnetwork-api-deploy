@@ -68,9 +68,7 @@ exports.sign = wrap(async (req, res) => {
 
 // GET /api/rep/agreement/pdf
 exports.agreementPdf = wrap(async (req, res) => {
-    if (!(await repAgreement.isSignedNow(req.rep))) {
-        return res.status(403).json({ success: false, code: 'AGREEMENT_REQUIRED', message: 'Sign the agreement first.' });
-    }
+    // Before signing it is the text to read; after, the copy as signed.
     const pdf = await repAgreement.pdfFor(req.rep);
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader(

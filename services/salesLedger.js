@@ -336,6 +336,7 @@ async function customers(repId, now = new Date()) {
         const loose = await Subscription.find({
             rep: repId,
             unlockMember: { $exists: false },
+            _id: { $nin: subIds },
             activatedAt: { $exists: true },
         }).lean();
         for (const sub of loose) {

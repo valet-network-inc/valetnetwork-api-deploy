@@ -165,7 +165,9 @@ exports.edit = wrap(async (req, res) => {
     const vehicle = v
         ? {
               ...(v.color !== undefined ? { color: v.color } : {}),
-              ...(v.model !== undefined || v.description !== undefined ? { model: v.model ?? v.description } : {}),
+              ...(v.model !== undefined || v.description !== undefined || v.make !== undefined
+                  ? { model: [v.make, v.model ?? v.description].filter(Boolean).join(' ') }
+                  : {}),
               ...(v.licensePlate !== undefined || v.plate !== undefined ? { licensePlate: v.licensePlate ?? v.plate } : {}),
           }
         : undefined;
