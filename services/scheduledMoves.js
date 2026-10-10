@@ -149,10 +149,13 @@ async function cardSetup(userId) {
     if (!user) return { status: 404, error: 'Not found.' };
     const { ensureStripeCustomer } = require('../controllers/subscriptionController');
     const customerId = await ensureStripeCustomer(user);
+    // Cards only (Apple Pay and Google Pay are cards too): a run is charged to
+    // a saved card, and anything else saved here would leave the customer
+    // asked for a card again.
     const intent = await stripe.setupIntents.create({
         customer: customerId,
         usage: 'off_session',
-        automatic_payment_methods: { enabled: true },
+        payment_method_types: ['card'],
         metadata: { purpose: 'schedule_card', userId: String(user._id) },
     });
     const ephemeralKey = await stripe.ephemeralKeys.create({ customer: customerId }, { apiVersion: '2024-06-20' });
