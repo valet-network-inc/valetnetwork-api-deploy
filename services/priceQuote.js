@@ -204,7 +204,22 @@ async function buildPriceQuote({
             lines,
             ...(notes.length ? { note: notes.join(' ') } : {}),
             // The ⓘ box above Subscribe.
-            ...(waitlist ? { waitlist, info: waitlist.note } : {}),
+            ...(waitlist
+                ? {
+                      waitlist,
+                      info: waitlist.note,
+                      // The clients' unlock shape. Not started counts as locked
+                      // here: the card is only saved today either way.
+                      unlock: {
+                          label: waitlist.neighborhood,
+                          count: waitlist.count,
+                          needed: waitlist.needed,
+                          unlocked: false,
+                          startsAt: waitlist.startsAt || null,
+                          message: waitlist.note,
+                      },
+                  }
+                : {}),
             cta:
                 dueTodayCents === amountCents || waitlist
                     ? `Subscribe · ${dollars(amountCents)}${unit}`
