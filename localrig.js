@@ -23,6 +23,8 @@ const { MongoMemoryServer } = require('mongodb-memory-server');
   // Nothing periodic. A sweep or an auto-cancel firing mid-screenshot would
   // rewrite the very state we are trying to photograph.
   process.env.SUBS_SCHEDULER_ENABLED = 'false';
+  process.env.UNLOCK_JOB_ENABLED = 'false';
+  process.env.SCHEDULED_MOVES_ENABLED = 'false';
   process.env.ASP_SWEEP_ENABLED = 'false';
   process.env.AUTO_CANCEL_ENABLED = 'false';
   process.env.CLEANING_SCHEDULER_ENABLED = 'false';

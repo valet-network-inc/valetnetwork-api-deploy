@@ -504,10 +504,21 @@ exports.createOrder = async (req, res) => {
 
         // Enterprise (doorman) accounts are allowed to have multiple concurrent orders
         // because each order is for a different end-customer. Skip the active-order check for them.
+        let repark = null;
         const customerDoc = await User.findById(customer).select('isDoorman phone');
         const isEnterpriseCustomer = !!customerDoc?.isDoorman;
 
         if (!isEnterpriseCustomer) {
+            // A managed car whose keys the customer holds: Park my car hands
+            // it back to us. Its open park doesn't block the new one, and
+            // ends once the new one is saved (curbCustody.endForRepark).
+            if ((orderType || 'parking') === 'parking') {
+                try {
+                    repark = await curbCustody.reparkCandidate(customer);
+                } catch (err) {
+                    console.error('createOrder: repark check failed:', err.message);
+                }
+            }
             // A booking scheduled well into the future (advance ASP move,
             // away-mode start) must not lock the customer out of parking
             // today — only orders that are live now, or starting within 6
@@ -520,6 +531,7 @@ exports.createOrder = async (req, res) => {
                     { status: { $in: ['accepted', 'in_progress', 'parked'] } },
                     { status: 'pending', pickUpTime: { $lte: soonCutoff } },
                 ],
+                ...(repark && repark.currentOrder ? { _id: { $ne: repark.currentOrder } } : {}),
             });
 
             if (activeOrder) {
@@ -958,6 +970,14 @@ exports.createOrder = async (req, res) => {
         await order.save();
         
         console.log('Order saved successfully:', order._id);
+
+        if (repark) {
+            try {
+                await curbCustody.endForRepark(customer);
+            } catch (err) {
+                console.error('createOrder: repark hand-back failed:', err.message);
+            }
+        }
 
         // Increment event usage if event code was used
         if (isEventValid && validatedEvent) {

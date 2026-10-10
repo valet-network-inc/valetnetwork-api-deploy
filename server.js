@@ -202,6 +202,7 @@ app.use('/api/admin', require('./routes/admin'));
 app.use('/api/rep', require('./routes/rep'));
 app.use('/api/waitlist', require('./routes/waitlist'));
 app.use('/api/referral', require('./routes/referral'));
+app.use('/api/schedule', require('./routes/schedule'));
 app.use('/api/valet', require('./routes/valet'));
 app.use('/api/webhooks', require('./routes/webhook'));
 
@@ -319,6 +320,22 @@ server.listen(PORT, () => {
             console.log('Scheduled dispatch registered (runs every 60s)');
         } catch (err) {
             console.error('Failed to register scheduled dispatch:', err.message);
+        }
+    }
+
+    // Background job: scheduled pick-ups and drop-offs — turns each one into
+    // an ordinary order shortly before it (services/scheduledMoves.js).
+    if (process.env.SCHEDULED_MOVES_ENABLED === 'false') {
+        console.warn('Scheduled moves DISABLED via SCHEDULED_MOVES_ENABLED=false — booked pick-ups and drop-offs will not run.');
+    } else {
+        try {
+            const scheduledMoves = require('./services/scheduledMoves');
+            setInterval(() => {
+                scheduledMoves.tick().catch((e) => console.error('scheduledMoves interval error:', e.message));
+            }, 60 * 1000);
+            console.log('Scheduled moves registered (runs every 60s)');
+        } catch (err) {
+            console.error('Failed to register scheduled moves:', err.message);
         }
     }
 

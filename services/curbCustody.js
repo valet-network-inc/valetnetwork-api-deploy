@@ -808,6 +808,31 @@ async function close({ custody, reason }) {
     return custody;
 }
 
+/**
+ * Park my car while the customer holds the keys of a car we manage (the
+ * pre-release must-do, Oct 2 2026). Until now the only action on offer was
+ * "bring it back", which put them in a code box for a car they already had.
+ * The open park ends here — they have the car — and the new park they are
+ * booking opens custody again when the valet parks it. Returns the closed
+ * custody, or null when there is nothing to hand back.
+ */
+/** The open custody a new park would replace: keys with the customer. */
+async function reparkCandidate(customerId) {
+    const custody = await openFor(customerId);
+    return custody && custody.keysWith === 'customer' ? custody : null;
+}
+
+async function endForRepark(customerId, now = new Date()) {
+    const custody = await openFor(customerId);
+    if (!custody || custody.keysWith !== 'customer') return null;
+    await Order.updateOne(
+        { _id: custody.currentOrder, status: 'parked' },
+        { $set: { status: 'completed', parkClosedAt: now, keysStayWithValet: false } }
+    );
+    await close({ custody, reason: 'superseded' });
+    return custody;
+}
+
 async function closeSafely({ orderId, customerId, reason }) {
     try {
         const query = { closedAt: { $exists: false } };
@@ -1016,6 +1041,8 @@ async function reconcile({ now = new Date() } = {}) {
 }
 
 module.exports = {
+    endForRepark,
+    reparkCandidate,
     MANAGED_TIERS,
     NOTE_SPOT_TOLERANCE_M,
     DRIFT_TOLERANCE_M,
