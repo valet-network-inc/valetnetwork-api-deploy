@@ -32,7 +32,11 @@ function webBase() {
 }
 
 function shareFor(member, user) {
-    const code = phoneCode(user && user.phone);
+    // The sharer's number is a code (and pays them) only once they have told
+    // us where to send the money (Refer a friend). Before that the link
+    // carries no code: one that isn't valid would greet the friend as an
+    // error at checkout.
+    const code = user && user.referral && user.referral.method ? phoneCode(user.phone) : null;
     const url = `${webBase()}/join/share?${code ? `ref=${code}&` : ''}n=${encodeURIComponent(member.neighborhoodName)}`;
     return {
         url,
@@ -198,7 +202,7 @@ exports.leave = wrap(async (req, res) => {
 exports.share = wrap(async (req, res) => {
     const member = await ownMember(req, res);
     if (!member) return;
-    const user = await User.findById(req.callerUserId).select('phone').lean();
+    const user = await User.findById(req.callerUserId).select('phone referral').lean();
     const share = shareFor(member, user);
     res.json({ success: true, url: share.url, message: share.text, shareUrl: share.url, shareMessage: share.text });
 });

@@ -30,6 +30,7 @@ const User = require('../models/User');
 const stripeClient = require('./stripeClient');
 const operatorAlert = require('./operatorAlert');
 const realtime = require('./realtime');
+const { phoneCode } = require('./phoneCodes');
 const { getTable, neighborhoodByKey, garagePriceAt } = require('./neighborhoodPricing');
 const { dollars, pricingSnapshot, resolveStripePrice } = require('./planPricing');
 const { nyClock, nyWallTimeToInstant } = require('./nyTime');
@@ -406,6 +407,7 @@ async function markCardSaved(member, paymentMethodId, now = new Date()) {
     );
     if (!claimed) return UnlockMember.findById(member._id);
     await touchNeighborhood(member.neighborhood, { lastNewSubscriberAt: now });
+    if (claimed.source === 'self') await closeOpenInvites(claimed, now);
 
     if (claimed.status === 'scheduled' && claimed.startsAt <= now) {
         await startMember(claimed, { now });
@@ -415,6 +417,27 @@ async function markCardSaved(member, paymentMethodId, now = new Date()) {
     const unlock = await checkUnlock(member.neighborhood, now);
     await broadcast(member.neighborhood, unlock.unlocked ? 'unlocked' : 'count');
     return unlock.unlocked ? UnlockMember.findById(member._id) : claimed;
+}
+
+/**
+ * Someone who joined on their own (or with a code) leaves any rep's open
+ * invite to their number unanswered. It is closed, so that rep's portal stops
+ * chasing them; the invite they didn't use earns nothing (agreement, s. 4).
+ */
+async function closeOpenInvites(member, now) {
+    const user = await User.findById(member.user).select('phone').lean();
+    const ten = phoneCode(user && user.phone);
+    if (!ten) return;
+    await UnlockMember.updateMany(
+        {
+            _id: { $ne: member._id },
+            source: 'rep',
+            status: { $in: ['invited', 'pending_card'] },
+            liveUser: { $exists: false },
+            'contact.phone': { $in: [ten, `+1${ten}`, `1${ten}`] },
+        },
+        { $set: { status: 'left', endedAt: now, endedBecause: 'joined_elsewhere' } }
+    );
 }
 
 /** Ask Stripe whether the member's SetupIntent has cleared, and act on it. */

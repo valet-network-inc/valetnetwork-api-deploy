@@ -48,6 +48,9 @@ const UnlockMemberSchema = new mongoose.Schema(
         neighborhoodName: { type: String },
 
         source: { type: String, enum: ['self', 'rep'], required: true },
+        // Why an invite ended without the invitee answering it:
+        // 'joined_elsewhere' = they joined on their own or with another code.
+        endedBecause: { type: String },
         status: {
             type: String,
             enum: [...LIVE_STATUSES, 'declined', 'left', 'cancelled'],

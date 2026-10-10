@@ -184,3 +184,24 @@ test('everyone waiting hears each new card, the unlock, and their own start, liv
     expect(String(realtime.toUser.mock.calls[0][0])).toBe(String(b.user));
     expect(realtime.toUser.mock.calls[0][2]).toMatchObject({ neighborhood: other, reason: 'count', count: 1 });
 });
+
+test("joining on your own closes a rep's open invite to your number", async () => {
+    const rep = new mongoose.Types.ObjectId();
+    const invite = await UnlockMember.create({
+        neighborhood: CHELSEA, borough: 'Manhattan', neighborhoodName: 'Chelsea', source: 'rep', status: 'invited', rep,
+        contact: { name: 'Sam', phone: '9175551005' },
+        plan: { tier: 'home_garage', interval: 'month', amountCents: 52500, commissionCents: 10000 },
+        homeAddress: { streetAddress: '205 W 20th St', lat: 40.7425, lng: -73.997 }, inviteToken: 'tok-close',
+    });
+    const other = await UnlockMember.create({
+        neighborhood: CHELSEA, borough: 'Manhattan', neighborhoodName: 'Chelsea', source: 'rep', status: 'invited', rep,
+        contact: { name: 'Someone else', phone: '9175559999' },
+        plan: { tier: 'home_garage', interval: 'month', amountCents: 52500, commissionCents: 10000 },
+        homeAddress: { streetAddress: '206 W 20th St', lat: 40.7425, lng: -73.997 }, inviteToken: 'tok-keep',
+    });
+    // waitingMember(5) is +19175551005: the invited number, joining on their own.
+    await unlocks.markCardSaved(await waitingMember(5), 'pm_5', new Date('2026-10-09T18:00:00Z'));
+    const closed = await UnlockMember.findById(invite._id).lean();
+    expect(closed).toMatchObject({ status: 'left', endedBecause: 'joined_elsewhere' });
+    expect((await UnlockMember.findById(other._id).lean()).status).toBe('invited');
+});

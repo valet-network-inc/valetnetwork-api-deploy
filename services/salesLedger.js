@@ -291,6 +291,10 @@ function customerRow(m, sub, user, now) {
         const at = (sub && (sub.cancelledAt || sub.updatedAt)) || m.endedAt || m.updatedAt;
         return { ...base, status: 'cancelled', cancelledAt: at, statusLine: `Cancelled ${shortDay(at)} · commission ended` };
     }
+    if (m.endedBecause === 'joined_elsewhere') {
+        const at = m.endedAt || m.updatedAt;
+        return { ...base, status: 'cancelled', cancelledAt: at, statusLine: `Joined without this invite ${shortDay(at)} · not credited` };
+    }
     if (['left', 'declined'].includes(m.status)) {
         const at = m.endedAt || m.updatedAt;
         return { ...base, status: 'cancelled', cancelledAt: at, statusLine: `Cancelled ${shortDay(at)}` };
