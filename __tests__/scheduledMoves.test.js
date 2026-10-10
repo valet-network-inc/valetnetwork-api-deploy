@@ -122,7 +122,8 @@ describe('the job', () => {
         expect(a.length + b.length).toBe(1);
         expect(calls).toHaveLength(1);
         expect(calls[0].url).toMatch(/\/api\/order\/createOrder$/);
-        expect(calls[0].body).toMatchObject({ customer: String(user._id), orderType: 'parking', totalAmount: 0 });
+        // duration is required on the Order; without it every booking failed validation.
+        expect(calls[0].body).toMatchObject({ customer: String(user._id), orderType: 'parking', totalAmount: 0, duration: 24 * 60 });
         expect(new Date(calls[0].body.pickUpTime).toISOString()).toBe(first.toISOString());
         const after = await ScheduledMove.findById(move._id);
         expect(after.nextAt.toISOString()).toBe('2026-10-14T23:00:00.000Z');

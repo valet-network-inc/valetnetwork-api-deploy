@@ -232,10 +232,17 @@ async function runOne(move, http) {
                 customerLocation: move.address,
                 parkingType: 'street',
                 pickUpTime: move.nextAt,
+                // Required on the Order. A plan's park has no end time; the app
+                // sends 24 hours for it (INDEFINITE_DURATION_MINUTES) and the
+                // server stamps it indefinite.
+                duration: 24 * 60,
                 paymentMethod: 'card',
                 totalAmount: 0,
                 orderType: 'parking',
                 serviceType: 'park-and-hold',
+                carWatch: false,
+                carWatchAmount: 0,
+                aspMode: false,
             });
         } catch (err) {
             const body = (err.response && err.response.data) || {};
