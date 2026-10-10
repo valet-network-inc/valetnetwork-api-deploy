@@ -42,7 +42,8 @@ function requireRep({ signed = true, adminOnly = false } = {}) {
             if (adminOnly && rep.role !== 'admin') {
                 return res.status(403).json({ success: false, code: 'NOT_ADMIN', message: 'Only Rishi can do that.' });
             }
-            if (signed && !(await repAgreement.isSignedNow(rep))) {
+            // Admin (Rishi) is Valet Network's side of the agreement, not a rep.
+            if (signed && rep.role !== 'admin' && !(await repAgreement.isSignedNow(rep))) {
                 return res.status(403).json({
                     success: false,
                     code: 'AGREEMENT_REQUIRED',

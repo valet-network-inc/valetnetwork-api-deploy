@@ -75,3 +75,5 @@ This agreement is between Valet Network, Inc., 21-31 24th Street, Astoria, NY 11
 - This is the whole agreement between the parties on its subject. It may be changed only in writing signed by both parties. Electronic signatures count.
 - If any part of this agreement cannot be enforced, the rest still applies.
 - The Rep signs electronically in the rep portal by typing their full name. Valet Network, Inc. signs by Rishi Ganesh, who issues this agreement in the portal. It binds both parties when the Rep signs, and each party receives a copy of the signed agreement by email.
+
+Signed for Valet Network, Inc.: Rishi Ganesh, {ISSUED_DATE}

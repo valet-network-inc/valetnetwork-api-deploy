@@ -70,15 +70,16 @@ function isoDay(date) {
  * The stored text as the portal shows it, with the rep's name and the date
  * filled in: { title, subtitle, draft, intro, sections: [{heading, body}], note }.
  */
-function parse(text, { name, phone, email, date }) {
+function parse(text, { name, phone, email, date, issued }) {
     const { formatPhone } = require('./phoneCodes');
     const filled = text
         .replace(/\{REP_NAME\}/g, name || 'the Rep')
         .replace(/\{REP_PHONE\}/g, phone ? formatPhone(phone) : '[phone]')
         .replace(/\{REP_EMAIL\}/g, email || '[email]')
-        .replace(/\{START_DATE\}/g, longDate(date));
+        .replace(/\{START_DATE\}/g, longDate(date))
+        .replace(/\{ISSUED_DATE\}/g, longDate(issued || date));
     const blocks = filled.split(/\n\s*\n/).map((b) => b.trim()).filter(Boolean);
-    const out = { title: '', subtitle: '', draft: '', intro: '', sections: [], note: '' };
+    const out = { title: '', subtitle: '', draft: '', intro: '', sections: [], note: '', countersign: '' };
     const intro = [];
     let section = null;
     for (const b of blocks) {
@@ -89,6 +90,7 @@ function parse(text, { name, phone, email, date }) {
         } else if (/^DRAFT\b/.test(b)) out.draft = b;
         else if (!out.subtitle && !section && !intro.length && out.title) out.subtitle = b;
         else if (/^This is a draft for review/.test(b)) out.note = b;
+        else if (/^Signed for Valet Network/.test(b)) out.countersign = b;
         else if (section) section.body = section.body ? `${section.body}\n\n${b}` : b;
         else intro.push(b);
     }
@@ -101,7 +103,10 @@ async function viewFor(rep, now = new Date()) {
     const doc = await current();
     const signed = isSigned(rep, doc);
     const date = signed ? rep.agreement.signedAt : now;
-    return { version: doc.version, ...parse(doc.text, { name: rep.name, phone: rep.phone, email: rep.email, date }) };
+    return {
+        version: doc.version,
+        ...parse(doc.text, { name: rep.name, phone: rep.phone, email: rep.email, date, issued: doc.createdAt }),
+    };
 }
 
 function isSigned(rep, doc) {
@@ -117,7 +122,8 @@ async function statusFor(rep) {
     const doc = await current();
     const a = rep.agreement || {};
     return {
-        signed: isSigned(rep, doc),
+        // Admin signs for Valet Network, so it is never asked to sign as a rep.
+        signed: rep.role === 'admin' || isSigned(rep, doc),
         version: doc.version,
         signedAt: a.signedAt || null,
         signedName: a.signedName || null,
@@ -131,7 +137,13 @@ async function pdfFor(rep) {
     const doc = await current();
     const PDFDocument = require('pdfkit');
     const signed = isSigned(rep, doc);
-    const a = parse(doc.text, { name: rep.name, phone: rep.phone, email: rep.email, date: signed ? rep.agreement.signedAt : new Date() });
+    const a = parse(doc.text, {
+        name: rep.name,
+        phone: rep.phone,
+        email: rep.email,
+        date: signed ? rep.agreement.signedAt : new Date(),
+        issued: doc.createdAt,
+    });
     const pdf = new PDFDocument({ size: 'LETTER', margins: { top: 60, bottom: 60, left: 64, right: 64 } });
     const chunks = [];
     const done = new Promise((resolve, reject) => {
@@ -157,16 +169,25 @@ async function pdfFor(rep) {
         }
     }
     if (a.note) pdf.moveDown(0.4).font('Helvetica-Oblique').fontSize(9).text(a.note);
+    // a.countersign is printed as the signature block below.
+    // Both signatures: Valet Network's, given when this version was issued,
+    // and the Rep's, or a blank line until they sign.
+    const issuedOn = longDate(doc.createdAt || new Date());
+    pdf.moveDown(1.2).font('Helvetica-Bold').fontSize(12).text('Signatures');
+    pdf.moveDown(0.5).font('Helvetica-Bold').fontSize(10.5).text('Valet Network, Inc.');
+    pdf.font('Helvetica').text('Signed: ', { continued: true }).font('Helvetica-Oblique').text('Rishi Ganesh');
+    pdf.font('Helvetica').text('Name: Rishi Ganesh');
+    pdf.text(`Date: ${issuedOn}`);
+    pdf.moveDown(0.6).font('Helvetica-Bold').text('The Rep');
     if (signed) {
-        pdf.moveDown(1.2).font('Helvetica-Bold').fontSize(12).text('Signed');
-        pdf.moveDown(0.3).font('Helvetica').fontSize(10.5);
-        pdf.text(`Valet Network, Inc.: Rishi Ganesh`);
-        pdf.text(`The Rep: ${rep.agreement.signedName}`);
+        pdf.font('Helvetica').text('Signed: ', { continued: true }).font('Helvetica-Oblique').text(rep.agreement.signedName);
+        pdf.font('Helvetica').text(`Name: ${rep.agreement.signedName}`);
         pdf.text(`Date: ${longDate(rep.agreement.signedAt)}`);
-        pdf.text(`Signed electronically by the Rep typing their full name in the rep portal. Agreement version ${rep.agreement.version}.`);
+        pdf.moveDown(0.4).fontSize(9).text(`The Rep signed electronically by typing their full name in the rep portal. Agreement version ${rep.agreement.version}.`);
     } else {
-        pdf.moveDown(1.2).font('Helvetica-Bold').fontSize(12).text('Not signed yet');
-        pdf.font('Helvetica').fontSize(10.5);
+        pdf.font('Helvetica').text('Signed: ______________________________');
+        pdf.text(`Name: ${rep.name || ''}`);
+        pdf.text('Date: ______________________________');
     }
     pdf.moveDown(0.6).text('Valet Network, Inc. · 21-31 24th Street, Astoria, NY 11105 · rishi@valetnetwork.co');
     pdf.end();

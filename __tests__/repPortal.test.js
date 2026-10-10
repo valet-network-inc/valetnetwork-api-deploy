@@ -92,6 +92,7 @@ describe('sign-in and the agreement gate', () => {
         expect(a.body.agreement.note).toBe('');
         expect(a.body.agreement.intro).toMatch(/and Alex Rivera, \(646\) 555-0198, alexrivera@email.com \("the Rep"\)/);
         expect(a.body.agreement.sections).toHaveLength(12);
+        expect(a.body.agreement.countersign).toMatch(/^Signed for Valet Network, Inc\.: Rishi Ganesh, \w+ \d+, \d{4}$/);
         expect(JSON.stringify(a.body)).not.toMatch(/REP ADDRESS|\{REP_|attorney|DRAFT/);
 
         const stale = await request(app).post('/api/rep/agreement/sign').set(as(ALEX)).send({ version: 99, fullName: 'Alex Rivera' });
@@ -132,7 +133,8 @@ describe('sign-in and the agreement gate', () => {
 
     test('admin routes are Rishi’s only', async () => {
         await signAs(ALEX, 'Alex Rivera');
-        await signAs(RISHI, 'Rishi Ganesh');
+        // Rishi signs for Valet Network; he is never asked to sign as a rep.
+        expect((await request(app).get('/api/rep/me').set(as(RISHI))).body.agreement.signed).toBe(true);
         expect((await request(app).get('/api/rep/admin/reps').set(as(ALEX))).status).toBe(403);
         const made = await request(app).post('/api/rep/admin/reps').set(as(RISHI)).send({ name: 'Dana Brooks', phone: '(917) 555-0107', email: 'danabrooks@email.com' });
         expect(made.status).toBe(201);
