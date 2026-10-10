@@ -10,6 +10,7 @@
 // `available: false` and the sentence to show; only a request that names no
 // real plan is a 400.
 
+const { formatPhone } = require('./phoneCodes');
 const { getTable, contactSalesOf } = require('./neighborhoodPricing');
 const { quotePlan, dollars } = require('./planPricing');
 const {
@@ -149,7 +150,8 @@ async function buildPriceQuote({
         described = describe(promo, { amountCents, interval: quote.interval, now });
         // "SAVE20 · 20% off your first month": the discount row, and the chip
         // under it with Remove.
-        described.label = `${promo.code} · ${described.headline}`;
+        // A phone-number code reads as the number, not ten digits run together.
+        described.label = `${promo.source === 'phone' ? formatPhone(promo.code) : promo.code} · ${described.headline}`;
         if (promo.kind === 'free_trial') {
             lines.push(line(described.label, -amountCents, 'discount', `${MINUS}${dollars(amountCents)}`));
             dueTodayCents = 0;
