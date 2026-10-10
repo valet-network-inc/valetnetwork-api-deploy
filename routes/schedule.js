@@ -15,9 +15,14 @@ const wrap = (fn) => async (req, res) => {
     }
 };
 const send = (res, r, ok) =>
-    r.error ? res.status(r.status || 400).json({ success: false, message: r.error }) : res.status(ok).json({ success: true, ...r });
+    r.error
+        ? res.status(r.status || 400).json({ success: false, message: r.error, ...(r.code ? { code: r.code } : {}) })
+        : res.status(ok).json({ success: true, ...r });
 
 router.get('/mine/:userId', self, wrap(async (req, res) => res.json({ success: true, moves: await moves.mine(req.callerUserId) })));
+// Without a plan: what a run costs and the card it goes on; and a $0 card save.
+router.get('/quote/:userId', self, wrap(async (req, res) => res.json({ success: true, ...(await moves.quote(req.callerUserId)) })));
+router.post('/card', self, wrap(async (req, res) => send(res, await moves.cardSetup(req.callerUserId), 200)));
 router.post('/', self, wrap(async (req, res) => send(res, await moves.create(req.callerUserId, req.body || {}), 201)));
 router.patch('/:id', self, wrap(async (req, res) => send(res, await moves.update(req.callerUserId, req.params.id, req.body || {}), 200)));
 router.delete('/:id', self, wrap(async (req, res) => send(res, await moves.cancel(req.callerUserId, req.params.id, req.body || {}), 200)));

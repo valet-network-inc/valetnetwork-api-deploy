@@ -32,6 +32,8 @@ const Subscription = require('../models/Subscription');
 const ScheduledMove = require('../models/ScheduledMove');
 const CurbCustody = require('../models/CurbCustody');
 const moves = require('../services/scheduledMoves');
+const stripeClient = require('../services/stripeClient');
+const Payment = require('../models/Payment');
 const curbCustody = require('../services/curbCustody');
 
 const app = express();
@@ -48,13 +50,29 @@ beforeAll(async () => {
     await mongoose.connect(mongo.getUri());
 });
 afterAll(async () => {
+    stripeClient.reset();
     await mongoose.disconnect();
     await mongo.stop();
 });
 beforeEach(async () => {
+    stripeClient.set(null);
     await mongoose.connection.db.dropDatabase();
     user = await User.create({ verified: true, phone: '+19175550134', firebaseUid: 'sam' });
 });
+
+/** A Stripe with one saved Visa on cus_sam; `charge` decides each off-session charge. */
+function stripeWithCard(charge = async (p) => ({ id: 'pi_1', status: 'succeeded', amount: p.amount, currency: 'usd' })) {
+    const intents = [];
+    stripeClient.set({
+        customers: { retrieve: async () => ({ id: 'cus_sam', invoice_settings: { default_payment_method: 'pm_visa' } }) },
+        paymentMethods: {
+            retrieve: async () => ({ id: 'pm_visa', card: { brand: 'visa', last4: '4242' } }),
+            list: async () => ({ data: [] }),
+        },
+        paymentIntents: { create: async (p, o) => { intents.push({ p, o }); return charge(p); } },
+    });
+    return intents;
+}
 
 async function givePlan(tier = 'home_garage') {
     await Subscription.collection.insertOne({
@@ -86,11 +104,24 @@ describe('occurrences', () => {
 });
 
 describe('booking', () => {
-    test('only on a plan that includes the move', async () => {
+    test('everyone: without a plan a card has to be on file; on a plan it is included', async () => {
         const auth = { Authorization: 'Bearer uid:sam' };
         const body = { userId: String(user._id), kind: 'drop-off', repeat: 'once', at: new Date(Date.now() + 3 * 3600e3).toISOString(), address: HOME };
         const none = await request(app).post('/api/schedule').set(auth).send(body);
-        expect(none.status).toBe(403);
+        expect(none.status).toBe(402);
+        expect(none.body.code).toBe('CARD_REQUIRED');
+
+        await User.updateOne({ _id: user._id }, { $set: { stripeCustomerId: 'cus_sam' } });
+        stripeWithCard();
+        const q = await request(app).get(`/api/schedule/quote/${user._id}`).set(auth);
+        expect(q.body).toMatchObject({ plan: false, pickUpCents: 1300, dropOffCents: 0, cardRequired: false, card: { label: 'Visa ending 4242' } });
+        const paid = await request(app).post('/api/schedule').set(auth).send({ ...body, kind: 'pick-up' });
+        expect(paid.status).toBe(201);
+        expect(paid.body.move.detail).toBe('Collected from 200 W 20th St · $13');
+        const back = await request(app).post('/api/schedule').set(auth).send(body);
+        expect(back.body.move.detail).toBe('Brought to 200 W 20th St · Included with your park');
+        await ScheduledMove.deleteMany({});
+
         await givePlan();
         const soon = await request(app).post('/api/schedule').set(auth).send({ ...body, at: new Date(Date.now() + 10 * 60e3).toISOString() });
         expect(soon.status).toBe(400);
@@ -102,6 +133,51 @@ describe('booking', () => {
         const other = await User.create({ verified: true, phone: '+12125550100', firebaseUid: 'eve' });
         const peek = await request(app).delete(`/api/schedule/${ok.body.move._id}`).set('Authorization', 'Bearer uid:eve').send({ userId: String(other._id) });
         expect(peek.status).toBe(404);
+    });
+});
+
+describe('the job, without a plan', () => {
+    async function bookOne() {
+        await User.updateOne({ _id: user._id }, { $set: { stripeCustomerId: 'cus_sam' } });
+        const order = await Order.collection.insertOne({ customer: user._id, orderType: 'parking', status: 'pending', paymentStatus: 'pending', totalAmount: 1300, serviceType: 'park-and-hold', createdAt: new Date() });
+        const move = await ScheduledMove.create({ user: user._id, kind: 'pick-up', repeat: 'weekdays', time: '19:00', address: HOME, nextAt: at('2026-10-13T23:00:00Z') });
+        const calls = [];
+        const http = { post: jest.fn(async (url, body) => {
+            calls.push({ url, body });
+            return { data: { success: true, order: { _id: order.insertedId, totalAmount: 1300 } } };
+        }) };
+        return { orderId: order.insertedId, move, calls, http };
+    }
+
+    test('a pick-up is a park-and-hold charged to the saved card when it is booked', async () => {
+        const intents = stripeWithCard();
+        const { orderId, move, calls, http } = await bookOne();
+        const [r] = await moves.tick({ now: at('2026-10-13T22:15:00Z'), http });
+        expect(r.outcome).toBe('booked');
+        expect(calls[0].body).toMatchObject({ serviceType: 'park-and-hold', totalAmount: 1300, duration: 24 * 60 });
+        expect(intents).toHaveLength(1);
+        expect(intents[0].p).toMatchObject({ amount: 1300, customer: 'cus_sam', payment_method: 'pm_visa', off_session: true, confirm: true });
+        expect(intents[0].p.metadata.orderId).toBe(String(orderId));
+        expect(intents[0].o.idempotencyKey).toBe(`scheduled-pickup-${orderId}`);
+        const order = await Order.findById(orderId).lean();
+        expect(order.paymentStatus).toBe('paid');
+        expect(order.paymentIntentId).toBe('pi_1');
+        expect(await Payment.countDocuments({ order: orderId, status: 'succeeded' })).toBe(1);
+        // A repeating move goes on to the next weekday.
+        expect((await ScheduledMove.findById(move._id)).nextAt.toISOString()).toBe('2026-10-14T23:00:00.000Z');
+    });
+
+    test('a declined card cancels that run, and the schedule carries on', async () => {
+        stripeWithCard(async () => {
+            throw Object.assign(new Error('Your card was declined.'), { type: 'StripeCardError' });
+        });
+        const { orderId, move, http } = await bookOne();
+        const [r] = await moves.tick({ now: at('2026-10-13T22:15:00Z'), http });
+        expect(r.outcome).toBe('payment_failed');
+        expect((await Order.findById(orderId).lean()).status).toBe('cancelled');
+        const after = await ScheduledMove.findById(move._id);
+        expect(after.active).toBe(true);
+        expect(after.lastOutcome).toBe('payment_failed');
     });
 });
 
