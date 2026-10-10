@@ -127,6 +127,9 @@ async function ensureStripeCustomer(user) {
         phone: user.phone || undefined,
     });
     await User.findByIdAndUpdate(user._id, { stripeCustomerId: created.id });
+    // The caller's copy too: /create asks again for the waitlist's card, and
+    // a second ask on a stale copy made a second, empty Stripe customer.
+    user.stripeCustomerId = created.id;
     return created.id;
 }
 
@@ -798,7 +801,11 @@ async function waitingPlanFor(userId) {
         neighborhood: member.neighborhoodName,
         memberId: String(member._id),
         startsAt: view.startsAt,
-        unlock: { ...view.unlock, unlocked: false },
+        firstChargeCents: view.price.firstChargeCents,
+        freeDays: view.price.freeDays,
+        // As the neighborhood stands: /park's plan page shows the start date
+        // once it has unlocked. status 'waiting' already says the plan isn't live.
+        unlock: view.unlock,
         waitlist: view,
     };
 }

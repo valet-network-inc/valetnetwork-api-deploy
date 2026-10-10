@@ -29,6 +29,7 @@ const Subscription = require('../models/Subscription');
 const User = require('../models/User');
 const stripeClient = require('./stripeClient');
 const operatorAlert = require('./operatorAlert');
+const realtime = require('./realtime');
 const { getTable, neighborhoodByKey, garagePriceAt } = require('./neighborhoodPricing');
 const { dollars, pricingSnapshot, resolveStripePrice } = require('./planPricing');
 const { nyClock, nyWallTimeToInstant } = require('./nyTime');
@@ -200,6 +201,68 @@ async function pushTo(userId, title, body, data) {
 }
 
 /**
+ * Tells everyone waiting in a neighborhood that it moved (a card saved, a
+ * member gone, the unlock), so an open app or /park page re-reads its count
+ * then rather than on the next visit. Members already on a plan are left out:
+ * nothing they see depends on the count.
+ */
+async function broadcast(key, reason) {
+    try {
+        const state = await stateFor(key);
+        const members = await UnlockMember.find({
+            neighborhood: key,
+            status: { $in: ['invited', 'pending_card', 'waiting', 'scheduled', 'starting', 'failed'] },
+            user: { $exists: true },
+        })
+            .select('user')
+            .lean();
+        const payload = {
+            neighborhood: key,
+            reason,
+            count: state ? state.count : null,
+            needed: UNLOCK_AT,
+            unlocked: !!(state && state.unlocked),
+            startsAt: (state && state.startsAt) || null,
+        };
+        for (const id of new Set(members.map((m) => String(m.user)))) realtime.toUser(id, 'waitlistUpdated', payload);
+    } catch (err) {
+        console.error('neighborhoodUnlocks: broadcast failed:', err.message);
+    }
+}
+
+/** The same event for one member whose own plan moved (started, failed). */
+function tellMember(member, reason) {
+    realtime.toUser(member.user, 'waitlistUpdated', { neighborhood: member.neighborhood, reason });
+}
+
+/**
+ * What the member's card is charged on the start day, after their code: a
+ * free trial charges nothing for its days, a discount comes off the first
+ * bill. { cents, freeDays }.
+ */
+async function startCharge(member) {
+    const amount = member.plan.amountCents;
+    if (!member.plan.promoCode) return { cents: amount, freeDays: 0 };
+    const { findPromo, isDiscount, discountedCents } = require('./subscriptionPromos');
+    let promo = null;
+    try {
+        promo = await findPromo(member.plan.promoCode);
+    } catch (err) {
+        console.error('neighborhoodUnlocks: promo lookup failed:', err.message);
+    }
+    if (promo && promo.kind === 'free_trial' && promo.trialDays) return { cents: 0, freeDays: promo.trialDays };
+    if (promo && isDiscount(promo)) return { cents: discountedCents(promo, amount), freeDays: 0 };
+    return { cents: amount, freeDays: 0 };
+}
+
+/** "Your card is charged $725 that morning." or "The first 90 days are free." */
+function startChargeLine(charge, when = 'that morning') {
+    return charge.freeDays
+        ? `The first ${charge.freeDays} days are free.`
+        : `Your card is charged ${dollars(charge.cents)} ${when}.`;
+}
+
+/**
  * Unlock the neighborhood if it has reached 10. Safe to call after every
  * saved card: the conditional update lets exactly one caller win.
  * Returns { unlocked: true, startsAt } for the winner, or { unlocked: false }.
@@ -248,7 +311,7 @@ async function checkUnlock(key, now = new Date()) {
         await pushTo(
             m.user,
             `${name} unlocked`,
-            `Your Permanent valet plan starts ${longDay(startsAt)}. Your card is charged ${dollars(m.plan.amountCents)} that morning.`,
+            `Your Permanent valet plan starts ${longDay(startsAt)}. ${startChargeLine(await startCharge(m))}`,
             { type: 'NEIGHBORHOOD_UNLOCKED', neighborhood: key }
         );
         await UnlockMember.updateOne({ _id: m._id }, { $set: { unlockNotifiedAt: new Date() } });
@@ -346,9 +409,11 @@ async function markCardSaved(member, paymentMethodId, now = new Date()) {
 
     if (claimed.status === 'scheduled' && claimed.startsAt <= now) {
         await startMember(claimed, { now });
+        await broadcast(member.neighborhood, 'count');
         return UnlockMember.findById(member._id);
     }
     const unlock = await checkUnlock(member.neighborhood, now);
+    await broadcast(member.neighborhood, unlock.unlocked ? 'unlocked' : 'count');
     return unlock.unlocked ? UnlockMember.findById(member._id) : claimed;
 }
 
@@ -396,6 +461,7 @@ async function failStart(member, reason, { alert = true } = {}) {
         'We could not charge your card for Permanent valet. Open the app to update it.',
         { type: 'UNLOCK_START_FAILED' }
     );
+    tellMember(member, 'failed');
 }
 
 /**
@@ -519,6 +585,7 @@ async function startMember(member, { now = new Date() } = {}) {
             `Your valet in ${m.neighborhoodName} is ready. Park your car from the app.`,
             { type: 'UNLOCK_STARTED' }
         );
+        tellMember(m, 'started');
         console.log(`neighborhoodUnlocks: started member ${m._id} -> subscription ${sub._id}`);
         return { outcome: 'started', subscription: sub };
     } catch (err) {
@@ -571,7 +638,7 @@ async function tick({ now = new Date() } = {}) {
         await pushTo(
             m.user,
             'Your plan starts tomorrow',
-            `Your card is charged ${dollars(m.plan.amountCents)} at 8 AM tomorrow and your Permanent valet plan starts.`,
+            `Your Permanent valet plan starts at 8 AM tomorrow. ${startChargeLine(await startCharge(m), 'then')}`,
             { type: 'UNLOCK_REMINDER' }
         );
         results.reminded += 1;
@@ -595,6 +662,7 @@ async function endMember(member, status, now = new Date()) {
         { $set: { status, endedAt: now }, $unset: { liveUser: 1 } },
         { new: true }
     );
+    if (ended && COUNTED_STATUSES.includes(member.status)) await broadcast(member.neighborhood, 'count');
     return ended;
 }
 
@@ -686,16 +754,18 @@ async function recordActiveSubscription(sub, now = new Date()) {
     await Subscription.updateOne({ _id: sub._id }, { $set: { unlockMember: member._id } });
     sub.unlockMember = member._id;
     await touchNeighborhood(key, { lastNewSubscriberAt: now });
+    await broadcast(key, 'count');
     return member;
 }
 
 /** The plan a member started was cancelled: they stop counting. */
 async function subscriptionEnded(sub, now = new Date()) {
     if (!sub || !sub.unlockMember) return;
-    await UnlockMember.updateOne(
+    const ended = await UnlockMember.findOneAndUpdate(
         { _id: sub.unlockMember, status: 'active' },
         { $set: { status: 'cancelled', endedAt: now }, $unset: { liveUser: 1 } }
     );
+    if (ended) await broadcast(ended.neighborhood, 'count');
 }
 
 // ---------------------------------------------------------------------------
@@ -818,6 +888,7 @@ async function memberView(member, now = new Date()) {
     const name = member.neighborhoodName || (state && state.name);
     const unit = member.plan.interval === 'week' ? '/wk' : '/mo';
     const amount = dollars(member.plan.amountCents);
+    const charge = await startCharge(member);
     const street = shortStreet(member.homeAddress);
     const rep = await repFirstName(member.rep);
     const count = state ? state.count : 0;
@@ -872,7 +943,7 @@ async function memberView(member, now = new Date()) {
     if (member.status === 'waiting') {
         after = {
             title: `You’re in. ${name} is almost there.`,
-            body: `It starts when ${name} reaches ${UNLOCK_AT} subscribers. We’ll tell you the day before your card is charged.`,
+            body: `It starts when ${name} reaches ${UNLOCK_AT} subscribers. We’ll tell you the day before ${charge.freeDays ? 'it starts' : 'your card is charged'}.`,
             progress: copy.progress,
             secondary: 'Cancel before it starts',
             fine: 'Nothing is charged until the start date.',
@@ -885,7 +956,9 @@ async function memberView(member, now = new Date()) {
                 : `After that it renews on the ${ordinal(day.day)} of each month.`;
         after = {
             title: `Starts ${longDay(startsAt)}`,
-            body: `Your ${card || 'card'} is charged ${amount} that morning and your Permanent valet plan starts. ${renews}`,
+            body: charge.freeDays
+                ? `Your Permanent valet plan starts that morning. The first ${charge.freeDays} days are free, then ${amount}${unit} on your ${card || 'card'}.`
+                : `Your ${card || 'card'} is charged ${dollars(charge.cents)} that morning and your Permanent valet plan starts. ${renews}`,
             badge: `${name} unlocked`,
             secondary: 'Cancel before it starts',
         };
@@ -920,7 +993,14 @@ async function memberView(member, now = new Date()) {
             status: unlocked ? (startsAt && new Date(startsAt) <= now ? 'live' : 'unlocked') : 'locked',
             live: !!(unlocked && startsAt && new Date(startsAt) <= now),
         },
-        price: { amountCents: member.plan.amountCents, interval: member.plan.interval, label: copy.priceLine },
+        price: {
+            amountCents: member.plan.amountCents,
+            interval: member.plan.interval,
+            label: copy.priceLine,
+            // The start day's charge after their code, and a free trial's days.
+            firstChargeCents: charge.cents,
+            freeDays: charge.freeDays,
+        },
         rep: rep ? { firstName: rep } : null,
         copy,
         after,
@@ -947,6 +1027,7 @@ module.exports = {
     countFor,
     waitlistForQuote,
     checkUnlock,
+    broadcast,
     setupIntentFor,
     markCardSaved,
     confirmCard,

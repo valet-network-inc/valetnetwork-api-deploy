@@ -92,6 +92,7 @@ app.use((req, res, next) => {
     req.io = io;
     next();
 });
+require('./services/realtime').set(io);
 
 app.use(bodyParser.json());
 app.use(cors());

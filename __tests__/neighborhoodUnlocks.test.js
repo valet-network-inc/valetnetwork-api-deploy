@@ -17,6 +17,7 @@ const mongoose = require('mongoose');
 
 process.env.NODE_ENV = 'test';
 jest.mock('../services/operatorAlert', () => ({ raise: jest.fn(async () => ({})), SEVERITY: { WARN: 'warn' } }));
+jest.mock('../services/realtime', () => ({ set: jest.fn(), toUser: jest.fn() }));
 jest.mock('firebase-admin', () => ({
     messaging: () => ({ send: async () => 'x', sendEachForMulticast: async () => ({ responses: [] }) }),
     auth: () => ({ verifyIdToken: async () => ({ uid: 'x' }) }),
@@ -29,6 +30,7 @@ const NeighborhoodUnlock = require('../models/NeighborhoodUnlock');
 const Subscription = require('../models/Subscription');
 const unlocks = require('../services/neighborhoodUnlocks');
 const operatorAlert = require('../services/operatorAlert');
+const realtime = require('../services/realtime');
 
 const CHELSEA = 'manhattan-chelsea';
 let created;
@@ -76,6 +78,7 @@ beforeEach(async () => {
     await mongoose.connection.db.dropDatabase();
     stubStripe();
     operatorAlert.raise.mockClear();
+    realtime.toUser.mockClear();
 });
 
 async function waitingMember(i, status = 'pending_card') {
@@ -139,4 +142,45 @@ test('a member without a saved card is never charged, and nothing re-locks', asy
     expect((await UnlockMember.findById(noCard._id)).status).toBe('pending_card');
     await UnlockMember.updateMany({ status: 'active' }, { $set: { status: 'cancelled' } });
     expect((await unlocks.stateFor(CHELSEA)).unlocked).toBe(true);
+});
+
+test('everyone waiting hears each new card, the unlock, and their own start, live', async () => {
+    const unlockAt = new Date('2026-10-09T18:00:00Z');
+    const members = [];
+    for (let i = 0; i < 3; i++) members.push(await waitingMember(i));
+    // A member whose plan is already running hears nothing about the count.
+    const onPlan = await waitingMember(30, 'active');
+
+    await unlocks.markCardSaved(members[0], 'pm_0', unlockAt);
+    await unlocks.markCardSaved(members[1], 'pm_1', unlockAt);
+    // The second card: all three waiting users hear "2 of 10" (onPlan counts too: 3).
+    const second = realtime.toUser.mock.calls.slice(-3);
+    expect(second.map((c) => String(c[0])).sort()).toEqual(members.map((m) => String(m.user)).sort());
+    expect(second.every((c) => c[1] === 'waitlistUpdated' && c[2].reason === 'count' && c[2].count === 3 && c[2].needed === 10)).toBe(true);
+    expect(realtime.toUser.mock.calls.some((c) => String(c[0]) === String(onPlan.user))).toBe(false);
+
+    // Seven more (with the one already on a plan, ten): the unlock, and the event says so.
+    for (let i = 3; i < 10; i++) await unlocks.markCardSaved(await waitingMember(i), `pm_${i}`, unlockAt);
+    const last = realtime.toUser.mock.calls[realtime.toUser.mock.calls.length - 1][2];
+    expect(last).toMatchObject({ reason: 'unlocked', unlocked: true, count: 10 });
+    expect(new Date(last.startsAt).toISOString()).toBe('2026-10-12T12:00:00.000Z');
+
+    // The start: each of the nine with a card hears their own plan began.
+    realtime.toUser.mockClear();
+    await unlocks.tick({ now: new Date('2026-10-12T12:00:30Z') });
+    const started = realtime.toUser.mock.calls.filter((c) => c[2].reason === 'started');
+    expect(started).toHaveLength(9);
+
+    // Someone leaves a waitlist with a card behind it: the rest hear the count drop.
+    const other = 'manhattan-soho';
+    const a = await waitingMember(40);
+    const b = await waitingMember(41);
+    await UnlockMember.updateMany({ _id: { $in: [a._id, b._id] } }, { $set: { neighborhood: other } });
+    await unlocks.markCardSaved(await UnlockMember.findById(a._id), 'pm_a', unlockAt);
+    await unlocks.markCardSaved(await UnlockMember.findById(b._id), 'pm_b', unlockAt);
+    realtime.toUser.mockClear();
+    await unlocks.endMember(await UnlockMember.findById(a._id), 'left');
+    expect(realtime.toUser.mock.calls).toHaveLength(1);
+    expect(String(realtime.toUser.mock.calls[0][0])).toBe(String(b.user));
+    expect(realtime.toUser.mock.calls[0][2]).toMatchObject({ neighborhood: other, reason: 'count', count: 1 });
 });
