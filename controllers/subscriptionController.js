@@ -771,6 +771,38 @@ exports.createSubscription = async (req, res) => {
 };
 
 // GET /api/subscription/status/:userId
+/**
+ * A self-signup waiting on a locked neighborhood has no Subscription yet,
+ * only its unlock member. /status reports it as a waiting plan so the clients
+ * can show it, and checks Stripe for a card saved a moment ago rather than
+ * waiting on the webhook. Null when there is nothing waiting.
+ */
+async function waitingPlanFor(userId) {
+    let member = await unlocks.liveMemberFor(userId);
+    if (!member || member.source !== 'self') return null;
+    if (member.status === 'pending_card' && member.setupIntentId && stripe()) {
+        try {
+            member = await unlocks.confirmCard(member);
+        } catch (err) {
+            console.error('status: waiting card check failed:', err.message);
+        }
+    }
+    if (!member || !['waiting', 'scheduled', 'starting'].includes(member.status)) return null;
+    const view = await unlocks.memberView(member);
+    return {
+        status: 'waiting',
+        tier: member.plan.tier,
+        interval: member.plan.interval,
+        amountCents: member.plan.amountCents,
+        homeAddress: member.homeAddress,
+        neighborhood: member.neighborhoodName,
+        memberId: String(member._id),
+        startsAt: view.startsAt,
+        unlock: { ...view.unlock, unlocked: false },
+        waitlist: view,
+    };
+}
+
 exports.getSubscriptionStatus = async (req, res) => {
     const { userId } = req.params;
     try {
@@ -783,7 +815,7 @@ exports.getSubscriptionStatus = async (req, res) => {
             return res.status(200).json({
                 success: true,
                 hasActiveSubscription: false,
-                subscription: null,
+                subscription: await waitingPlanFor(userId),
             });
         }
 
@@ -823,7 +855,7 @@ exports.getSubscriptionStatus = async (req, res) => {
             return res.status(200).json({
                 success: true,
                 hasActiveSubscription: false,
-                subscription: null,
+                subscription: await waitingPlanFor(userId),
             });
         }
 
