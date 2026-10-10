@@ -199,6 +199,9 @@ app.use('/api/event', require('./routes/eventRoutes'));
 app.use('/api/key-transfer', require('./routes/keyTransfer'));
 app.use('/api/location', require('./routes/location'));
 app.use('/api/admin', require('./routes/admin'));
+app.use('/api/rep', require('./routes/rep'));
+app.use('/api/waitlist', require('./routes/waitlist'));
+app.use('/api/referral', require('./routes/referral'));
 app.use('/api/valet', require('./routes/valet'));
 app.use('/api/webhooks', require('./routes/webhook'));
 

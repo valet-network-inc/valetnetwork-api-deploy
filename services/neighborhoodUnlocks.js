@@ -780,8 +780,10 @@ async function editMember(member, { homeAddress, vehicle } = {}) {
         if (moved && member.status === 'waiting') {
             const state = await stateFor(member.neighborhood);
             if (state && state.unlocked) {
-                await UnlockMember.updateOne({ _id: member._id }, { $set: { status: 'scheduled', startsAt: new Date() } });
-                await startMember(await UnlockMember.findById(member._id));
+                const now = new Date();
+                const startAt = state.startsAt && new Date(state.startsAt) > now ? new Date(state.startsAt) : now;
+                await UnlockMember.updateOne({ _id: member._id }, { $set: { status: 'scheduled', startsAt: startAt } });
+                if (startAt <= now) await startMember(await UnlockMember.findById(member._id));
             } else {
                 await checkUnlock(member.neighborhood);
             }

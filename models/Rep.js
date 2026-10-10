@@ -28,6 +28,17 @@ const RepSchema = new mongoose.Schema(
         firebaseUid: { type: String, unique: true, sparse: true },
         createdBy: { type: String },
         notes: { type: String },
+        // The signed commission agreement (services/repAgreement.js).
+        agreement: {
+            version: { type: Number },
+            signedName: { type: String, trim: true },
+            signedAt: { type: Date },
+            ip: { type: String },
+            userAgent: { type: String },
+            emailStatus: { type: String }, // sent | not_configured | failed
+            emailError: { type: String },
+            sentTo: [{ type: String }],
+        },
     },
     { timestamps: true }
 );
