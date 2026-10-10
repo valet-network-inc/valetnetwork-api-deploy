@@ -20,6 +20,7 @@
 // code that only credits the sale. findPromo became async for them.
 
 const mongoose = require('mongoose');
+const { phoneCode, findPhonePromo } = require('./phoneCodes');
 const { getPlan, priceFor } = require('./subscriptionPlans');
 const Subscription = require('../models/Subscription');
 const PromoCode = require('../models/PromoCode');
@@ -198,6 +199,8 @@ async function findDbPromo(c) {
 
 // Admin-made codes first, then the built-in table, then the env coupons.
 async function findPromo(code) {
+    // A phone number is a rep's or a customer's referral code.
+    if (phoneCode(code)) return findPhonePromo(code);
     const c = normalizeCode(code);
     if (!c) return null;
     const fromDb = await findDbPromo(c);
@@ -387,8 +390,9 @@ function describe(promo, { amountCents, interval, now = new Date() } = {}) {
             requiresCard: true,
         };
     }
-    if (promo.kind === 'rep') {
-        // A rep's code is credit, not a discount. The customer pays the price.
+    if (promo.kind === 'rep' || promo.kind === 'referral') {
+        // A rep's or a referrer's code is credit, not a discount. The
+        // customer pays the price.
         return {
             ...base,
             headline: promo.headline || 'Code applied',

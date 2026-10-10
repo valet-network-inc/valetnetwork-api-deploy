@@ -319,6 +319,25 @@ server.listen(PORT, () => {
         }
     }
 
+    // Background job: neighborhood unlocks — starts every scheduled member at
+    // 8 AM ET on their start date (one charge each; claimed atomically) and
+    // sends the day-before reminder. See services/neighborhoodUnlocks.js.
+    if (process.env.UNLOCK_JOB_ENABLED === 'false') {
+        console.warn('Unlock job DISABLED via UNLOCK_JOB_ENABLED=false — unlocked neighborhoods will not start.');
+    } else {
+        try {
+            const neighborhoodUnlocks = require('./services/neighborhoodUnlocks');
+            setInterval(() => {
+                neighborhoodUnlocks
+                    .tick()
+                    .catch((e) => console.error('neighborhoodUnlocks interval error:', e.message));
+            }, 60 * 1000);
+            console.log('Unlock job registered (runs every 60s)');
+        } catch (err) {
+            console.error('Failed to register unlock job:', err.message);
+        }
+    }
+
     // Background job: auto-ASP subscription scheduler — books the covered
     // street-cleaning move for every active subscriber ~45 min before their
     // scheduled sweep. Idempotent via Order.autoBookKey (unique index); never

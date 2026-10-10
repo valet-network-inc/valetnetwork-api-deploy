@@ -148,7 +148,19 @@ async function stateFor(key, table = null) {
 async function waitlistForQuote(quote) {
     if (!quote || !quote.plan || !quote.plan.pricedByAddress || !quote.area || !quote.area.key) return null;
     const state = await stateFor(quote.area.key);
-    if (!state || state.unlocked) return null;
+    if (!state) return null;
+    if (state.unlocked) {
+        // Unlocked but not started: the card is charged on the start date.
+        if (!state.startsAt || new Date(state.startsAt) <= new Date()) return null;
+        return {
+            neighborhood: state.name,
+            key: state.key,
+            count: state.count,
+            needed: state.needed,
+            startsAt: state.startsAt,
+            note: `${state.name} unlocked. Plans start ${longDay(state.startsAt)}, and you’re not charged until then.`,
+        };
+    }
     return {
         neighborhood: state.name,
         key: state.key,
@@ -311,6 +323,9 @@ async function markCardSaved(member, paymentMethodId, now = new Date()) {
         }
     }
     const state = await stateFor(member.neighborhood);
+    // Unlocked: start with the neighborhood's start date, or now once that
+    // has passed. Otherwise wait for the 10th.
+    const startAt = state && state.unlocked ? (state.startsAt && new Date(state.startsAt) > now ? new Date(state.startsAt) : now) : null;
     const claimed = await UnlockMember.findOneAndUpdate(
         { _id: member._id, status: { $in: ['pending_card', 'invited'] } },
         {
@@ -320,8 +335,8 @@ async function markCardSaved(member, paymentMethodId, now = new Date()) {
                 cardLast4: last4,
                 cardSavedAt: now,
                 // Unlocked already: start now. Otherwise wait for the 10th.
-                status: state && state.unlocked ? 'scheduled' : 'waiting',
-                ...(state && state.unlocked ? { startsAt: now } : {}),
+                status: startAt ? 'scheduled' : 'waiting',
+                ...(startAt ? { startsAt: startAt } : {}),
             },
         },
         { new: true }
@@ -329,7 +344,7 @@ async function markCardSaved(member, paymentMethodId, now = new Date()) {
     if (!claimed) return UnlockMember.findById(member._id);
     await touchNeighborhood(member.neighborhood, { lastNewSubscriberAt: now });
 
-    if (claimed.status === 'scheduled') {
+    if (claimed.status === 'scheduled' && claimed.startsAt <= now) {
         await startMember(claimed, { now });
         return UnlockMember.findById(member._id);
     }
@@ -807,7 +822,6 @@ async function memberView(member, now = new Date()) {
     const unlocked = !!(state && state.unlocked);
     const startsAt = member.startsAt || (state && state.startsAt) || null;
     const card = cardLabel(member);
-    const every = member.plan.interval === 'week' ? 'weekly' : 'monthly';
     const repSet = rep ? ` ${rep}, your Valet Network rep, set this up.` : '';
 
     // Which invite screen: the neighborhood is live, they would be the 10th,
@@ -825,7 +839,7 @@ async function memberView(member, now = new Date()) {
             title: `Permanent valet at ${street}`,
             body: `${repSet.trim()} ${name} unlocks at ${UNLOCK_AT} subscribers. You’re not charged until it does.`.trim(),
             cta: 'Add a card and join',
-            fine: `Your card is charged ${amount} when ${name} unlocks, then ${every}. Leave before then and nothing is charged.`,
+            fine: `Your card is charged ${amount}${unit} after ${name} unlocks.`,
             secondary: 'Not for me',
         });
     } else if (variant === 'last') {
@@ -872,7 +886,6 @@ async function memberView(member, now = new Date()) {
             body: `Your ${card || 'card'} is charged ${amount} that morning and your Permanent valet plan starts. ${renews}`,
             badge: `${name} unlocked`,
             secondary: 'Cancel before it starts',
-            fine: `Leave before ${shortDay(startsAt)} and nothing is charged.`,
         };
     }
 

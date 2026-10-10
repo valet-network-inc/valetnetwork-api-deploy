@@ -650,6 +650,24 @@ exports.handleStripeWebhook = async (req, res) => {
             return res.status(200).json({ success: true, message: 'Webhook processed successfully' });
         }
 
+        // A neighborhood waitlist's saved card (services/neighborhoodUnlocks.js).
+        if (
+            event.type === 'setup_intent.succeeded' &&
+            event.data &&
+            event.data.object &&
+            event.data.object.metadata &&
+            event.data.object.metadata.purpose === 'unlock_member'
+        ) {
+            try {
+                const result = await require('../services/neighborhoodUnlocks').applySetupIntentSucceeded(event.data.object);
+                console.log('Unlock member card saved:', result);
+            } catch (err) {
+                console.error('Unlock member card error:', err);
+                return res.status(500).json({ success: false, message: 'Failed to apply setup intent' });
+            }
+            return res.status(200).json({ success: true, message: 'Webhook processed successfully' });
+        }
+
         // Handle payment_intent.succeeded event
         if (event.type === 'payment_intent.succeeded') {
             if (!event.data || !event.data.object) {

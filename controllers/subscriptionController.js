@@ -66,6 +66,7 @@ const {
 } = require('../services/planPricing');
 const { buildPriceQuote, shortDate, perUnit } = require('../services/priceQuote');
 const { nyClock } = require('../services/nyTime');
+const unlocks = require('../services/neighborhoodUnlocks');
 
 // A free month needs a card behind it, and an app build that can only open a
 // payment sheet cannot save a card without charging something. Stripe's floor
@@ -289,6 +290,7 @@ exports.quotePrice = async (req, res) => {
             address: b.address || b.homeAddress,
             promoCode: b.promoCode,
             userId: b.userId,
+            waitlistFor: unlocks.waitlistForQuote,
         });
         res.status(status).json(body);
     } catch (err) {
@@ -555,6 +557,42 @@ exports.createSubscription = async (req, res) => {
         }
         const isTrial = !!promo && promo.kind === 'free_trial';
 
+        // A referral code is the referrer's phone number. Only the referrer
+        // is rewarded, so this customer pays the price.
+        if (promo && promo.kind === 'referral' && String(promo.referrer) === String(user._id)) {
+            return res.status(400).json({ success: false, message: 'That’s your own code.' });
+        }
+        const referral = promo && promo.kind === 'referral' ? { userId: promo.referrer, code: promo.code } : null;
+
+        // A Permanent valet neighborhood that hasn't started takes the card
+        // and charges nothing until it does (services/neighborhoodUnlocks.js).
+        if (purchase.plan.pricedByAddress && purchase.area && purchase.area.key) {
+            const state = await unlocks.stateFor(purchase.area.key, table);
+            const started = !!(state && state.unlocked && (!state.startsAt || new Date(state.startsAt) <= new Date()));
+            if (!started) {
+                if (!supportsSetupIntent) {
+                    return res.status(426).json({
+                        success: false,
+                        code: 'UPDATE_REQUIRED',
+                        message: 'Update the app to join this neighborhood’s waitlist.',
+                    });
+                }
+                const joined = await unlocks.joinAsSelf({ user, quote: purchase, promo, referral, homeAddress });
+                if (joined.error) {
+                    return res.status(joined.status || 400).json({ success: false, code: joined.code, message: joined.error });
+                }
+                const sheet = await unlocks.setupIntentFor(joined.member, user);
+                return res.status(201).json({
+                    success: true,
+                    status: 'waiting',
+                    memberId: String(joined.member._id),
+                    ...sheet,
+                    amountCents: 0,
+                    waitlist: await unlocks.waitlistForQuote(purchase),
+                });
+            }
+        }
+
         const stripeSub = await stripe().subscriptions.create({
             customer: stripeCustomerId,
             items: [{ price: priceId, quantity: purchase.quantity }],
@@ -577,6 +615,7 @@ exports.createSubscription = async (req, res) => {
                 interval,
                 ...(promo ? { promoCode: promo.code } : {}),
                 ...(promo && promo.rep ? { repId: String(promo.rep) } : {}),
+                ...(referral ? { referredBy: String(referral.userId) } : {}),
             },
             expand: ['latest_invoice.payment_intent', 'pending_setup_intent'],
         });
@@ -604,6 +643,7 @@ exports.createSubscription = async (req, res) => {
             ...(promo ? { promoCode: promo.code } : {}),
             ...(stripeSub.trial_end ? { trialEndsAt: new Date(stripeSub.trial_end * 1000) } : {}),
             pricing: pricingSnapshot(purchase),
+            ...(referral ? { referredBy: referral.userId, referralCode: referral.code } : {}),
             // A code that carries a rep credits the sale to them, with the
             // neighborhood's commission as it stands today.
             ...(promo && promo.rep
@@ -1487,6 +1527,12 @@ async function activateLocal(sub, invoice, stripeSub) {
     } catch (err) {
         console.error(`activateLocal: could not count the code on ${sub._id}:`, err.message);
     }
+    // The unlock tree counts this subscriber in their neighborhood.
+    try {
+        await unlocks.recordActiveSubscription(sub);
+    } catch (err) {
+        console.error(`activateLocal: could not record ${sub._id} in its neighborhood:`, err.message);
+    }
     console.log(`Subscription ${sub._id} active (tier ${sub.tier}, user ${sub.user})`);
 }
 
@@ -1672,6 +1718,11 @@ async function applySubscriptionUpdated(stripeSub, isDeletion = false) {
             { _id: sub.user, activeSubscription: sub._id },
             { $unset: { activeSubscription: 1 } }
         );
+        try {
+            await unlocks.subscriptionEnded(sub);
+        } catch (err) {
+            console.error(`applySubscriptionUpdated: could not end ${sub._id}'s membership:`, err.message);
+        }
     } else if (mapped === 'active') {
         await User.findByIdAndUpdate(sub.user, {
             $set: { activeSubscription: sub._id },

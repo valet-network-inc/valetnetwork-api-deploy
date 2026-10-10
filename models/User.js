@@ -6,6 +6,15 @@ const UserSchema = new mongoose.Schema({
         required: true,
         unique: true,
     },
+    // Refer a friend (spec v2, 13): where the $50/mo goes. Their code is
+    // their phone number, live once this is set.
+    referral: {
+        method: { type: String, enum: ['zelle', 'venmo', 'bank'] },
+        // Zelle email or phone, Venmo username, or the bank deposit
+        // instructions as typed. Shown only to the customer and to admin.
+        handle: { type: String, trim: true },
+        savedAt: { type: Date },
+    },
     firebaseUid: {
         type: String,
         sparse: true,
