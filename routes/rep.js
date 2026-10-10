@@ -9,6 +9,9 @@ const open = requireRep({ signed: false });
 const signed = requireRep();
 const adminOnly = requireRep({ adminOnly: true });
 
+router.get('/invite/:token', rep.inviteInfo);
+router.post('/invite/claim', rep.claimInvite);
+
 router.get('/me', open, rep.me);
 router.get('/agreement', open, rep.agreement);
 router.post('/agreement/sign', open, rep.sign);

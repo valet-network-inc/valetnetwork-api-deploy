@@ -147,6 +147,50 @@ describe('sign-in and the agreement gate', () => {
     });
 });
 
+describe('rep invite links (added without a phone)', () => {
+    test('the first phone through the link becomes the rep, once', async () => {
+        const made = await request(app).post('/api/rep/admin/reps').set(as(RISHI)).send({ name: 'Fred Lenz' });
+        expect(made.status).toBe(201);
+        expect(made.body.rep.phone).toBeNull();
+        const url = made.body.rep.inviteUrl;
+        expect(url).toMatch(/^https:\/\/valetnetwork\.co\/rep\?invite=[A-Za-z0-9_-]{24}$/);
+        const token = url.split('invite=')[1];
+
+        const info = await request(app).get(`/api/rep/invite/${token}`);
+        expect(info.body.invite).toEqual({ name: 'Fred Lenz', needsEmail: true, used: false });
+        expect((await request(app).get('/api/rep/invite/nope-nope-nope-nope')).status).toBe(404);
+
+        // Before claiming, the number is just a stranger.
+        expect((await request(app).get('/api/rep/me').set(as(DANA))).body.code).toBe('NOT_A_REP');
+        // An existing rep's number can't take it.
+        expect((await request(app).post('/api/rep/invite/claim').set(as(ALEX)).send({ token, email: 'a@b.co' })).status).toBe(409);
+        // No email, no claim when the invite has none.
+        expect((await request(app).post('/api/rep/invite/claim').set(as(DANA)).send({ token })).status).toBe(400);
+        expect((await request(app).post('/api/rep/invite/claim').send({ token, email: 'fred@email.com' })).status).toBe(401);
+
+        const claim = await request(app).post('/api/rep/invite/claim').set(as(DANA)).send({ token, email: 'Fred@Email.com' });
+        expect(claim.status).toBe(200);
+        const me = await request(app).get('/api/rep/me').set(as(DANA));
+        expect(me.status).toBe(200);
+        expect(me.body.rep).toMatchObject({ name: 'Fred Lenz', email: 'fred@email.com', phone: '(917) 555-0107' });
+        expect(me.body.agreement.signed).toBe(false);
+
+        // Same phone again is fine; another phone is refused.
+        expect((await request(app).post('/api/rep/invite/claim').set(as(DANA)).send({ token })).status).toBe(200);
+        expect((await request(app).post('/api/rep/invite/claim').set(as('2125550100')).send({ token, email: 'x@y.co' })).status).toBe(409);
+        const list = await request(app).get('/api/rep/admin/reps').set(as(RISHI));
+        expect(list.body.reps.find((r) => r.name === 'Fred Lenz').inviteUrl).toBeNull();
+    });
+
+    test('two phone-less invites can be open at once', async () => {
+        await Rep.syncIndexes();
+        const a = await request(app).post('/api/rep/admin/reps').set(as(RISHI)).send({ name: 'Fred Lenz' });
+        const b = await request(app).post('/api/rep/admin/reps').set(as(RISHI)).send({ name: 'Pat Doe', email: 'pat@email.com' });
+        expect([a.status, b.status]).toEqual([201, 201]);
+        expect(a.body.rep.inviteUrl).not.toBe(b.body.rep.inviteUrl);
+    });
+});
+
 describe('customers and invites', () => {
     beforeEach(async () => {
         await signAs(ALEX, 'Alex Rivera');

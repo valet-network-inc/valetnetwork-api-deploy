@@ -13,9 +13,10 @@ const mongoose = require('mongoose');
 const RepSchema = new mongoose.Schema(
     {
         name: { type: String, required: true, trim: true },
-        // E.164 (+19175551234). The sign-in matches the Firebase token's
-        // phone_number against this, so it is the rep's identity.
-        phone: { type: String, required: true, unique: true, trim: true },
+        // 10 digits. The sign-in matches the Firebase token's phone_number
+        // against this, so it is the rep's identity. Empty only on a rep
+        // invited by link who hasn't signed in yet (invite below).
+        phone: { type: String, unique: true, sparse: true, trim: true },
         email: { type: String, trim: true, lowercase: true },
         // Normalized like a promo code (uppercase, no spaces or dashes).
         code: { type: String, unique: true, sparse: true },
@@ -27,6 +28,13 @@ const RepSchema = new mongoose.Schema(
         // Stored the first time the rep signs in, after the phone matched.
         firebaseUid: { type: String, unique: true, sparse: true },
         createdBy: { type: String },
+        // Added without a phone (Rishi, 2026-10-10: "I don't have his phone
+        // number"): the link valetnetwork.co/rep?invite=<token> lets the first
+        // phone that signs in with it become this rep. One use.
+        invite: {
+            token: { type: String, unique: true, sparse: true },
+            claimedAt: { type: Date },
+        },
         notes: { type: String },
         // The signed commission agreement (services/repAgreement.js).
         agreement: {

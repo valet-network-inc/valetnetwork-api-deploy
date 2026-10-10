@@ -60,3 +60,4 @@ function requireRep({ signed = true, adminOnly = false } = {}) {
 }
 
 module.exports = requireRep;
+module.exports.verifiedToken = verifiedToken;

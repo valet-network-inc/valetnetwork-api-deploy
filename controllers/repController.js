@@ -14,7 +14,9 @@ const PromoCode = require('../models/PromoCode');
 const repAgreement = require('../services/repAgreement');
 const ledger = require('../services/salesLedger');
 const unlocks = require('../services/neighborhoodUnlocks');
+const crypto = require('crypto');
 const { phoneCode, phoneVariants, formatPhone } = require('../services/phoneCodes');
+const { verifiedToken } = require('../middleware/requireRep');
 const { getTable, saveTable, garagePriceAt, allNeighborhoods, NOT_OFFERED_MESSAGE } = require('../services/neighborhoodPricing');
 const { createCode, updateCode, listCodes } = require('../services/subscriptionPromos');
 
@@ -35,12 +37,18 @@ function repView(rep) {
     return {
         _id: String(rep._id),
         name: rep.name,
-        phone: formatPhone(rep.phone),
+        phone: rep.phone ? formatPhone(rep.phone) : null,
         email: rep.email || undefined,
-        code: formatPhone(rep.phone),
+        code: rep.phone ? formatPhone(rep.phone) : null,
         role: rep.role,
         active: rep.active !== false,
     };
+}
+
+function inviteUrl(rep) {
+    if (!rep.invite?.token || rep.invite.claimedAt) return null;
+    const base = (process.env.PUBLIC_WEB_URL || 'https://valetnetwork.co').replace(/\/$/, '');
+    return `${base}/rep?invite=${rep.invite.token}`;
 }
 
 // GET /api/rep/me
@@ -275,6 +283,7 @@ exports.listReps = wrap(async (req, res) => {
         const month = money.months.find((m) => m.month === nowKey) || { totalCents: 0, paidCents: 0 };
         out.push({
             ...repView(r),
+            inviteUrl: inviteUrl(r),
             agreementSignedAt: (await repAgreement.isSignedNow(r)) ? r.agreement.signedAt : null,
             customers: members.filter((m) => m.status === 'active').length,
             waitlists: members.filter((m) => ['waiting', 'scheduled', 'starting'].includes(m.status)).length,
@@ -285,22 +294,66 @@ exports.listReps = wrap(async (req, res) => {
     res.json({ success: true, reps: out });
 });
 
-// POST /api/rep/admin/reps  { name, phone, email? }
+// POST /api/rep/admin/reps  { name, phone?, email? }
+// Without a phone the rep gets a one-time invite link instead: the first
+// phone that signs in with it becomes the rep's (claimInvite below).
 exports.createRep = wrap(async (req, res) => {
     const b = req.body || {};
     const name = String(b.name || '').replace(/\s+/g, ' ').trim();
-    const phone = phoneCode(b.phone);
+    const phone = b.phone ? phoneCode(b.phone) : null;
     if (!name) return res.status(400).json({ success: false, message: 'Full name is required.' });
-    if (!phone) return res.status(400).json({ success: false, message: 'Enter a 10-digit US phone number.' });
-    if (await Rep.exists({ phone })) return res.status(409).json({ success: false, message: 'That number is already a rep.' });
+    if (b.phone && !phone) return res.status(400).json({ success: false, message: 'Enter a 10-digit US phone number.' });
+    if (phone && (await Rep.exists({ phone }))) return res.status(409).json({ success: false, message: 'That number is already a rep.' });
     const rep = await Rep.create({
         name,
-        phone,
-        code: phone,
+        ...(phone ? { phone, code: phone } : { invite: { token: crypto.randomBytes(18).toString('base64url') } }),
         email: b.email ? String(b.email).trim() : undefined,
         createdBy: req.rep.name,
     });
-    res.status(201).json({ success: true, rep: { ...repView(rep), agreementSignedAt: null, customers: 0, waitlists: 0, owedCents: 0, paidToDateCents: 0 } });
+    res.status(201).json({
+        success: true,
+        rep: { ...repView(rep), inviteUrl: inviteUrl(rep), agreementSignedAt: null, customers: 0, waitlists: 0, owedCents: 0, paidToDateCents: 0 },
+    });
+});
+
+const openInvite = (token) =>
+    /^[A-Za-z0-9_-]{16,64}$/.test(String(token || '')) ? Rep.findOne({ 'invite.token': token, active: { $ne: false } }) : null;
+
+// GET /api/rep/invite/:token — public: whose invite it is, for the sign-in screen.
+exports.inviteInfo = wrap(async (req, res) => {
+    const rep = await openInvite(req.params.token);
+    if (!rep) return res.status(404).json({ success: false, message: 'This invite link isn’t valid. Ask Rishi for a new one.' });
+    res.json({ success: true, invite: { name: rep.name, needsEmail: !rep.email, used: Boolean(rep.invite.claimedAt) } });
+});
+
+// POST /api/rep/invite/claim  { token, email? } — Firebase token only (not yet a rep).
+// The signed-in phone becomes the invited rep's phone, code and identity.
+exports.claimInvite = wrap(async (req, res) => {
+    const id = await verifiedToken(req);
+    if (!id) return res.status(401).json({ success: false, message: 'Sign in again to continue.' });
+    const phone = phoneCode(id.phone_number);
+    if (!phone) return res.status(400).json({ success: false, message: 'Sign in with a US mobile number.' });
+    const b = req.body || {};
+    const rep = await openInvite(b.token);
+    if (!rep) return res.status(404).json({ success: false, message: 'This invite link isn’t valid. Ask Rishi for a new one.' });
+    if (rep.invite.claimedAt) {
+        if (rep.phone === phone) return res.json({ success: true });
+        return res.status(409).json({ success: false, message: 'This invite link was already used. Ask Rishi for a new one.' });
+    }
+    if (await Rep.exists({ phone, _id: { $ne: rep._id } })) {
+        return res.status(409).json({ success: false, message: 'This number is already a rep. Sign in without the invite link.' });
+    }
+    if (!rep.email) {
+        const email = String(b.email || '').trim().toLowerCase();
+        if (!/^\S+@\S+\.\S+$/.test(email)) return res.status(400).json({ success: false, message: 'Type your email. Your signed copy goes there.' });
+        rep.email = email;
+    }
+    rep.phone = phone;
+    rep.code = phone;
+    rep.firebaseUid = id.uid;
+    rep.invite.claimedAt = new Date();
+    await rep.save();
+    res.json({ success: true });
 });
 
 const MONTH = /^\d{4}-(0[1-9]|1[0-2])$/;
