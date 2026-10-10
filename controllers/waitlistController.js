@@ -230,11 +230,18 @@ exports.neighborhood = wrap(async (req, res) => {
 
 const METHODS = { zelle: 'Zelle', venmo: 'Venmo', bank: 'Bank deposit' };
 
+/** What the customer sees of their payout: a bank account only by its last four. */
+function shownHandle(r) {
+    if (r.method !== 'bank') return r.handle || '';
+    const m = /account (\d+)/.exec(r.handle || '');
+    return m ? `ending ${m[1].slice(-4)}` : '';
+}
+
 function referralPayload(user, summary) {
     const ten = phoneCode(user.phone);
     const r = user.referral && user.referral.method ? user.referral : null;
     return {
-        payout: r ? { method: r.method, label: METHODS[r.method], handle: r.handle || '' } : null,
+        payout: r ? { method: r.method, label: METHODS[r.method], handle: shownHandle(r) } : null,
         code: r && ten ? formatPhone(ten) : null,
         codeDigits: r && ten ? ten : null,
         shareText:
@@ -260,7 +267,14 @@ exports.referral = wrap(async (req, res) => {
 exports.savePayout = wrap(async (req, res) => {
     const b = req.body || {};
     if (!METHODS[b.method]) return res.status(400).json({ success: false, message: 'Pick Zelle, Venmo or Bank deposit.' });
-    const handle = String(b.handle || '').trim();
+    // The app sends a bank deposit as its three fields; Rishi pays it by hand.
+    const bank = b.method === 'bank' && b.bank && typeof b.bank === 'object' ? b.bank : null;
+    const handle = bank
+        ? [bank.name, bank.routingNumber && `routing ${bank.routingNumber}`, bank.accountNumber && `account ${bank.accountNumber}`]
+              .map((x) => String(x || '').trim())
+              .filter(Boolean)
+              .join(' · ')
+        : String(b.handle || '').trim();
     if (handle.length < 3) {
         const what = { zelle: 'your Zelle email or phone', venmo: 'your Venmo username', bank: 'your bank deposit details' }[b.method];
         return res.status(400).json({ success: false, message: `Enter ${what}.` });
