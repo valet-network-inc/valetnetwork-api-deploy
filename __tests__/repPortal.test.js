@@ -163,7 +163,8 @@ describe('rep invite links (added without a phone)', () => {
         // Before claiming, the number is just a stranger.
         expect((await request(app).get('/api/rep/me').set(as(DANA))).body.code).toBe('NOT_A_REP');
         // An existing rep's number can't take it.
-        expect((await request(app).post('/api/rep/invite/claim').set(as(ALEX)).send({ token, email: 'a@b.co' })).status).toBe(409);
+        const taken = await request(app).post('/api/rep/invite/claim').set(as(ALEX)).send({ token, email: 'a@b.co' });
+        expect([taken.status, taken.body.code]).toEqual([409, 'ALREADY_A_REP']);
         // No email, no claim when the invite has none.
         expect((await request(app).post('/api/rep/invite/claim').set(as(DANA)).send({ token })).status).toBe(400);
         expect((await request(app).post('/api/rep/invite/claim').send({ token, email: 'fred@email.com' })).status).toBe(401);

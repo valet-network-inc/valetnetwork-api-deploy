@@ -341,7 +341,7 @@ exports.claimInvite = wrap(async (req, res) => {
         return res.status(409).json({ success: false, message: 'This invite link was already used. Ask Rishi for a new one.' });
     }
     if (await Rep.exists({ phone, _id: { $ne: rep._id } })) {
-        return res.status(409).json({ success: false, message: 'This number is already a rep. Sign in without the invite link.' });
+        return res.status(409).json({ success: false, code: 'ALREADY_A_REP', message: 'This number is already a rep. Sign in without the invite link.' });
     }
     if (!rep.email) {
         const email = String(b.email || '').trim().toLowerCase();
