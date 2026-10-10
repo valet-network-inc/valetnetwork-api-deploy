@@ -1,9 +1,10 @@
 /**
  * The commission agreement a rep signs before the portal opens (spec v2, 17).
  *
- * The text is stored versioned in Mongo, seeded from
- * config/commissionAgreement.md (the Oct 9 rewrite that matches /sales; still
- * a draft for attorney review, and it says so). A rep's signature is the full
+ * The text is stored versioned in Mongo. config/commissionAgreement.md is
+ * the source: when it differs from the latest stored version, it is stored as
+ * the next version, so editing the file and deploying publishes it, and every
+ * rep signs again before the portal reopens. A rep's signature is the full
  * name they type plus today's date in New York, recorded with the version.
  * On signing, a PDF of the agreement as signed is emailed to the rep, cc
  * Rishi, from rishi@valetnetwork.co. The email needs SMTP settings:
@@ -28,15 +29,17 @@ const FROM_DEFAULT = 'Rishi Ganesh <rishi@valetnetwork.co>';
 
 let cached = null;
 
-/** The current version: { version, text }. Seeds version 1 on first use. */
+/** The current version: { version, text }. Publishes the file's text as the next version when it changed. */
 async function current() {
     if (cached && Date.now() - cached.at < 60 * 1000) return cached.doc;
     let doc = await RepAgreement.findOne({}).sort({ version: -1 }).lean();
-    if (!doc) {
+    if (!doc || doc.text !== SEED_TEXT) {
+        const version = doc ? doc.version + 1 : 1;
         try {
-            doc = (await RepAgreement.create({ version: 1, text: SEED_TEXT })).toObject();
+            doc = (await RepAgreement.create({ version, text: SEED_TEXT })).toObject();
         } catch (err) {
-            if (err && err.code === 11000) doc = await RepAgreement.findOne({ version: 1 }).lean();
+            // Another process published it a moment ago.
+            if (err && err.code === 11000) doc = await RepAgreement.findOne({}).sort({ version: -1 }).lean();
             else throw err;
         }
     }
@@ -67,8 +70,13 @@ function isoDay(date) {
  * The stored text as the portal shows it, with the rep's name and the date
  * filled in: { title, subtitle, draft, intro, sections: [{heading, body}], note }.
  */
-function parse(text, { name, date }) {
-    const filled = text.replace(/\{REP_NAME\}/g, name || 'the Rep').replace(/\{START_DATE\}/g, longDate(date));
+function parse(text, { name, phone, email, date }) {
+    const { formatPhone } = require('./phoneCodes');
+    const filled = text
+        .replace(/\{REP_NAME\}/g, name || 'the Rep')
+        .replace(/\{REP_PHONE\}/g, phone ? formatPhone(phone) : '[phone]')
+        .replace(/\{REP_EMAIL\}/g, email || '[email]')
+        .replace(/\{START_DATE\}/g, longDate(date));
     const blocks = filled.split(/\n\s*\n/).map((b) => b.trim()).filter(Boolean);
     const out = { title: '', subtitle: '', draft: '', intro: '', sections: [], note: '' };
     const intro = [];
@@ -93,7 +101,7 @@ async function viewFor(rep, now = new Date()) {
     const doc = await current();
     const signed = isSigned(rep, doc);
     const date = signed ? rep.agreement.signedAt : now;
-    return { version: doc.version, ...parse(doc.text, { name: rep.name, date }) };
+    return { version: doc.version, ...parse(doc.text, { name: rep.name, phone: rep.phone, email: rep.email, date }) };
 }
 
 function isSigned(rep, doc) {
@@ -123,7 +131,7 @@ async function pdfFor(rep) {
     const doc = await current();
     const PDFDocument = require('pdfkit');
     const signed = isSigned(rep, doc);
-    const a = parse(doc.text, { name: rep.name, date: signed ? rep.agreement.signedAt : new Date() });
+    const a = parse(doc.text, { name: rep.name, phone: rep.phone, email: rep.email, date: signed ? rep.agreement.signedAt : new Date() });
     const pdf = new PDFDocument({ size: 'LETTER', margins: { top: 60, bottom: 60, left: 64, right: 64 } });
     const chunks = [];
     const done = new Promise((resolve, reject) => {
@@ -152,9 +160,10 @@ async function pdfFor(rep) {
     if (signed) {
         pdf.moveDown(1.2).font('Helvetica-Bold').fontSize(12).text('Signed');
         pdf.moveDown(0.3).font('Helvetica').fontSize(10.5);
+        pdf.text(`Valet Network, Inc.: Rishi Ganesh`);
         pdf.text(`The Rep: ${rep.agreement.signedName}`);
         pdf.text(`Date: ${longDate(rep.agreement.signedAt)}`);
-        pdf.text(`Signed electronically by typing their full name. Agreement version ${rep.agreement.version}.`);
+        pdf.text(`Signed electronically by the Rep typing their full name in the rep portal. Agreement version ${rep.agreement.version}.`);
     } else {
         pdf.moveDown(1.2).font('Helvetica-Bold').fontSize(12).text('Not signed yet');
         pdf.font('Helvetica').fontSize(10.5);

@@ -88,10 +88,11 @@ describe('sign-in and the agreement gate', () => {
 
         const a = await request(app).get('/api/rep/agreement').set(as(ALEX));
         expect(a.body.agreement.title).toBe('Commission agreement');
-        expect(a.body.agreement.draft).toMatch(/DRAFT/);
-        expect(a.body.agreement.intro).toMatch(/and Alex Rivera \("the Rep"\)/);
-        expect(a.body.agreement.sections).toHaveLength(10);
-        expect(JSON.stringify(a.body)).not.toMatch(/REP ADDRESS|\{REP_NAME\}/);
+        expect(a.body.agreement.draft).toBe('');
+        expect(a.body.agreement.note).toBe('');
+        expect(a.body.agreement.intro).toMatch(/and Alex Rivera, \(646\) 555-0198, alexrivera@email.com \("the Rep"\)/);
+        expect(a.body.agreement.sections).toHaveLength(12);
+        expect(JSON.stringify(a.body)).not.toMatch(/REP ADDRESS|\{REP_|attorney|DRAFT/);
 
         const stale = await request(app).post('/api/rep/agreement/sign').set(as(ALEX)).send({ version: 99, fullName: 'Alex Rivera' });
         expect(stale.status).toBe(409);
@@ -113,6 +114,20 @@ describe('sign-in and the agreement gate', () => {
         expect(pdf.status).toBe(200);
         expect(pdf.headers['content-type']).toMatch(/pdf/);
         expect(pdf.body.slice(0, 4).toString()).toBe('%PDF');
+    });
+
+    test('a changed agreement is published as the next version, and signers sign again', async () => {
+        const RepAgreement = require('../models/RepAgreement');
+        await RepAgreement.create({ version: 1, text: '# Old agreement' });
+        await Rep.updateOne({ phone: ALEX }, { $set: { agreement: { version: 1, signedName: 'Alex Rivera', signedAt: new Date() } } });
+        repAgreement.invalidate();
+        const a = await request(app).get('/api/rep/agreement').set(as(ALEX));
+        expect(a.body.agreement.version).toBe(2);
+        expect(a.body.agreement.title).toBe('Commission agreement');
+        expect((await request(app).get('/api/rep/home').set(as(ALEX))).body.code).toBe('AGREEMENT_REQUIRED');
+        expect((await signAs(ALEX, 'Alex Rivera')).status).toBe(200);
+        expect((await request(app).get('/api/rep/home').set(as(ALEX))).status).toBe(200);
+        expect(await RepAgreement.countDocuments()).toBe(2);
     });
 
     test('admin routes are Rishi’s only', async () => {
