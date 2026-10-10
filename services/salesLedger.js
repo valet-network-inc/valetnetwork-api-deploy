@@ -530,24 +530,24 @@ async function referralSummary(userId, now = new Date()) {
         const ended = endedAt(s);
         const name = await nameFor(s.user);
         if (ended || s.status !== 'active') {
-            rows.push({ name, line: `Cancelled ${shortDay(ended || s.updatedAt)}`, rewardCents: null });
+            rows.push({ name, status: 'cancelled', line: `Cancelled ${shortDay(ended || s.updatedAt)}`, rewardCents: null });
             continue;
         }
         const used = start && start <= now ? monthsBetween(monthKey(start), nowKey) : 0;
         const left = Math.max(0, REFERRAL_MONTHS - used);
         if (!start || start > now) {
-            rows.push({ name, line: `Starts ${shortDay(start || now)}`, rewardCents: null });
+            rows.push({ name, status: 'waiting', line: `Starts ${shortDay(start || now)}`, rewardCents: null });
         } else if (left > 0) {
-            rows.push({ name, line: `Active since ${shortDay(start)} · ${left} month${left === 1 ? '' : 's'} left`, rewardCents: REFERRAL_CENTS });
+            rows.push({ name, status: 'active', since: start, monthsLeft: left, line: `Active since ${shortDay(start)} · ${left} month${left === 1 ? '' : 's'} left`, rewardCents: REFERRAL_CENTS });
             earningCents += REFERRAL_CENTS;
         } else {
-            rows.push({ name, line: `Active since ${shortDay(start)} · year complete`, rewardCents: null });
+            rows.push({ name, status: 'ended', since: start, line: `Active since ${shortDay(start)} · year complete`, rewardCents: null });
         }
     }
     const waiting = await UnlockMember.find({ referredBy: userId, status: { $in: ['waiting', 'scheduled', 'starting'] } }).lean();
     for (const m of waiting) {
         const user = m.user ? await User.findById(m.user).select('firstName lastName name').lean() : null;
-        rows.push({ name: personName(user, m.contact), line: `Waiting for ${m.neighborhoodName} to go live`, rewardCents: null });
+        rows.push({ name: personName(user, m.contact), status: 'waiting', line: `Waiting for ${m.neighborhoodName} to go live`, rewardCents: null });
     }
     return { referrals: rows, earningCents };
 }

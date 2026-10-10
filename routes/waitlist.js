@@ -15,5 +15,6 @@ router.post('/members/:memberId/setup-intent', self, w.setupIntent);
 router.post('/members/:memberId/confirm', self, w.confirm);
 router.patch('/members/:memberId', self, w.edit);
 router.post('/members/:memberId/leave', self, w.leave);
+router.post('/members/:memberId/share', self, w.share);
 
 module.exports = router;

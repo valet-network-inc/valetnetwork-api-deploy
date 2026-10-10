@@ -33,7 +33,7 @@ function webBase() {
 
 function shareFor(member, user) {
     const code = phoneCode(user && user.phone);
-    const url = `${webBase()}/join/n/${encodeURIComponent(member.neighborhood)}${code ? `?code=${code}` : ''}`;
+    const url = `${webBase()}/join/share?${code ? `ref=${code}&` : ''}n=${encodeURIComponent(member.neighborhoodName)}`;
     return {
         url,
         text: `Join the ${member.neighborhoodName} waitlist for Valet Network. It goes live at 10 subscribers: ${url}`,
@@ -46,7 +46,12 @@ async function fullView(member, user) {
         ...view,
         inviteToken: member.inviteToken || undefined,
         savedCard: member.cardLast4 ? { brand: member.cardBrand || 'card', last4: member.cardLast4 } : null,
-        ...(['waiting', 'scheduled'].includes(member.status) ? { share: shareFor(member, user) } : {}),
+        ...(['waiting', 'scheduled'].includes(member.status)
+            ? (() => {
+                  const share = shareFor(member, user);
+                  return { share, shareUrl: share.url, shareMessage: share.text };
+              })()
+            : {}),
     };
 }
 
@@ -189,6 +194,15 @@ exports.leave = wrap(async (req, res) => {
     res.json({ success: true });
 });
 
+// POST /api/waitlist/members/:memberId/share  { userId } — the share link.
+exports.share = wrap(async (req, res) => {
+    const member = await ownMember(req, res);
+    if (!member) return;
+    const user = await User.findById(req.callerUserId).select('phone').lean();
+    const share = shareFor(member, user);
+    res.json({ success: true, url: share.url, message: share.text, shareUrl: share.url, shareMessage: share.text });
+});
+
 // GET /api/waitlist/neighborhood/:key — public: the share link's landing.
 exports.neighborhood = wrap(async (req, res) => {
     const table = await getTable();
@@ -229,6 +243,10 @@ function referralPayload(user, summary) {
                 : null,
         rewardCents: ledger.REFERRAL_CENTS,
         ...summary,
+        // The app's names for the same things.
+        shareMessage: r && ten ? `Use my code ${formatPhone(ten)} when you subscribe to Valet Network: ${webBase()}/park?code=${ten}` : null,
+        earnCents: summary.earningCents,
+        referrals: (summary.referrals || []).map((x) => ({ ...x, detail: x.line, amountCents: x.rewardCents })),
     };
 }
 
@@ -255,4 +273,19 @@ exports.savePayout = wrap(async (req, res) => {
         .select('phone referral')
         .lean();
     res.json({ success: true, ...referralPayload(user, await ledger.referralSummary(user._id)) });
+});
+
+// GET /api/referral/share/:code — public: the share link's landing. Who shared
+// it (first name only) and how far their neighborhood is from 10.
+exports.shareInfo = wrap(async (req, res) => {
+    const ten = phoneCode(req.params.code);
+    const user = ten ? await User.findOne({ phone: { $in: phoneVariants(ten) } }).select('firstName name').lean() : null;
+    if (!user) return res.status(404).json({ success: false, message: 'Not found.' });
+    const member = await UnlockMember.findOne({ user: user._id, status: { $in: ['waiting', 'scheduled'] } }).lean();
+    const state = member ? await unlocks.stateFor(member.neighborhood) : null;
+    res.json({
+        success: true,
+        firstName: (user.firstName || (user.name || '').split(' ')[0] || '').trim() || null,
+        unlock: state ? { label: state.name, count: state.count, needed: state.needed, unlocked: state.unlocked, startsAt: state.startsAt } : null,
+    });
 });

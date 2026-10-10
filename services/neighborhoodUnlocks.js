@@ -910,7 +910,17 @@ async function memberView(member, now = new Date()) {
         cardBrand: member.cardBrand || null,
         cardLast4: member.cardLast4 || null,
         startedAt: member.startedAt || null,
-        unlock: { label: name, count, needed: UNLOCK_AT, unlocked, startsAt },
+        unlock: {
+            label: name,
+            count,
+            needed: UNLOCK_AT,
+            unlocked,
+            startsAt,
+            // live = unlocked and its start date has come.
+            status: unlocked ? (startsAt && new Date(startsAt) <= now ? 'live' : 'unlocked') : 'locked',
+            live: !!(unlocked && startsAt && new Date(startsAt) <= now),
+        },
+        price: { amountCents: member.plan.amountCents, interval: member.plan.interval, label: copy.priceLine },
         rep: rep ? { firstName: rep } : null,
         copy,
         after,
