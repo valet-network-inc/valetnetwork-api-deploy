@@ -27,6 +27,8 @@ const wrap = (fn) => async (req, res) => {
     }
 };
 
+const APP_STORE_URL = 'https://apps.apple.com/us/app/valet-network-inc/id6760546890';
+
 function webBase() {
     return (process.env.PUBLIC_WEB_URL || 'https://valetnetwork.co').replace(/\/$/, '');
 }
@@ -255,7 +257,9 @@ function referralPayload(user, summary) {
         rewardCents: ledger.REFERRAL_CENTS,
         ...summary,
         // The app's names for the same things.
-        shareMessage: r && ten ? `Use my code ${formatPhone(ten)} when you subscribe to Valet Network: ${webBase()}/park?code=${ten}` : null,
+        // The app shares from an iPhone, so its message points at the App Store;
+        // the web keeps its /park?code= link (shareText above).
+        shareMessage: r && ten ? `Use my code ${formatPhone(ten)} when you subscribe to Valet Network. Get the app: ${APP_STORE_URL}` : null,
         earnCents: summary.earningCents,
         referrals: (summary.referrals || []).map((x) => ({ ...x, detail: x.line, amountCents: x.rewardCents })),
     };
