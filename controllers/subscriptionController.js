@@ -43,6 +43,7 @@ const {
     discountRefusal,
     ensureStripeCoupon,
     countRedemption,
+    withFriendDiscount,
 } = require('../services/subscriptionPromos');
 const {
     getTable,
@@ -235,7 +236,7 @@ async function refundTrialDeposit(sub) {
 exports.checkPromo = async (req, res) => {
     const { code, tier, interval, movesPerWeek, userId, homeAddress } = req.body || {};
     try {
-        const promo = await findPromo(code);
+        const promo = await withFriendDiscount(await findPromo(code), tier, userId);
         if (!promo) {
             return res.status(400).json({ success: false, message: 'That code is not valid.' });
         }
@@ -521,7 +522,7 @@ exports.createSubscription = async (req, res) => {
         const accountCode = typedCode ? '' : String(user.pendingPromoCode || '').trim();
         const codeToApply = typedCode || accountCode;
         if (codeToApply) {
-            const candidate = await findPromo(codeToApply);
+            const candidate = await withFriendDiscount(await findPromo(codeToApply), tier, user._id);
             const mismatch = candidate
                 ? planMismatch(candidate, {
                       tier,

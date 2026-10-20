@@ -21,6 +21,7 @@ const {
     describe,
     discountRefusal,
     isDiscount,
+    withFriendDiscount,
 } = require('./subscriptionPromos');
 
 function shortDate(date) {
@@ -84,7 +85,7 @@ async function buildPriceQuote({
         } else {
             const blocked = await promoRedemptionBlock(candidate, userId);
             if (blocked) promoError = blocked;
-            else promo = candidate;
+            else promo = await withFriendDiscount(candidate, tier, userId);
         }
     }
 

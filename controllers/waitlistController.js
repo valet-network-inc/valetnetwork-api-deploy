@@ -252,14 +252,14 @@ function referralPayload(user, summary) {
         codeDigits: r && ten ? ten : null,
         shareText:
             r && ten
-                ? `Use my code ${formatPhone(ten)} when you subscribe to Valet Network: ${webBase()}/park?code=${ten}`
+                ? `Use my code ${formatPhone(ten)} when you subscribe for a Permanent Valet pass to get $50 off your first month: ${webBase()}/park?code=${ten}`
                 : null,
         rewardCents: ledger.REFERRAL_CENTS,
         ...summary,
         // The app's names for the same things.
         // The app shares from an iPhone, so its message points at the App Store;
         // the web keeps its /park?code= link (shareText above).
-        shareMessage: r && ten ? `Use my code ${formatPhone(ten)} when you subscribe to Valet Network. Get the app: ${APP_STORE_URL}` : null,
+        shareMessage: r && ten ? `Use my code ${formatPhone(ten)} when you subscribe for a Permanent Valet pass to get $50 off your first month ${APP_STORE_URL}` : null,
         earnCents: summary.earningCents,
         referrals: (summary.referrals || []).map((x) => ({ ...x, detail: x.line, amountCents: x.rewardCents })),
     };

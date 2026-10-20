@@ -304,7 +304,43 @@ const UNUSABLE_MESSAGE = "That code can't be used on this plan.";
 const MIN_FIRST_INVOICE_CENTS = 100;
 
 function isDiscount(promo) {
-    return !!promo && (promo.kind === 'percent_off' || promo.kind === 'amount_off');
+    return !!promo && (promo.kind === 'percent_off' || promo.kind === 'amount_off' || !!promo.friendDiscount);
+}
+
+// ---------------------------------------------------------------------------
+// A friend's referral code on a Permanent valet pass
+// ---------------------------------------------------------------------------
+//
+// The friend gets $50 off their first month; the referrer is still paid as
+// before. The promo keeps kind 'referral' so the referral credit paths are
+// untouched. Not `appliesTo`: planMismatch would then refuse the code on a
+// street-cleaning plan and the referrer would lose the credit.
+
+const FRIEND_DISCOUNT = { amountOffCents: 5000, duration: 'once', tier: 'home_garage', couponId: 'FRIEND50' };
+
+/**
+ * The promo with the friend's $50 on it when it is a friend's code on a
+ * Permanent valet pass and this customer has never started a plan; otherwise
+ * the promo unchanged. With no userId (the public price card) it is shown.
+ */
+async function withFriendDiscount(promo, tier, userId) {
+    if (!promo || promo.kind !== 'referral' || tier !== FRIEND_DISCOUNT.tier) return promo;
+    if (userId && mongoose.isValidObjectId(userId)) {
+        const prior = await Subscription.findOne({
+            user: userId,
+            $or: [{ activatedAt: { $exists: true, $ne: null } }, { 'payments.0': { $exists: true } }],
+        })
+            .select('_id')
+            .lean();
+        if (prior) return promo;
+    }
+    return {
+        ...promo,
+        friendDiscount: true,
+        amountOffCents: FRIEND_DISCOUNT.amountOffCents,
+        duration: FRIEND_DISCOUNT.duration,
+        headline: '$50 off your first month',
+    };
 }
 
 function money(cents) {
@@ -317,7 +353,7 @@ function discountedCents(promo, amountCents) {
     if (promo.kind === 'percent_off') {
         return Math.round((amountCents * (100 - promo.percentOff)) / 100);
     }
-    if (promo.kind === 'amount_off') return Math.max(0, amountCents - promo.amountOffCents);
+    if (promo.kind === 'amount_off' || promo.friendDiscount) return Math.max(0, amountCents - promo.amountOffCents);
     return amountCents;
 }
 
@@ -378,7 +414,7 @@ function describe(promo, { amountCents, interval, now = new Date() } = {}) {
                     ? `Taken off every bill for ${promo.durationInMonths || 1} month${(promo.durationInMonths || 1) === 1 ? '' : 's'}.`
                     : 'Taken off your first bill.'),
             percentOff: promo.kind === 'percent_off' ? promo.percentOff : null,
-            amountOffCents: promo.kind === 'amount_off' ? promo.amountOffCents : null,
+            amountOffCents: promo.kind === 'amount_off' || promo.friendDiscount ? promo.amountOffCents : null,
             duration: promo.duration,
             durationInMonths: promo.duration === 'repeating' ? promo.durationInMonths : null,
             dueTodayCents: due,
@@ -435,6 +471,24 @@ async function ensureStripeCoupon(promo) {
     if (promo.stripeCouponId) return promo.stripeCouponId;
     const stripe = stripeClient.get();
     if (!stripe) throw new Error('Stripe API key not configured');
+    if (promo.friendDiscount) {
+        // One shared coupon with a fixed id, so it never doubles up.
+        const id = FRIEND_DISCOUNT.couponId;
+        try {
+            await stripe.coupons.retrieve(id);
+        } catch (err) {
+            if (err.statusCode !== 404 && err.code !== 'resource_missing') throw err;
+            await stripe.coupons.create({
+                id,
+                amount_off: FRIEND_DISCOUNT.amountOffCents,
+                currency: 'usd',
+                duration: FRIEND_DISCOUNT.duration,
+                name: "$50 off your first month (a friend's code)",
+                metadata: { kind: 'friend_referral' },
+            });
+        }
+        return id;
+    }
     const id = String(promo.promoCodeId || promo.code);
     const coupon = await stripe.coupons.create(
         {
@@ -623,6 +677,8 @@ module.exports = {
     discountedCents,
     discountRefusal,
     ensureStripeCoupon,
+    withFriendDiscount,
+    FRIEND_DISCOUNT,
     countRedemption,
     createCode,
     updateCode,

@@ -243,11 +243,14 @@ function tellMember(member, reason) {
  */
 async function startCharge(member) {
     const amount = member.plan.amountCents;
-    if (!member.plan.promoCode) return { cents: amount, freeDays: 0 };
-    const { findPromo, isDiscount, discountedCents } = require('./subscriptionPromos');
+    // A friend's code is kept as referralCode, not promoCode; it is $50 off.
+    const code = member.plan.promoCode || member.referralCode;
+    if (!code) return { cents: amount, freeDays: 0 };
+    const { findPromo, isDiscount, discountedCents, withFriendDiscount } = require('./subscriptionPromos');
     let promo = null;
     try {
-        promo = await findPromo(member.plan.promoCode);
+        promo = await findPromo(code);
+        if (!member.plan.promoCode) promo = await withFriendDiscount(promo, member.plan.tier, member.liveUser || member.user);
     } catch (err) {
         console.error('neighborhoodUnlocks: promo lookup failed:', err.message);
     }
@@ -526,8 +529,13 @@ async function startMember(member, { now = new Date() } = {}) {
         const amountCents = m.plan.amountCents;
         const priceId = await resolveStripePrice({ garage: true, interval, unitAmountCents: amountCents });
 
-        const { findPromo, isDiscount, ensureStripeCoupon } = require('./subscriptionPromos');
-        const promo = m.plan.promoCode ? await findPromo(m.plan.promoCode) : null;
+        const { findPromo, isDiscount, ensureStripeCoupon, withFriendDiscount } = require('./subscriptionPromos');
+        // A friend's code is kept as referralCode, not promoCode; it is $50 off.
+        const promo = m.plan.promoCode
+            ? await findPromo(m.plan.promoCode)
+            : m.referralCode
+            ? await withFriendDiscount(await findPromo(m.referralCode), m.plan.tier, m.liveUser || m.user)
+            : null;
         const isTrial = !!promo && promo.kind === 'free_trial';
         const discounts = promo && isDiscount(promo) ? [{ coupon: await ensureStripeCoupon(promo) }] : undefined;
 
