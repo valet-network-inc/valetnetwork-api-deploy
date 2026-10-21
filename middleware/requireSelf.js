@@ -19,6 +19,7 @@
  */
 const admin = require('firebase-admin');
 const User = require('../models/User');
+const { noteAppBuild } = require('../services/appSeen');
 
 /** The verified Firebase uid on this request, or null. Never throws. */
 async function callerFirebaseUid(req) {
@@ -66,6 +67,7 @@ function requireSelf(pick = (req) => req.body?.userId || req.query?.userId) {
             }
 
             req.callerUserId = String(user._id);
+            noteAppBuild(req, user._id);
             return next();
         } catch (err) {
             console.error('requireSelf failed:', err.message);
@@ -103,6 +105,7 @@ function requireValet() {
                 return res.status(403).json({ success: false, message: 'Valets only.' });
             }
             req.callerUserId = String(user._id);
+            noteAppBuild(req, user._id);
             return next();
         } catch (err) {
             console.error('requireValet failed:', err.message);
@@ -151,6 +154,7 @@ function requireOrderOwner(pickOrderId = (req) => req.params?.orderId || req.bod
             }
 
             req.callerUserId = String(owner._id);
+            noteAppBuild(req, owner._id);
             return next();
         } catch (err) {
             console.error('requireOrderOwner failed:', err.message);

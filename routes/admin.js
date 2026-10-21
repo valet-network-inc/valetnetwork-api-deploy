@@ -47,6 +47,8 @@ router.put('/managed-cars/:id/rules', managedCarAdmin.setManagedCarRules);
 router.post('/managed-cars/:id/close', managedCarAdmin.closeManagedCar);
 router.post('/managed-cars/:id/request-keys', managedCarAdmin.requestKeysForCustomer);
 router.get('/ops-alerts', managedCarAdmin.listOpsAlerts);
+// Which app build each customer and valet last opened (services/appSeen.js).
+router.get('/app-builds', require('../controllers/appBuildAdminController').listAppBuilds);
 router.post('/ops-alerts/:id/ack', managedCarAdmin.ackOpsAlert);
 
 router.get('/asp-suspensions', aspSuspensionAdmin.list);

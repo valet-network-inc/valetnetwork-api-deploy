@@ -35,6 +35,15 @@ const UserSchema = new mongoose.Schema({
     signupPlatform: {
         type: String,
     },
+    // The app build they last used, from their requests' User-Agent
+    // (services/appSeen.js). webSeenAt = last signed-in use of the web app.
+    app: {
+        platform: { type: String },
+        build: { type: String },
+        userAgent: { type: String },
+        seenAt: { type: Date },
+    },
+    webSeenAt: { type: Date },
     firstName: {
         type: String,
     },
