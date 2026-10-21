@@ -13,8 +13,9 @@
  *   - $100 when it completes its first full paid month
  *   - a cluster: ten of the rep's subscriptions active at once in one
  *     neighborhood, each past its first full paid month = 1,500 shares
- * Customer referrals: $50 a month per referred subscription while active, for
- * up to 12 paid months each, no cap, only to the referrer.
+ * Customer referrals: $50 for each month the referred friend actually paid
+ * (a Stripe invoice above $0 — a paused, voided or free month earns nothing),
+ * for the first 12 such months each, no cap, only to the referrer.
  *
  * Months are 'YYYY-MM' in New York, compared as strings.
  */
@@ -523,9 +524,31 @@ async function home(repId, now = new Date()) {
 // Customer referrals
 // ---------------------------------------------------------------------------
 
+// A paid bill covers about one period; past this many days without one the
+// friend is not paying right now (paused, unpaid or between bills late).
+const PAID_WINDOW_DAYS = { week: 8, month: 35, year: 370 };
+
+/** The 'YYYY-MM' months a referred friend paid a bill above $0 in, oldest first. */
+function paidMonths(sub, now = new Date()) {
+    const keys = new Set();
+    for (const p of sub.payments || []) {
+        if (p.paidAt && p.amountCents > 0 && new Date(p.paidAt) <= now) keys.add(monthKey(new Date(p.paidAt)));
+    }
+    return [...keys].sort();
+}
+
+/** Whether the friend's latest bill above $0 is recent enough to cover today. */
+function paidRecently(sub, now = new Date()) {
+    const days = PAID_WINDOW_DAYS[sub.interval] || PAID_WINDOW_DAYS.month;
+    return (sub.payments || []).some((p) => {
+        if (!p.paidAt || !(p.amountCents > 0)) return false;
+        const at = new Date(p.paidAt);
+        return at <= now && now - at <= days * DAY;
+    });
+}
+
 /** The Refer a friend screen's list and total for one customer. */
 async function referralSummary(userId, now = new Date()) {
-    const nowKey = monthKey(now);
     const subs = await Subscription.find({ referredBy: userId, activatedAt: { $exists: true } }).lean();
     const rows = [];
     let earningCents = 0;
@@ -537,15 +560,19 @@ async function referralSummary(userId, now = new Date()) {
             rows.push({ name, status: 'cancelled', line: `Cancelled ${shortDay(ended || s.updatedAt)}`, rewardCents: null });
             continue;
         }
-        const used = start && start <= now ? monthsBetween(monthKey(start), nowKey) : 0;
-        const left = Math.max(0, REFERRAL_MONTHS - used);
+        const paid = paidMonths(s, now);
+        const left = Math.max(0, REFERRAL_MONTHS - paid.length);
+        // Earning now = paying now, and the latest paid month is one of the first 12.
+        const earning = paidRecently(s, now) && paid.slice(0, REFERRAL_MONTHS).includes(paid[paid.length - 1]);
         if (!start || start > now) {
             rows.push({ name, status: 'waiting', line: `Starts ${shortDay(start || now)}`, rewardCents: null });
-        } else if (left > 0) {
+        } else if (earning) {
             rows.push({ name, status: 'active', since: start, monthsLeft: left, line: `Active since ${shortDay(start)} · ${left} month${left === 1 ? '' : 's'} left`, rewardCents: REFERRAL_CENTS });
             earningCents += REFERRAL_CENTS;
-        } else {
+        } else if (paid.length >= REFERRAL_MONTHS) {
             rows.push({ name, status: 'ended', since: start, line: `Active since ${shortDay(start)} · year complete`, rewardCents: null });
+        } else {
+            rows.push({ name, status: 'paused', since: start, monthsLeft: left, line: `Not paying right now · ${left} paid month${left === 1 ? '' : 's'} left`, rewardCents: null });
         }
     }
     const waiting = await UnlockMember.find({ referredBy: userId, status: { $in: ['waiting', 'scheduled', 'starting'] } }).lean();
@@ -561,11 +588,8 @@ async function referralPayouts(month, now = new Date()) {
     const subs = await Subscription.find({ referredBy: { $exists: true, $ne: null }, activatedAt: { $exists: true } }).lean();
     const owed = new Map();
     for (const s of subs) {
-        const start = firstPaidAt(s);
-        if (!start) continue;
-        const months = earningMonths(s, now);
-        if (!months.includes(month)) continue;
-        if (monthsBetween(monthKey(start), month) >= REFERRAL_MONTHS) continue;
+        // Only a month the friend actually paid in, and only their first 12.
+        if (!paidMonths(s, now).slice(0, REFERRAL_MONTHS).includes(month)) continue;
         const key = String(s.referredBy);
         const row = owed.get(key) || { activeReferrals: 0, owedCents: 0 };
         row.activeReferrals += 1;
@@ -603,6 +627,8 @@ module.exports = {
     shortDay,
     firstPaidAt,
     earningMonths,
+    paidMonths,
+    paidRecently,
     bonusMonth,
     commissionOf,
     earnings,
