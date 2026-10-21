@@ -26,8 +26,9 @@ function formatPhone(ten) {
 
 /**
  * The promo a phone number stands for, or null. A rep's number wins over a
- * customer's. A customer's number is a code only once they have told us
- * where to send the money (Refer a friend, step 1).
+ * customer's. Every customer's number is a code from the day they sign up;
+ * what they earn is owed until they tell us where to send it (Refer a
+ * friend, step 1).
  */
 async function findPhonePromo(code) {
     const ten = phoneCode(code);
@@ -37,7 +38,7 @@ async function findPhonePromo(code) {
     const base = { code: ten, appliesTo: null, firstTimeOnly: false, active: true, source: 'phone', headline: 'Code applied', detail: null };
     const rep = await Rep.findOne({ phone: ten, active: { $ne: false } }).select('_id name').lean();
     if (rep) return { ...base, kind: 'rep', rep: rep._id };
-    const user = await User.findOne({ phone: { $in: phoneVariants(ten) }, 'referral.method': { $exists: true } })
+    const user = await User.findOne({ phone: { $in: phoneVariants(ten) }, isDeleted: { $ne: true } })
         .select('_id')
         .lean();
     if (user) return { ...base, kind: 'referral', referrer: user._id };

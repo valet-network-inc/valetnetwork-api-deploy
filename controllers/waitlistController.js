@@ -34,11 +34,9 @@ function webBase() {
 }
 
 function shareFor(member, user) {
-    // The sharer's number is a code (and pays them) only once they have told
-    // us where to send the money (Refer a friend). Before that the link
-    // carries no code: one that isn't valid would greet the friend as an
-    // error at checkout.
-    const code = user && user.referral && user.referral.method ? phoneCode(user.phone) : null;
+    // The sharer's number is their code from the day they sign up, so the
+    // link always carries it.
+    const code = user ? phoneCode(user.phone) : null;
     const url = `${webBase()}/join/share?${code ? `ref=${code}&` : ''}n=${encodeURIComponent(member.neighborhoodName)}`;
     return {
         url,
@@ -248,10 +246,11 @@ function referralPayload(user, summary) {
     const r = user.referral && user.referral.method ? user.referral : null;
     return {
         payout: r ? { method: r.method, label: METHODS[r.method], handle: shownHandle(r) } : null,
-        code: r && ten ? formatPhone(ten) : null,
-        codeDigits: r && ten ? ten : null,
+        // The code works before a payout is set; what it earns waits for one.
+        code: ten ? formatPhone(ten) : null,
+        codeDigits: ten || null,
         shareText:
-            r && ten
+            ten
                 ? `Use my code ${formatPhone(ten)} when you subscribe for a Permanent Valet pass to get $50 off your first month: ${webBase()}/park?code=${ten}`
                 : null,
         rewardCents: ledger.REFERRAL_CENTS,
@@ -259,7 +258,7 @@ function referralPayload(user, summary) {
         // The app's names for the same things.
         // The app shares from an iPhone, so its message points at the App Store;
         // the web keeps its /park?code= link (shareText above).
-        shareMessage: r && ten ? `Use my code ${formatPhone(ten)} when you subscribe for a Permanent Valet pass to get $50 off your first month ${APP_STORE_URL}` : null,
+        shareMessage: ten ? `Use my code ${formatPhone(ten)} when you subscribe for a Permanent Valet pass to get $50 off your first month ${APP_STORE_URL}` : null,
         earnCents: summary.earningCents,
         referrals: (summary.referrals || []).map((x) => ({ ...x, detail: x.line, amountCents: x.rewardCents })),
     };
