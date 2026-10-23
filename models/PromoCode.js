@@ -17,7 +17,7 @@ const mongoose = require('mongoose');
 const PromoCodeSchema = new mongoose.Schema(
     {
         // Normalized exactly like subscriptionPromos.normalizeCode: uppercase,
-        // spaces and dashes removed.
+        // anything but letters and digits removed.
         code: { type: String, required: true, unique: true },
         kind: {
             type: String,

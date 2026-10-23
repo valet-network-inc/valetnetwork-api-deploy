@@ -119,9 +119,10 @@ function trialLabel(promoOrCode) {
 // Codes are typed by hand on a phone. Inner spaces and dashes are the
 // customer's, not the code's — "hands free 2" and "HANDSFREE-2" are both
 // HANDSFREE2, and a code that turns those away only generates a support text.
+// Punctuation goes the same way, so FREEWEEK! is FREEWEEK.
 function normalizeCode(code) {
     return String(code || '')
-        .replace(/[\s-]+/g, '')
+        .replace(/[^A-Za-z0-9]+/g, '')
         .toUpperCase();
 }
 

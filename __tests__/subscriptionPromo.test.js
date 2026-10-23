@@ -310,6 +310,7 @@ describe('HANDSFREE2', () => {
         // What people actually type when they hear it out loud.
         expect(promos.findStaticPromo('hands free 2').code).toBe('HANDSFREE2');
         expect(promos.findStaticPromo('HANDSFREE-2').code).toBe('HANDSFREE2');
+        expect(promos.normalizeCode('FreeWeek!')).toBe('FREEWEEK');
     });
 
     it('does not swallow the one-move code, and the one-move code does not swallow it', () => {
