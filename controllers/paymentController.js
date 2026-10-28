@@ -8,6 +8,7 @@ const stripe = process.env.STRIPE_API_KEY ? stripeModule(process.env.STRIPE_API_
 const User = require('../models/User');
 const axios = require('axios');
 const admin = require('firebase-admin');
+const giftBalance = require('../services/giftBalance');
 const {
     applyStripeSubscriptionEvent,
     applyTrialCardCheckPaid,
@@ -154,7 +155,8 @@ exports.createPaymentIntent = async (req, res) => {
 
         // Fetch amount from order's totalAmount
         // const amount = 50;
-        const amount = order.totalAmount || 0;
+        // Gift card money comes off first; the card pays what is left.
+        const amount = await giftBalance.cardCentsAfterGift(order);
 
         console.log('Creating payment intent for order:', orderId, 'Amount:', amount);
 

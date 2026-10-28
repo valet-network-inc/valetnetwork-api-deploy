@@ -5,6 +5,7 @@ const curbCustody = require('../services/curbCustody');
 const User = require('../models/User');
 const Event = require('../models/Event');
 const subscriptionService = require('../services/subscriptionService');
+const giftBalance = require('../services/giftBalance');
 const orderPricing = require('../services/orderPricing');
 const axios = require('axios');
 const stripeModule = require('stripe');
@@ -967,7 +968,18 @@ exports.createOrder = async (req, res) => {
         console.log('Order data to save:', orderData);
         
         const order = new Order(orderData);
-        await order.save();
+        // A move the customer's gift card balance covers is paid for from it
+        // here, with no card payment. The app and the site skip the card
+        // screen for any order that comes back paid.
+        if (paymentStatus === 'pending' && !awayMode && !paymentIntentId && finalAmount > 0) {
+            await giftBalance.payInFull(order);
+        }
+        try {
+            await order.save();
+        } catch (saveErr) {
+            if (order.giftPaidCents) await giftBalance.refundUnsaved(order);
+            throw saveErr;
+        }
         
         console.log('Order saved successfully:', order._id);
 
@@ -3894,6 +3906,9 @@ exports.cancelOrder = async (req, res) => {
 
         await curbCustody.closeSafely({ orderId: order._id, reason: 'cancelled' });
 
+        // Gift card money spent on it goes back to their gift balance.
+        await giftBalance.giveBack(order, undefined, 'cancel');
+
         // If this is a linked retrieval order (parking → retrieval pair), put
         // the parking order back exactly where it was so the customer can ask
         // again. Same helper the auto-cancel cron uses for stale retrievals.
@@ -4138,6 +4153,7 @@ exports.autoCancelStaleOrders = async (io) => {
                 order.status = 'cancelled';
                 await order.save();
                 cancelledCount++;
+                await giftBalance.giveBack(order, undefined, 'auto-cancel');
 
                 // If a retrieval order auto-cancels, recover the linked parking
                 // order so the customer / front desk can ask again. We marked
@@ -4623,8 +4639,12 @@ exports.cancelRetrievalLeg = async (req, res) => {
         }
 
         let refundInfo = { amountCents: 0, status: 'not_applicable' };
+        // Card first: the card gets back up to what it paid, and the rest of
+        // the return trip goes back to the gift balance that paid for it.
+        const cardRefundCents = Math.min(refundCents, Math.max(0, total - (order.giftPaidCents || 0)));
+        const giftBackCents = refundCents - cardRefundCents;
         const chargeable =
-            refundCents > 0 &&
+            cardRefundCents > 0 &&
             !order.isFreeService &&
             order.paymentStatus === 'paid' &&
             !!order.paymentIntentId &&
@@ -4634,7 +4654,7 @@ exports.cancelRetrievalLeg = async (req, res) => {
             try {
                 const refund = await stripe.refunds.create({
                     payment_intent: order.paymentIntentId,
-                    amount: refundCents,
+                    amount: cardRefundCents,
                     reason: 'requested_by_customer',
                     metadata: { orderId: String(order._id), leg: 'retrieval' },
                 });
@@ -4658,6 +4678,17 @@ exports.cancelRetrievalLeg = async (req, res) => {
                     success: false,
                     message: "We couldn't refund the return trip, so nothing was changed. Try again in a moment.",
                 });
+            }
+        }
+        if (giftBackCents > 0) {
+            const back = await giftBalance.giveBack(order, giftBackCents, 'retrieval-leg');
+            if (back > 0) {
+                refundInfo = {
+                    ...refundInfo,
+                    amountCents: (refundInfo.amountCents || 0) + back,
+                    giftCents: back,
+                    status: refundInfo.status === 'not_applicable' ? 'succeeded' : refundInfo.status,
+                };
             }
         }
 

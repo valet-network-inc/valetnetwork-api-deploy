@@ -230,6 +230,19 @@ const OrderSchema = new mongoose.Schema({
     awayPaidCents: {
         type: Number,
     },
+    // Gift card money spent on this order (services/giftBalance.js): the
+    // part of totalAmount that came off the customer's gift balance instead
+    // of their card, the Stripe customer it came from, and how much of it a
+    // cancel has given back so far.
+    giftPaidCents: {
+        type: Number,
+    },
+    giftCustomerId: {
+        type: String,
+    },
+    giftReturnedCents: {
+        type: Number,
+    },
     // Every charge taken for an away order, oldest first: the $1 deposit,
     // then whatever the valet's schedule added. Refunds walk this ledger —
     // paymentIntentId alone only points at the deposit, so refunding it
