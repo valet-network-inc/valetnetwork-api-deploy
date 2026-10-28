@@ -15,7 +15,7 @@ const normalize = (raw) =>
         .replace(/[^A-Z0-9]/g, '')
         .slice(0, 32);
 const newCode = () => Array.from({ length: 12 }, () => ALPHABET[crypto.randomInt(ALPHABET.length)]).join('');
-const linkFor = (code) => `https://valetnetwork.co/park/gift?code=${code}`;
+const linkFor = (code) => `https://valetnetwork.co/park?gift=${code}`;
 
 // GET /api/gift/:code — what the redeem page shows before anyone signs in.
 exports.getGift = async (req, res) => {
