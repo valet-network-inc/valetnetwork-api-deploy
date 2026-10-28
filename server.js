@@ -203,6 +203,7 @@ app.use('/api/admin', require('./routes/admin'));
 app.use('/api/rep', require('./routes/rep'));
 app.use('/api/waitlist', require('./routes/waitlist'));
 app.use('/api/referral', require('./routes/referral'));
+app.use('/api/gift', require('./routes/gift'));
 app.use('/api/schedule', require('./routes/schedule'));
 app.use('/api/valet', require('./routes/valet'));
 app.use('/api/webhooks', require('./routes/webhook'));

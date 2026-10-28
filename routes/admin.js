@@ -24,6 +24,7 @@ const aspSuspensionAdmin = require('../controllers/aspSuspensionAdminController'
 const managedCarAdmin = require('../controllers/managedCarAdminController');
 const adminSubscription = require('../controllers/adminSubscriptionController');
 const adminPromo = require('../controllers/adminPromoController');
+const giftCards = require('../controllers/giftCardController');
 const adminSales = require('../controllers/adminSalesController');
 const requireAdminKey = require('../middleware/requireAdminKey');
 
@@ -119,6 +120,11 @@ router.put('/sales/pricing', adminSales.putPricing);
 router.get('/sales/codes', adminSales.getCodes);
 router.post('/sales/codes', adminSales.postCode);
 router.patch('/sales/codes/:code', adminSales.patchCode);
+
+// --- gift cards: a link that puts money on whoever redeems it ---------
+router.get('/gift-cards', giftCards.adminListGifts);
+router.post('/gift-cards', giftCards.adminCreateGift);
+router.patch('/gift-cards/:code', giftCards.adminUpdateGift);
 
 // Where paying customers stop — built from server-side stamps only.
 router.get('/checkout-funnel', getCheckoutFunnel);
