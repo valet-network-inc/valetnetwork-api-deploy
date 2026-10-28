@@ -243,6 +243,16 @@ const OrderSchema = new mongoose.Schema({
     giftReturnedCents: {
         type: Number,
     },
+    // One entry per spend, by tag ('order', an away reconciliation, an
+    // extension), so a retry never takes gift money twice.
+    giftSpends: [
+        {
+            _id: false,
+            tag: { type: String },
+            cents: { type: Number },
+            at: { type: Date },
+        },
+    ],
     // Every charge taken for an away order, oldest first: the $1 deposit,
     // then whatever the valet's schedule added. Refunds walk this ledger —
     // paymentIntentId alone only points at the deposit, so refunding it

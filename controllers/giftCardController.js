@@ -3,6 +3,7 @@ const GiftCard = require('../models/GiftCard');
 const User = require('../models/User');
 const stripeClient = require('../services/stripeClient');
 const { ensureStripeCustomer } = require('./subscriptionController');
+const giftBalance = require('../services/giftBalance');
 
 const stripe = () => stripeClient.get();
 
@@ -33,6 +34,17 @@ exports.getGift = async (req, res) => {
     } catch (err) {
         console.error('getGift error:', err);
         res.status(500).json({ success: false, message: 'Could not load the gift card.' });
+    }
+};
+
+// GET /api/gift/balance?userId= — behind requireSelf: what they have left to spend.
+exports.getBalance = async (req, res) => {
+    try {
+        const gift = await giftBalance.giftFor(req.callerUserId);
+        res.json({ success: true, cents: gift.cents });
+    } catch (err) {
+        console.error('getBalance error:', err);
+        res.status(500).json({ success: false, message: 'Could not load your gift balance.' });
     }
 };
 

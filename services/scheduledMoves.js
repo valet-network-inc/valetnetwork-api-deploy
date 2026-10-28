@@ -31,6 +31,7 @@ const Order = require('../models/Order');
 const User = require('../models/User');
 const { nyClock, nyWallTimeToInstant } = require('./nyTime');
 const stripeClient = require('./stripeClient');
+const giftBalance = require('./giftBalance');
 const orderPricing = require('./orderPricing');
 
 const PICKUP_LEAD_MS = 50 * 60 * 1000;
@@ -334,12 +335,23 @@ function clock(at) {
 async function payForOrder(move, order) {
     const cancelOrder = () => Order.updateOne({ _id: order._id, status: 'pending' }, { $set: { status: 'cancelled' } });
     const stripe = stripeClient.get();
+    const total = Math.round(order.totalAmount || 0);
+    // Gift card money pays first: a pick-up it covers needs no card at all.
+    const giftCents = await giftBalance.takeGift(order, total, 'order', { minCardCents: giftBalance.MIN_CARD_CENTS });
+    const unpaid = async () => {
+        if (giftCents > 0) await giftBalance.giveBack(order, giftCents, 'scheduled-unpaid');
+        await cancelOrder();
+    };
+    if (total > 0 && giftCents >= total) {
+        await Order.updateOne({ _id: order._id }, { $set: { paymentStatus: 'paid', 'checkout.paidAt': new Date() } });
+        return { outcome: 'booked', orderId: order._id, chargedCents: 0, giftCents, card: null };
+    }
     const card = await savedCard(move.user);
     if (!stripe || !card) {
-        await cancelOrder();
+        await unpaid();
         return { outcome: 'no_card', orderId: order._id };
     }
-    const amount = Math.round(order.totalAmount || 0);
+    const amount = total - giftCents;
     let pi;
     try {
         pi = await stripe.paymentIntents.create(
@@ -356,11 +368,11 @@ async function payForOrder(move, order) {
             { idempotencyKey: `scheduled-pickup-${order._id}` }
         );
     } catch (err) {
-        await cancelOrder();
+        await unpaid();
         return { outcome: 'payment_failed', orderId: order._id, error: err.message };
     }
     if (pi.status !== 'succeeded') {
-        await cancelOrder();
+        await unpaid();
         return { outcome: 'payment_failed', orderId: order._id, error: `Payment ${pi.status}` };
     }
     const paidAt = new Date();
@@ -382,7 +394,7 @@ async function payForOrder(move, order) {
     } catch (err) {
         console.error('scheduledMoves: payment record failed for', String(order._id), err.message);
     }
-    return { outcome: 'booked', orderId: order._id, chargedCents: amount, card };
+    return { outcome: 'booked', orderId: order._id, chargedCents: amount, giftCents, card };
 }
 
 /** Make the order for one occurrence. Returns { outcome, orderId?, retry? }. */
@@ -492,6 +504,13 @@ async function tick({ now = new Date(), http = axios } = {}) {
                 `A valet collects your car at ${clock(claimed.nextAt)}. ${dollars(r.chargedCents)} was charged to your ${brandName(r.card && r.card.brand)} ending ${r.card && r.card.last4}.`,
                 { type: 'SCHEDULED_MOVE_BOOKED' }
             );
+        } else if (r.outcome === 'booked' && r.giftCents) {
+            await push(
+                claimed.user,
+                `Your ${label} is booked`,
+                `A valet collects your car at ${clock(claimed.nextAt)}. Your gift card paid for it.`,
+                { type: 'SCHEDULED_MOVE_BOOKED' }
+            );
         } else if (r.outcome === 'no_car') {
             await push(claimed.user, 'Nothing to bring back', `Your car isn’t parked with us, so there was nothing to bring back at ${clock(claimed.nextAt)}.`, { type: 'SCHEDULED_MOVE_SKIPPED' });
         } else if (r.outcome !== 'booked') {
@@ -515,4 +534,4 @@ async function tick({ now = new Date(), http = axios } = {}) {
     return results;
 }
 
-module.exports = { occurrenceAfter, timeOf, create, update, cancel, mine, tick, view, quote, cardSetup, savedCard, pickUpCents, PICKUP_LEAD_MS, DROPOFF_LEAD_MS };
+module.exports = { payForOrder, occurrenceAfter, timeOf, create, update, cancel, mine, tick, view, quote, cardSetup, savedCard, pickUpCents, PICKUP_LEAD_MS, DROPOFF_LEAD_MS };

@@ -40,6 +40,7 @@ const stripe = process.env.STRIPE_API_KEY
 
 const Order = require('../models/Order');
 const User = require('../models/User');
+const giftBalance = require('../services/giftBalance');
 const { sendPushNotification } = require('./notificationController');
 
 const ACTIVE_STATUSES = ['accepted', 'in-progress', 'in_progress', 'parked'];
@@ -222,6 +223,43 @@ exports.createExtensionIntent = async (req, res) => {
         }
 
         const amountCents = calcExtensionCents(hours);
+        // Gift card money pays first. An extension it covers in full is
+        // applied now with nothing to pay, the same as a plan-covered one; one
+        // it covers in part leaves the rest for the card, and the gift part is
+        // taken once that payment is confirmed.
+        const gift = await giftBalance.giftFor(order.customer._id);
+        if (gift.cents >= amountCents) {
+            const before = order.duration || 0;
+            const extended = await Order.findOneAndUpdate(
+                { _id: order._id, duration: order.duration },
+                { $set: { duration: before + hours * 60 } },
+                { new: true }
+            );
+            if (extended) {
+                const tag = `ext-${before}-${hours}`;
+                const taken = await giftBalance.takeGift(extended, amountCents, tag);
+                if (taken === amountCents) {
+                    order.duration = extended.duration;
+                    await pushValetExtension(order, hours);
+                    return res.json({
+                        success: true,
+                        covered: true,
+                        charged: false,
+                        applied: true,
+                        amountCents: 0,
+                        giftCents: taken,
+                        additionalHours: hours,
+                        newDurationMinutes: extended.duration,
+                        message: 'Your gift card paid for this. Nothing to pay.',
+                    });
+                }
+                // The balance moved under us: undo it, and the card pays.
+                if (taken > 0) await giftBalance.giveBack(extended, taken, `${tag}-undo`);
+                await Order.updateOne({ _id: order._id, duration: extended.duration }, { $set: { duration: before } });
+            }
+        }
+        const giftCents = Math.max(0, Math.min(gift.cents, amountCents - giftBalance.MIN_CARD_CENTS));
+        const cardCents = amountCents - giftCents;
 
         const ephemeralKey = await stripe.ephemeralKeys.create(
             { customer: stripeCustomerId },
@@ -229,7 +267,7 @@ exports.createExtensionIntent = async (req, res) => {
         );
 
         const paymentIntent = await stripe.paymentIntents.create({
-            amount: amountCents,
+            amount: cardCents,
             currency: 'usd',
             automatic_payment_methods: { enabled: true },
             customer: stripeCustomerId,
@@ -239,6 +277,7 @@ exports.createExtensionIntent = async (req, res) => {
                 customerId: order.customer._id.toString(),
                 purpose: 'extension',
                 additionalHours: String(hours),
+                giftCents: String(giftCents),
                 requestedBy: requestedBy ? String(requestedBy) : '',
             },
         });
@@ -249,7 +288,8 @@ exports.createExtensionIntent = async (req, res) => {
             clientSecret: paymentIntent.client_secret,
             customerId: stripeCustomerId,
             customerEphemeralKeySecret: ephemeralKey.secret,
-            amountCents,
+            amountCents: cardCents,
+            giftCents,
             additionalHours: hours,
         });
     } catch (err) {
@@ -358,6 +398,10 @@ exports.confirmExtension = async (req, res) => {
         );
         const amountCents = intent.amount_received || intent.amount || 0;
 
+        // The gift card part of a partly covered extension is taken now that
+        // the card part has gone through.
+        const giftCents = Number(intent.metadata.giftCents) || 0;
+        if (giftCents > 0) await giftBalance.takeGift(order, giftCents, `ext-${intent.id}`);
         order.duration = (order.duration || 0) + additionalHours * 60;
         order.extensions.push({
             additionalHours,

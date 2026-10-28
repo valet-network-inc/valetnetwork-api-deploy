@@ -71,6 +71,7 @@ jest.mock('firebase-admin', () => ({
 const Order = require('../models/Order');
 const User = require('../models/User');
 const GiftCard = require('../models/GiftCard');
+const Payment = require('../models/Payment');
 const orderController = require('../controllers/orderController');
 const paymentController = require('../controllers/paymentController');
 
@@ -90,7 +91,7 @@ afterAll(async () => {
 });
 
 afterEach(async () => {
-    await Promise.all([Order.deleteMany({}), User.deleteMany({}), GiftCard.deleteMany({})]);
+    await Promise.all([Order.deleteMany({}), User.deleteMany({}), GiftCard.deleteMany({}), Payment.deleteMany({})]);
     mockStripe.balances = {};
     mockStripe.keys = {};
     mockStripe.retrieves.length = 0;
@@ -242,5 +243,66 @@ describe('gift card money pays for one-off moves', () => {
         expect(res.statusCode).toBe(200);
         expect(mockStripe.refunds).toHaveLength(0);
         expect(balance(user)).toBe(-10000 + 1300 - 300);
+    });
+});
+
+const orderDoc = (user, fields) =>
+    Order.create({
+        customer: user._id,
+        customerLocation: { lat: 40.679, lng: -73.995, streetAddress: '123 Court St, Brooklyn' },
+        pickUpTime: new Date(Date.now() + 24 * 60 * 60 * 1000),
+        duration: 120,
+        paymentMethod: 'card',
+        status: 'pending',
+        orderType: 'parking',
+        serviceType: 'standard',
+        ...fields,
+    });
+
+describe('every other charge spends gift money first', () => {
+    it('a scheduled pick-up the balance covers is booked with no card on file', async () => {
+        const user = await makeCustomer({ giftCents: 10000 });
+        const order = await orderDoc(user, { totalAmount: 1500, paymentStatus: 'pending' });
+        const scheduledMoves = require('../services/scheduledMoves');
+        const r = await scheduledMoves.payForOrder({ _id: new mongoose.Types.ObjectId(), user: user._id }, order);
+        expect(r).toMatchObject({ outcome: 'booked', chargedCents: 0, giftCents: 1500 });
+        expect((await Order.findById(order._id)).paymentStatus).toBe('paid');
+        expect(balance(user)).toBe(-8500);
+        expect(mockStripe.intents).toHaveLength(0);
+    });
+
+    it('an extension the balance covers is added with nothing to pay', async () => {
+        const user = await makeCustomer({ giftCents: 10000 });
+        const booked = await book(user);
+        const orderId = String(booked.body.order._id);
+        await Order.updateOne({ _id: orderId }, { $set: { status: 'parked' } });
+        const extensionController = require('../controllers/extensionController');
+        const res = mockRes();
+        await extensionController.createExtensionIntent({ params: { orderId }, body: { additionalHours: 2 } }, res);
+        expect(res.body).toMatchObject({ success: true, covered: true, applied: true, amountCents: 0, giftCents: 600 });
+        expect((await Order.findById(orderId)).duration).toBe(240);
+        expect(balance(user)).toBe(-10000 + 1000 + 600);
+        expect(mockStripe.intents).toHaveLength(0);
+    });
+
+    it('cancelling a gift-paid away booking gives all of it back', async () => {
+        const user = await makeCustomer({ giftCents: 10000 });
+        const order = await orderDoc(user, {
+            totalAmount: 4000,
+            paymentStatus: 'paid',
+            awayMode: true,
+            awayService: 'hold',
+            awayPaidCents: 4000,
+            giftSpends: [{ tag: 'order', cents: 4000, at: new Date() }],
+            giftPaidCents: 4000,
+            giftCustomerId: user.stripeCustomerId,
+        });
+        mockStripe.balances[user.stripeCustomerId] = -6000;
+        const res = mockRes();
+        await orderController.cancelOrder({ body: { orderId: String(order._id), userId: String(user._id) }, io: mockIo() }, res);
+        expect(res.statusCode).toBe(200);
+        expect(mockStripe.refunds).toHaveLength(0);
+        expect(balance(user)).toBe(-10000);
+        expect((await Order.findById(order._id)).giftReturnedCents).toBe(4000);
     });
 });

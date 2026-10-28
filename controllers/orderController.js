@@ -971,7 +971,7 @@ exports.createOrder = async (req, res) => {
         // A move the customer's gift card balance covers is paid for from it
         // here, with no card payment. The app and the site skip the card
         // screen for any order that comes back paid.
-        if (paymentStatus === 'pending' && !awayMode && !paymentIntentId && finalAmount > 0) {
+        if (paymentStatus === 'pending' && !awayBillLater && !paymentIntentId && finalAmount > 0) {
             await giftBalance.payInFull(order);
         }
         try {
@@ -3523,10 +3523,12 @@ const awayChargeLedger = (order) => {
         refundedCents: c.refundedCents || 0,
         at: c.at,
     }));
-    if (!ledger.length && order.paymentIntentId && (order.awayPaidCents || 0) > 0) {
+    // A booking gift card money paid part of only put the rest on the card.
+    const bookingGift = ((order.giftSpends || []).find((g) => g.tag === 'order') || {}).cents || 0;
+    if (!ledger.length && order.paymentIntentId && (order.awayPaidCents || 0) - bookingGift > 0) {
         ledger.push({
             paymentIntentId: order.paymentIntentId,
-            amountCents: order.awayPaidCents,
+            amountCents: order.awayPaidCents - bookingGift,
             refundedCents: 0,
             at: order.createdAt,
         });
@@ -3557,6 +3559,12 @@ const refundAwayCharges = async (order, cents) => {
                 err.message
             );
         }
+    }
+    // What the cards can't take back goes to the gift balance that paid it.
+    if (remaining > 0) {
+        const back = await giftBalance.giveBack(order, remaining, `away-${order.giftReturnedCents || 0}`);
+        remaining -= back;
+        refunded += back;
     }
     return { refundedCents: refunded, shortfallCents: cents - refunded, ledger };
 };
@@ -3655,46 +3663,55 @@ exports.setAwaySchedule = async (req, res) => {
             if (delta === 0) {
                 order.awayBilling = { status: 'settled', lastDeltaCents: 0, at: new Date() };
             } else if (delta > 0) {
-                // Charge the difference to the customer's saved card.
+                // Gift card money first; the saved card pays the rest.
+                const giftTag = `away-${(order.giftSpends || []).length}-${paidCents}-${priceCents}`;
+                let giftCents = 0;
                 try {
                     if (!stripe) throw new Error('Stripe not configured');
-                    const customer = await User.findById(order.customer).select('stripeCustomerId');
-                    if (!customer?.stripeCustomerId) throw new Error('No saved payment method on file');
-                    const pms = await stripe.paymentMethods.list({
-                        customer: customer.stripeCustomerId,
-                        type: 'card',
-                        limit: 1,
+                    giftCents = await giftBalance.takeGift(order, delta, giftTag, {
+                        minCardCents: giftBalance.MIN_CARD_CENTS,
                     });
-                    if (!pms.data.length) throw new Error('No saved card on file');
-                    const pi = await stripe.paymentIntents.create({
-                        amount: delta,
-                        currency: 'usd',
-                        customer: customer.stripeCustomerId,
-                        payment_method: pms.data[0].id,
-                        off_session: true,
-                        confirm: true,
-                        description: `Away-mode street-cleaning moves (order ${order._id})`,
-                        metadata: {
-                            type: 'away_moves',
-                            orderId: order._id.toString(),
-                            customerId: String(order.customer),
-                        },
-                    });
+                    const cardCents = delta - giftCents;
                     // Ledger the balance charge alongside the deposit (seeded
                     // here on first reconciliation) so refunds can reach both.
                     const ledger = awayChargeLedger(order);
-                    ledger.push({
-                        paymentIntentId: pi.id,
-                        amountCents: delta,
-                        refundedCents: 0,
-                        at: new Date(),
-                    });
+                    if (cardCents > 0) {
+                        const customer = await User.findById(order.customer).select('stripeCustomerId');
+                        if (!customer?.stripeCustomerId) throw new Error('No saved payment method on file');
+                        const pms = await stripe.paymentMethods.list({
+                            customer: customer.stripeCustomerId,
+                            type: 'card',
+                            limit: 1,
+                        });
+                        if (!pms.data.length) throw new Error('No saved card on file');
+                        const pi = await stripe.paymentIntents.create({
+                            amount: cardCents,
+                            currency: 'usd',
+                            customer: customer.stripeCustomerId,
+                            payment_method: pms.data[0].id,
+                            off_session: true,
+                            confirm: true,
+                            description: `Away-mode street-cleaning moves (order ${order._id})`,
+                            metadata: {
+                                type: 'away_moves',
+                                orderId: order._id.toString(),
+                                customerId: String(order.customer),
+                            },
+                        });
+                        ledger.push({
+                            paymentIntentId: pi.id,
+                            amountCents: cardCents,
+                            refundedCents: 0,
+                            at: new Date(),
+                        });
+                        order.paymentIntentId = order.paymentIntentId || pi.id;
+                    }
                     order.awayCharges = ledger;
-                    order.paymentIntentId = order.paymentIntentId || pi.id;
                     order.awayPaidCents = priceCents;
                     order.totalAmount = priceCents;
                     order.awayBilling = { status: 'settled', lastDeltaCents: delta, at: new Date() };
                 } catch (chargeErr) {
+                    if (giftCents > 0) await giftBalance.giveBack(order, giftCents, `${giftTag}-undo`);
                     console.error('Away schedule charge failed:', chargeErr.message);
                     order.awayBilling = {
                         status: 'charge_failed',
