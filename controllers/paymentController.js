@@ -257,6 +257,9 @@ exports.createPaymentIntent = async (req, res) => {
             // New fields — the mobile app's PaymentSheet uses these to show saved cards.
             customerId: stripeCustomerId,
             customerEphemeralKeySecret: ephemeralKey.secret,
+            // What the card pays, and the gift card part taken off first.
+            amountCents: Math.round(amount),
+            giftCents: Math.max(0, Math.round(order.totalAmount || 0) - Math.round(amount)),
         });
     } catch (err) {
         console.error('STRIPE ERROR DETAILS:', {
