@@ -127,3 +127,16 @@ test("a doorman's guest car stays off the doorman's account", async () => {
     const after = await User.findById(doorman._id).lean();
     expect(after.vehicle && after.vehicle.licensePlate).toBeFalsy();
 });
+
+test('a note typed into the car fields never becomes the customer\'s car', async () => {
+    const customer = await makeUser();
+    const valet = await makeUser({ isValet: true });
+    const order = await makeOrder(customer._id, valet._id);
+
+    await request(app)
+        .post('/api/order/addVehicleInfo')
+        .send({ orderId: String(order._id), vehicle: { color: 'Can\u2019t find vehicle/phone won\u2019t dial', model: 'x', licensePlate: 'X' } });
+
+    const after = await User.findById(customer._id).lean();
+    expect(after.vehicle && after.vehicle.licensePlate).toBeFalsy();
+});

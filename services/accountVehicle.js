@@ -28,6 +28,20 @@ const normalizeVehicle = (input) => {
 const isComplete = (v) => !!(v && v.color && v.model && v.licensePlate);
 
 /**
+ * Valets sometimes type a note into the car fields ("Can't find
+ * vehicle/phone won't dial", "x", "Dsfdsf"). A car copied from an order has
+ * to look like one: a plate of 5+ letters and digits with at least one of
+ * each, and a model of 2+ characters. Only applied to copies from orders;
+ * what the customer types for their own car is theirs.
+ */
+const looksLikeACar = (v) => {
+    if (!isComplete(v)) return false;
+    const plate = v.licensePlate.replace(/[^A-Z0-9]/g, '');
+    return plate.length >= 5 && /[A-Z]/.test(plate) && /[0-9]/.test(plate)
+        && v.model.replace(/[^A-Za-z0-9]/g, '').length >= 2;
+};
+
+/**
  * Whether a car on this order belongs on the customer's own account. A
  * doorman or hotel books for their guests, so the car on those orders is the
  * guest's, not the account holder's; valets also book for customers on their
@@ -49,7 +63,7 @@ const orderCarBelongsToCustomer = (order, customer) => {
 const copyOrderCarToAccount = async (order, vehicle) => {
     try {
         const v = normalizeVehicle(vehicle);
-        if (!isComplete(v) || !order || !order.customer) return null;
+        if (!looksLikeACar(v) || !order || !order.customer) return null;
         const customer = await User.findById(order.customer)
             .select('isDoorman isValet enterpriseCode')
             .lean();
@@ -68,4 +82,4 @@ const copyOrderCarToAccount = async (order, vehicle) => {
     }
 };
 
-module.exports = { normalizeVehicle, isComplete, orderCarBelongsToCustomer, copyOrderCarToAccount };
+module.exports = { normalizeVehicle, isComplete, looksLikeACar, orderCarBelongsToCustomer, copyOrderCarToAccount };
