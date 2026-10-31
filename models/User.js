@@ -351,6 +351,18 @@ const UserSchema = new mongoose.Schema({
     pendingPromoCode: { type: String, trim: true, uppercase: true },
     pendingPromoSetAt: { type: Date },
 
+    // The customer's car, as they last typed it or a valet last logged it.
+    // Whoever entered it last wins; `source`/`by`/`at` say who and when. See
+    // services/accountVehicle.js for why this exists.
+    vehicle: {
+        color: { type: String, trim: true },
+        model: { type: String, trim: true },
+        licensePlate: { type: String, trim: true, uppercase: true },
+        source: { type: String, enum: ['customer', 'valet', 'operator'] },
+        by: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+        at: { type: Date },
+    },
+
     // --- The handoff link the customer gives their doorman ----------------
     //
     // The ritual assumes whoever is holding the keys is also holding a phone

@@ -84,6 +84,9 @@ const OrderPhotoSchema = new mongoose.Schema({
 
     // Whether the chat message + push notification fired successfully
     chatMessageId: { type: String },                    // ID of the chat message that delivered this photo
+    // Random token behind the chat link /api/photo/:token, which mints a
+    // fresh signed URL on every open (the URL itself expires).
+    shareToken: { type: String, index: { unique: true, sparse: true } },
     notifiedCustomerAt: { type: Date },
     notificationError: { type: String },                // populated only if the customer-notify step fails
 

@@ -2,6 +2,7 @@ const dotenv = require('dotenv');
 dotenv.config({ path: `.env.${process.env.NODE_ENV}` });
 const Order = require('../models/Order');
 const curbCustody = require('../services/curbCustody');
+const { copyOrderCarToAccount } = require('../services/accountVehicle');
 const User = require('../models/User');
 const Event = require('../models/Event');
 const subscriptionService = require('../services/subscriptionService');
@@ -2463,6 +2464,10 @@ exports.addVehicleInfo = async (req, res) => {
             ...order.toObject(),
             type: 'VEHICLE_ADDED',
         });
+
+        // What the valet typed is the customer's car: keep it on their
+        // account, so the app's Your car screen shows it.
+        await copyOrderCarToAccount(order, vehicle);
 
         res.status(200).json({
             success: true,

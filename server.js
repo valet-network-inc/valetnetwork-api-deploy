@@ -180,6 +180,7 @@ app.get('/health', (req, res) => {
 // Routes
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/order', require('./routes/order'));
+app.use('/api/photo', require('./routes/photoLink'));
 app.use('/api/share', require('./routes/share'));
 app.use('/api/pricing', require('./routes/pricing'));
 app.use('/api/chauffeur', require('./routes/chauffeur'));

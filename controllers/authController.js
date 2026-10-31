@@ -2,6 +2,7 @@ const User = require('../models/User');
 const FCMToken = require('../models/FCMToken');
 const { resolveSignupPlatform } = require('../services/signupPlatform');
 const { ensurePushChannelDoc } = require('../services/pushChannel');
+const { normalizeVehicle } = require('../services/accountVehicle');
 
 // Function to generate a random 6-character code (numbers and capital letters)
 const generateReferralCode = () => {
@@ -172,6 +173,7 @@ exports.updateUser = async (req, res) => {
         userAgreementAccepted,
         enterpriseBusinessName,
         enterpriseAddress, // { street, suite, city, state, zip }
+        vehicle, // { color, model, licensePlate } from the Your car screen
     } = req.body;
 
     try {
@@ -191,6 +193,18 @@ exports.updateUser = async (req, res) => {
             ...(enterpriseBusinessName !== undefined && { enterpriseBusinessName }),
             ...(enterpriseAddress !== undefined && { enterpriseAddress }),
         };
+
+        // The car on the account (services/accountVehicle.js). The app's Your
+        // car screen insists on a plate, and sends all three fields blank to
+        // clear the car.
+        if (vehicle !== undefined) {
+            const v = normalizeVehicle(vehicle);
+            if (v && v.licensePlate) {
+                updateData.vehicle = { ...v, source: 'customer', at: new Date() };
+            } else if (v && !v.color && !v.model) {
+                updateData.$unset = { vehicle: 1 };
+            }
+        }
 
         // If user is a doorman and doesn't have a referral code, generate one
         if (isDoorman) {

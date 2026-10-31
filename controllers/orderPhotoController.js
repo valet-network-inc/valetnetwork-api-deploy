@@ -44,6 +44,18 @@ const TYPE_LABELS = {
     post_park: 'Photo after parking',
 };
 
+// The chat link. Until Oct 30 2026 the photo message's text was
+// "Photo after parking — tap to view" with the signed URL only in
+// `photoUrl`/`link`, which neither the app nor /park reads: the app makes
+// links out of URLs in the text, and there was none, so photos never
+// opened. The URL also died after 7 days. The text now carries a link that
+// mints a fresh signed URL on every open, for as long as the photo exists.
+const PUBLIC_BASE = process.env.PUBLIC_BACKEND_URL || 'https://api.valetnetwork.co';
+const LINK_URL_MINUTES = 10;
+const newShareToken = () => crypto.randomBytes(12).toString('base64url');
+const photoLink = (photo) => (photo && photo.shareToken ? `${PUBLIC_BASE}/api/photo/${photo.shareToken}` : null);
+const photoMessageText = (label, link) => (link ? `${label}: ${link}` : `${label} — tap to view`);
+
 /**
  * Post a system-style chat message carrying the signed photo URL into the
  * order's conversation, and fire a push to the customer. Failures here
@@ -52,6 +64,7 @@ const TYPE_LABELS = {
 const announcePhotoToCustomer = async ({ photo, order, viewUrl, valetId }) => {
     const conversationId = order?.conversationId;
     const label = TYPE_LABELS[photo.type] || 'Photo';
+    const link = photoLink(photo);
     const updates = {};
 
     // 1) Chat message in Firestore. Mirror the shape used by the mobile
@@ -66,14 +79,15 @@ const announcePhotoToCustomer = async ({ photo, order, viewUrl, valetId }) => {
                 .doc(conversationId)
                 .collection('messages')
                 .add({
-                    text: `${label} — tap to view`,
+                    text: photoMessageText(label, link),
                     createdAt: admin.firestore.FieldValue.serverTimestamp(),
                     senderId: valetId,
                     messageType: 'photo',
                     photoType: photo.type,
+                    photoId: String(photo._id),
                     photoUrl: viewUrl,
                     containsLink: true,
-                    link: viewUrl,
+                    link: link || viewUrl,
                 });
             updates.chatMessageId = ref.id;
         } catch (err) {
@@ -216,6 +230,7 @@ exports.uploadPhoto = async (req, res) => {
             // none. Guard here too rather than trusting the client.
             capturedAtLocation:
                 photoSource === 'camera' && hasCoords ? { lat, lng } : undefined,
+            shareToken: newShareToken(),
         });
 
         // -- Surface a fresh signed URL the mobile can show immediately
@@ -417,3 +432,36 @@ exports.adminDeletePhoto = async (req, res) => {
         });
     }
 };
+
+const linkPage = (title, body) => `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title></head><body style="margin:0;font-family:-apple-system,system-ui,sans-serif;color:#123524;display:flex;min-height:100vh;align-items:center;justify-content:center;padding:24px;text-align:center"><div><h1 style="font-size:24px;margin:0 0 8px">${title}</h1><p style="color:#545B54;margin:0">${body}</p></div></body></html>`;
+
+/**
+ * GET /api/photo/:token: the link in a photo's chat message. Public on
+ * purpose (it opens in a browser from the chat): the 16-character random
+ * token is the key, the same way the signed URL was before. Each open gets
+ * a fresh 10-minute signed URL, so the link works for as long as the photo
+ * exists (photos are deleted 30 days after capture).
+ */
+exports.viewPhotoByLink = async (req, res) => {
+    const token = String(req.params.token || '');
+    res.set('Cache-Control', 'no-store');
+    if (!/^[A-Za-z0-9_-]{16,64}$/.test(token)) {
+        return res.status(404).type('html').send(linkPage('Photo not found', 'This link isn’t right. Ask your valet to send it again.'));
+    }
+    try {
+        const photo = await OrderPhoto.findOne({ shareToken: token }).select('storagePath expiresAt').lean();
+        if (!photo || (photo.expiresAt && photo.expiresAt < new Date())) {
+            return res.status(404).type('html').send(linkPage('This photo is gone', 'We keep parking photos for 30 days.'));
+        }
+        const url = await firebaseStorage.getSignedUrl(photo.storagePath, LINK_URL_MINUTES);
+        return res.redirect(302, url);
+    } catch (err) {
+        console.error('[orderPhoto] link error:', err.message);
+        return res.status(500).type('html').send(linkPage('Something went wrong', 'Try the link again in a minute.'));
+    }
+};
+
+exports.newShareToken = newShareToken;
+exports.photoLink = photoLink;
+exports.photoMessageText = photoMessageText;
+exports.TYPE_LABELS = TYPE_LABELS;
