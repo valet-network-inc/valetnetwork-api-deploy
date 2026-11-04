@@ -173,6 +173,15 @@ async function main() {
         doc.otpVerifiedTimes = { orderCreation: now, parkingLocation: now };
         // The return beat: minted when the valet pinned the spot.
         doc.otp = { code: code(), createdAt: now, expiresAt: new Date(now.getTime() + 60 * 60000), verified: false, type: 'return_key' };
+    } else if (mode === 'parked-hold') {
+        // Park & Retrieve, parked, return unspent: Home offers "Cancel the return".
+        doc.status = 'parked';
+        doc.serviceType = 'park-and-hold';
+        doc.totalAmount = 1300;
+        doc.vehicle = CAR;
+        doc.parkingLocation = PARKED;
+        doc.otp.verified = true;
+        doc.otpVerifiedTimes = { orderCreation: now, parkingLocation: now, returnKey: now };
     } else if (mode === 'car-away') {
         // A park whose car stands a block from where the keys change hands.
         doc.status = 'pending';
