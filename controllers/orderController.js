@@ -1344,9 +1344,17 @@ exports.hasActiveOrder = async (req, res) => {
         // builds already on phones only ever expected one order here, and
         // oldest-first means the job they see doesn't jump the moment a newer
         // one is accepted.
+        // A running job comes before a car that is only parked: on the
+        // $250/$300 plans the park stays 'parked' for as long as the valet
+        // holds the keys, and a key delivery or a return booked meanwhile is
+        // the job the user is watching. A bare findOne answered with whichever
+        // came first, so "Watch live" opened the parked car.
         const activeOrders = valetSide
             ? await Order.find(query).sort({ acceptedAt: 1, createdAt: 1 })
-            : [await Order.findOne(query)].filter(Boolean);
+            : [
+                  (await Order.findOne({ ...query, status: { $in: ['pending', 'accepted', 'in_progress'] } }).sort({ createdAt: -1 })) ||
+                      (await Order.findOne(query)),
+              ].filter(Boolean);
 
         res.status(200).json({
             success: true,

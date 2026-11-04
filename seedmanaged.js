@@ -12,6 +12,8 @@
  *   node seedmanaged.js valet-parked     # a valet job sitting at 'parked'
  *   node seedmanaged.js clear
  *
+ * PHONE=+15555550101 picks the rig's test user (default: the newest user).
+ *
  * Writes documents straight into the in-memory database. Nothing is dispatched,
  * nothing is charged.
  */
@@ -36,13 +38,16 @@ async function main() {
     const OpsAlert = require('./models/OpsAlert');
     const curbCustody = require('./services/curbCustody');
 
-    const customer = await User.findOne({ isValet: { $ne: true } }).sort({ createdAt: -1 });
+    // PHONE picks the user (the rig's test numbers); else the newest user.
+    const customer = process.env.PHONE
+        ? await User.findOne({ phone: process.env.PHONE })
+        : await User.findOne({ isValet: { $ne: true } }).sort({ createdAt: -1 });
     if (!customer) {
         console.error('No customer yet — sign up in the app first.');
         process.exit(1);
     }
 
-    let valet = await User.findOne({ isValet: true });
+    let valet = (await User.findOne({ phone: '+15555550102' })) || (await User.findOne({ isValet: true }));
     if (!valet) {
         valet = await User.create({
             phone: '+19175550147',
@@ -98,6 +103,8 @@ async function main() {
             paymentMethod: 'card',
             paymentStatus: 'paid',
             serviceType: 'park-and-hold',
+            // Every park on the flat plans has no end time (orderController).
+            indefinite: true,
             coveredBySubscription: sub._id,
             vehicle: { make: 'BMW', model: 'X5', color: 'Red', licensePlate: 'AA224' },
         });

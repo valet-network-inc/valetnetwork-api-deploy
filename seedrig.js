@@ -95,6 +95,52 @@ async function main() {
     console.log('accounts:', [user, codes, valet].map((u) => `${u.firstName} ${u.phone}`).join(' | '));
     if (mode === 'accounts') return done();
 
+    // `accept`: Marcus takes the newest job waiting for a valet (a key
+    // delivery, a booking made in the app), the way his phone would: a chat
+    // first, then acceptOrder. One phone can then play both sides.
+    if (mode === 'accept') {
+        const job = await Order.findOne({ status: 'pending', paymentStatus: 'paid', customer: { $in: [user._id, codes._id] } }).sort({ createdAt: -1 });
+        if (!job) {
+            console.log('No job waiting for a valet.');
+            return done();
+        }
+        const chat = await fsCall({
+            op: 'add',
+            path: 'conversations',
+            data: { createdAt: { __fv: 'serverTimestamp' }, customerId: String(job.customer), valetId: String(valet._id), status: 'active', lastMessage: null },
+        }).catch(() => null);
+        const body = JSON.stringify({
+            orderId: String(job._id),
+            valetId: String(valet._id),
+            valetLocation: { latitude: valet.currentLocation.lat, longitude: valet.currentLocation.lng },
+            conversationId: chat && chat.id,
+        });
+        const answer = await new Promise((resolve, reject) => {
+            const req = http.request(
+                {
+                    host: '127.0.0.1',
+                    port: 8099,
+                    path: '/api/order/acceptOrder',
+                    method: 'POST',
+                    headers: {
+                        'content-type': 'application/json',
+                        'content-length': Buffer.byteLength(body),
+                        authorization: `Bearer rig-${valet.phone.replace(/\D/g, '')}`,
+                    },
+                },
+                (res) => {
+                    let raw = '';
+                    res.on('data', (c) => (raw += c));
+                    res.on('end', () => resolve({ status: res.statusCode, raw }));
+                }
+            );
+            req.on('error', reject);
+            req.end(body);
+        });
+        console.log('accept', String(job._id), job.keyDeliveryOnly ? '(keys only)' : `(${job.orderType})`, '->', answer.status, answer.status === 200 ? 'Marcus has it' : answer.raw.slice(0, 200));
+        return done();
+    }
+
     const customer = mode === 'job-codes' ? codes : user;
     await Order.deleteMany({ customer: { $in: [user._id, codes._id] }, status: { $ne: 'completed' } });
     await clearChats([user._id, codes._id]).catch(() => console.log('(rig chat store not running; chats not cleared)'));
@@ -182,6 +228,9 @@ async function main() {
         doc.parkingLocation = PARKED;
         doc.otp.verified = true;
         doc.otpVerifiedTimes = { orderCreation: now, parkingLocation: now, returnKey: now };
+        // Closed out: keys back with the user, return trip owed (what the
+        // server stamps when the valet finishes the park).
+        doc.parkClosedAt = now;
     } else if (mode === 'car-away') {
         // A park whose car stands a block from where the keys change hands.
         doc.status = 'pending';
