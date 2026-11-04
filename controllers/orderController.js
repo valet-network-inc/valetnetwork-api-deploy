@@ -1629,14 +1629,14 @@ exports.updateOrder = async (req, res) => {
                     if (!otp) {
                         return res.status(400).json({
                             success: false,
-                            message: 'OTP is required to complete the order. Please verify OTP first.',
+                            message: 'The handoff code is needed to finish this job. Check it first.',
                         });
                     }
 
                     if (!otpData || !otpData.code) {
                         return res.status(400).json({
                             success: false,
-                            message: 'No OTP found for this order. Please update parking location first.',
+                            message: 'No handoff code on this job yet. Save the parking spot first.',
                         });
                     }
 
@@ -1656,7 +1656,7 @@ exports.updateOrder = async (req, res) => {
                         
                         return res.status(400).json({
                             success: false,
-                            message: 'OTP has expired. A new OTP has been generated and sent.',
+                            message: 'That handoff code expired. A new one has been sent.',
                             otpRegenerated: true,
                         });
                     }
@@ -1666,7 +1666,7 @@ exports.updateOrder = async (req, res) => {
                     if (otpData.code !== String(otp).trim()) {
                         return res.status(400).json({
                             success: false,
-                            message: 'Invalid OTP. Please try again.',
+                            message: "That handoff code didn't match. Try again.",
                         });
                     }
 
@@ -1704,7 +1704,7 @@ exports.updateOrder = async (req, res) => {
                     (existingOtp.expiresAt && new Date(existingOtp.expiresAt) > new Date()));
 
             if (!hasLiveReturnKeyOtp) {
-                // Generate new OTP (6-digit code)
+                // Generate a new handoff code (services/handoffCode: 2 digits)
                 const otpCode = newHandoffCode();
                 const otpCreatedAt = new Date();
                 const otpExpiresAt = new Date(otpCreatedAt.getTime() + OTP_EXPIRY_PARKING_LOCATION);
@@ -2734,7 +2734,7 @@ const applyOtpVerification = async (order, submittedOtp, io, opts = {}) => {
             status: 400,
             body: {
                 success: false,
-                message: 'No OTP found for this order. Please update parking location first.',
+                message: 'No handoff code on this job yet. Save the parking spot first.',
             },
         };
     }
@@ -2757,7 +2757,7 @@ const applyOtpVerification = async (order, submittedOtp, io, opts = {}) => {
             status: 400,
             body: {
                 success: false,
-                message: 'OTP has expired. A new OTP has been generated and sent.',
+                message: 'That handoff code expired. A new one has been sent.',
                 otpRegenerated: true,
             },
         };
@@ -2770,7 +2770,7 @@ const applyOtpVerification = async (order, submittedOtp, io, opts = {}) => {
             status: 400,
             body: {
                 success: false,
-                message: 'Invalid OTP. Please try again.',
+                message: "That handoff code didn't match. Try again.",
             },
         };
     }
@@ -2876,7 +2876,7 @@ const applyOtpVerification = async (order, submittedOtp, io, opts = {}) => {
             status: 200,
             body: {
                 success: true,
-                message: 'OTP verified successfully',
+                message: 'Code checked. Keys can change hands.',
                 otpRegenerated: true,
             },
         };
@@ -2894,7 +2894,7 @@ const applyOtpVerification = async (order, submittedOtp, io, opts = {}) => {
         status: 200,
         body: {
             success: true,
-            message: 'OTP verified successfully',
+            message: 'Code checked. Keys can change hands.',
         },
     };
 };
@@ -3007,7 +3007,7 @@ exports.updateCarLocation = async (req, res) => {
         const changes = { parkingLocation };
         let otpExpiresAt = existingOtp && existingOtp.expiresAt;
         if (!hasLiveReturnKeyOtp) {
-            // Generate new OTP (6-digit code)
+            // Generate a new handoff code (services/handoffCode: 2 digits)
             const otpCode = newHandoffCode();
             const otpCreatedAt = new Date();
             otpExpiresAt = new Date(otpCreatedAt.getTime() + OTP_EXPIRY_PARKING_LOCATION);
@@ -3219,7 +3219,7 @@ exports.generateReturnKeyOtp = async (req, res) => {
             });
         }
 
-        // Generate OTP for key return (6-digit code)
+        // Generate the key-return handoff code (2 digits)
         const otpCode = newHandoffCode();
         const otpCreatedAt = new Date();
         const otpExpiresAt = new Date(otpCreatedAt.getTime() + OTP_EXPIRY_RETURN_KEY);

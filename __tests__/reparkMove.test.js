@@ -112,7 +112,7 @@ describe('parking a car, then moving it', () => {
         expect(after.status).toBe('parked');
         expect(after.parkingLocation.streetAddress).toBe(SPOT_A.streetAddress);
         expect(after.otp.type).toBe('return_key');
-        expect(after.otp.code).toMatch(/^\d{3}$/);
+        expect(after.otp.code).toMatch(/^\d{2}$/);
         expect(after.parkedAt).toBeTruthy();
     });
 
@@ -171,7 +171,7 @@ describe('the guest-flow endpoint follows the same rule', () => {
         await updateCar(order._id, SPOT_A);
         const first = await Order.findById(order._id);
         expect(first.otp.type).toBe('return_key');
-        expect(first.otp.code).toMatch(/^\d{3}$/);
+        expect(first.otp.code).toMatch(/^\d{2}$/);
 
         await updateCar(order._id, SPOT_B);
         const second = await Order.findById(order._id);
@@ -190,7 +190,7 @@ describe('the guest-flow endpoint follows the same rule', () => {
         const toValet = req.io.emits.find((e) => e.room === String(valet._id));
         // A shallow spread shared one otp object between the two payloads, so
         // hiding the code from the valet hid it from the customer as well.
-        expect(toCustomer.payload.otp.code).toMatch(/^\d{3}$/);
+        expect(toCustomer.payload.otp.code).toMatch(/^\d{2}$/);
         expect(toValet.payload.otp.code).toBeUndefined();
     });
 });

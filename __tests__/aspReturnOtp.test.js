@@ -204,7 +204,7 @@ describe('the code the customer is holding', () => {
         const res = await verify(parent._id, '386682');
 
         expect(res.statusCode).toBe(400);
-        expect(res.body.message).toMatch(/Invalid OTP/);
+        expect(res.body.message).toMatch(/didn't match/);
     });
 
     test('addressing the leg directly is unchanged', async () => {
@@ -329,7 +329,7 @@ describe('the code the customer is holding', () => {
 
         const after = await Order.findById(retrieval._id);
         expect(after.otpVerifiedTimes.returnKey).toBeTruthy();
-        expect(after.otp.code).toMatch(/^\d{3}$/);
+        expect(after.otp.code).toMatch(/^\d{2}$/);
         expect(after.otp.code).not.toBe('424242');
         expect(after.otp.verified).toBe(false);
     });
@@ -405,7 +405,7 @@ describe('the code the customer is holding', () => {
 
         const afterBeatOne = await Order.findById(retrieval._id);
         expect(afterBeatOne.otpVerifiedTimes.returnKey).toBeTruthy();
-        expect(afterBeatOne.otp.code).toMatch(/^\d{3}$/);
+        expect(afterBeatOne.otp.code).toMatch(/^\d{2}$/);
         expect(afterBeatOne.otp.code).not.toBe('313131');
 
         // Beat 2: whoever overheard the curb has the wrong number.
@@ -500,7 +500,7 @@ describe('the sweep leaves one code in the world', () => {
         expect(parent.linkedOrderId).toBeTruthy();
         const leg = await Order.findById(parent.linkedOrderId);
 
-        expect(leg.otp.code).toMatch(/^\d{3}$/);
+        expect(leg.otp.code).toMatch(/^\d{2}$/);
         expect(leg.otp.code).not.toBe('386682');
         // Same number on both screens, whichever order the app is bound to.
         expect(parent.otp.code).toBe(leg.otp.code);

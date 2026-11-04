@@ -88,7 +88,7 @@ test('a concurrent burst cannot outrun the absolute guess cap', async () => {
             request(app).post(`/api/share/${token}/verify`).send({ otp: String(100000 + i) })
         )
     );
-    const wrongCodeAnswers = res.filter((r) => r.status === 400 && /Invalid OTP/.test(r.body.message || '')).length;
+    const wrongCodeAnswers = res.filter((r) => r.status === 400 && /didn't match/.test(r.body.message || '')).length;
     const locked = res.filter((r) => r.status === 429 && r.body.locked).length;
     const paced = res.filter((r) => r.status === 429 && !r.body.locked).length;
     expect(wrongCodeAnswers).toBeLessThanOrEqual(10);   // the documented cap

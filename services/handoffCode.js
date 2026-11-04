@@ -15,8 +15,14 @@
  */
 const User = require('../models/User');
 
+// How long a handoff code is. Two digits (his Nov 4 call; three before that,
+// six before Nov 2026): it's read aloud at the curb, the valet and the user
+// are standing face to face, and the entry endpoints cap the tries.
+const HANDOFF_CODE_DIGITS = 2;
+
 function newHandoffCode() {
-    return String(Math.floor(100 + Math.random() * 900));
+    const low = 10 ** (HANDOFF_CODE_DIGITS - 1);
+    return String(Math.floor(low + Math.random() * (10 ** HANDOFF_CODE_DIGITS - low)));
 }
 
 /** Whether this user has handoff codes switched on. Off when unknown. */
@@ -26,4 +32,4 @@ async function handoffCodesOn(userId) {
     return !!(user && user.handoffCodes);
 }
 
-module.exports = { newHandoffCode, handoffCodesOn };
+module.exports = { newHandoffCode, handoffCodesOn, HANDOFF_CODE_DIGITS };

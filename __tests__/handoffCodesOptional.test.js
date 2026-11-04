@@ -88,8 +88,8 @@ afterEach(async () => {
 });
 
 describe('codes', () => {
-    test('are three digits', () => {
-        for (let i = 0; i < 500; i++) expect(newHandoffCode()).toMatch(/^[1-9]\d{2}$/);
+    test('are two digits', () => {
+        for (let i = 0; i < 500; i++) expect(newHandoffCode()).toMatch(/^[1-9]\d$/);
     });
 
     test('are off for a customer who never switched them on', async () => {
@@ -189,7 +189,7 @@ describe("the valet's swipe", () => {
         const after = await Order.findById(leg._id).lean();
         expect(after.otpVerifiedTimes.returnKey).toBeInstanceOf(Date);
         expect(after.otp.verified).toBe(false);
-        expect(after.otp.code).toMatch(/^\d{3}$/);
+        expect(after.otp.code).toMatch(/^\d{2}$/);
 
         // …and the second swipe hands the car back.
         const res2 = await swipe(await Order.findById(leg._id), valet);

@@ -151,7 +151,7 @@ async function main() {
     }
 
     const now = new Date();
-    const code = () => String(Math.floor(100 + Math.random() * 900)); // 3 digits
+    const code = require('./services/handoffCode').newHandoffCode; // the server's own (2 digits)
     const base = {
         customer: customer._id,
         customerLocation: WYCKOFF,

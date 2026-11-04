@@ -19,7 +19,7 @@ const curbCustody = require('../services/curbCustody');
 
 const OTP_EXPIRY_RETURN_KEY = 30 * 24 * 60 * 60 * 1000; // matches orderController
 
-const { newHandoffCode: sixDigit, handoffCodesOn } = require('../services/handoffCode'); // 3 digits now (Nov 2026); the old name stays
+const { newHandoffCode: sixDigit, handoffCodesOn } = require('../services/handoffCode'); // 2 digits now (Nov 4 2026); the old name stays
 
 /** Serialise the key state for the app. Never throws. */
 async function keyStateFor(customerId) {
