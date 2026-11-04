@@ -48,6 +48,25 @@ const { MongoMemoryServer } = require('mongodb-memory-server');
   storage.uploadFile = async (buf, path) => ({ bucket: 'rig-bucket', path });
   storage.deleteFile = async () => true;
 
+  // No Firebase here, so no ID tokens either. The app's rig sign-in (a dev
+  // build pointed at localhost) sends "Bearer rig-<digits>" and its loginUser
+  // stored firebaseUid "rig-<digits>", so this one verifier is enough for
+  // requireSelf / requireValet / requireRep to see a signed-in caller.
+  // Anything else is refused, as before.
+  const admin = require('firebase-admin');
+  const rigAuth = {
+    verifyIdToken: async (token) => {
+      const m = /^rig-(\d{10,15})$/.exec(String(token || ''));
+      if (!m) throw new Error('rig: only rig-<digits> tokens verify here');
+      return { uid: `rig-${m[1]}`, phone_number: `+${m[1]}` };
+    },
+  };
+  Object.defineProperty(admin, 'auth', { value: () => rigAuth, configurable: true, writable: true });
+
+  // The app's chats live in Firestore. The rig Metro points the app at this
+  // stand-in instead, so rig chats never touch the live Firestore.
+  require('./rigfirestore').start(8098);
+
   require('./server.js');
 
   const stop = async () => {
