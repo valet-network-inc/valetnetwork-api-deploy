@@ -43,6 +43,25 @@ const OrderSchema = new mongoose.Schema({
         },
     },
 
+    // Where the car is when it isn't where the keys change hands (Nov 2026,
+    // the /park "Where's the car?" step). A park meets the user at
+    // customerLocation for the keys; the car itself stands here. Unset = the
+    // car is right there with the keys.
+    carLocation: {
+        lat: { type: Number },
+        lng: { type: Number },
+        streetAddress: { type: String },
+    },
+
+    // Where the valet meets the user for the keys when that isn't at the car
+    // (a street-cleaning move, an away hold, a bring-back): customerLocation
+    // is the car, this is the handoff. Unset = the keys are at the car.
+    keysLocation: {
+        lat: { type: Number },
+        lng: { type: Number },
+        streetAddress: { type: String },
+    },
+
     // Where the keys physically changed hands at order start. Recorded by
     // the valet the moment they take possession of the keys. Used as the
     // default retrieval coordinate (build 11) and as the stable "key

@@ -192,6 +192,17 @@ const withoutOtpCode = (order) => {
  * identity, custody and OTP are deliberately absent and must stay that way —
  * they are set by the server or not at all.
  */
+// A { lat, lng, streetAddress } from a client, or null when it isn't one.
+// Only finite coordinates inside the planet's range get stored.
+const cleanPoint = (p) => {
+    if (!p || typeof p !== 'object') return null;
+    const lat = Number(p.lat);
+    const lng = Number(p.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) return null;
+    const streetAddress = typeof p.streetAddress === 'string' ? p.streetAddress.slice(0, 300) : undefined;
+    return streetAddress ? { lat, lng, streetAddress } : { lat, lng };
+};
+
 const CLIENT_WRITABLE_ORDER_FIELDS = new Set([
     'status',
     'parkClosed',
@@ -485,6 +496,8 @@ exports.createOrder = async (req, res) => {
         awayDays, // street-cleaning slots to move the car for while away
         awayEndTime, // when the customer is back — becomes asp_time (the auto-return moment)
         awayService, // 'moves' (per-move, reconciled on schedule set) | 'hold' (per-day, paid up front)
+        carLocation, // park: where the car stands when it isn't where the keys change hands
+        keysLocation, // move / away: where to meet for the keys when that isn't the car
     } = req.body;
 
     try {
@@ -878,6 +891,8 @@ exports.createOrder = async (req, res) => {
         const orderData = {
             customer,
             customerLocation,
+            ...(cleanPoint(carLocation) ? { carLocation: cleanPoint(carLocation) } : {}),
+            ...(cleanPoint(keysLocation) ? { keysLocation: cleanPoint(keysLocation) } : {}),
             parkingType,
             duration,
             pickUpTime,
@@ -2083,6 +2098,7 @@ exports.createRetrievalOrder = async (req, res) => {
         originalOrderId,
         paymentMethod,
         paymentIntentId,
+        keysLocation, // where to meet for the keys when the user holds them away from the car
     } = req.body;
 
     try {
@@ -2217,6 +2233,7 @@ exports.createRetrievalOrder = async (req, res) => {
         const retrievalOrderData = {
             customer,
             customerLocation: customerLocation || defaultRetrievalLocation,
+            ...(cleanPoint(keysLocation) ? { keysLocation: cleanPoint(keysLocation) } : {}),
             parkingType: 'retrieval',
             orderType: 'retrieval',
             parkingLocation: originalOrder.parkingLocation,

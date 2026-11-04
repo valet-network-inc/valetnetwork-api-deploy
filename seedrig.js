@@ -41,6 +41,38 @@ const ACCOUNTS = {
     },
 };
 
+// The rig's Firestore stand-in (rigfirestore.js, started by localrig.js). Each
+// seeded job gets a chat of its own there, the way accepting one does, so the
+// app never falls back to an older job's chat between the same two people.
+const http = require('http');
+function fsCall(body) {
+    return new Promise((resolve, reject) => {
+        const data = JSON.stringify(body);
+        const req = http.request(
+            { host: '127.0.0.1', port: 8098, path: '/fs', method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(data) } },
+            (res) => {
+                let raw = '';
+                res.on('data', (c) => (raw += c));
+                res.on('end', () => {
+                    try {
+                        resolve(JSON.parse(raw || '{}'));
+                    } catch (e) {
+                        reject(e);
+                    }
+                });
+            }
+        );
+        req.on('error', reject);
+        req.end(data);
+    });
+}
+async function clearChats(customerIds) {
+    for (const id of customerIds) {
+        const r = await fsCall({ op: 'query', path: 'conversations', wheres: [['customerId', '==', String(id)]] }).catch(() => ({ docs: [] }));
+        for (const d of r.docs || []) await fsCall({ op: 'delete', path: `conversations/${d.id}` });
+    }
+}
+
 async function upsert(User, fields) {
     const found = await User.findOne({ phone: fields.phone });
     if (found) {
@@ -65,6 +97,7 @@ async function main() {
 
     const customer = mode === 'job-codes' ? codes : user;
     await Order.deleteMany({ customer: { $in: [user._id, codes._id] }, status: { $ne: 'completed' } });
+    await clearChats([user._id, codes._id]).catch(() => console.log('(rig chat store not running; chats not cleared)'));
     if (mode === 'clear') {
         const r = await Order.deleteMany({ customer: { $in: [user._id, codes._id] } });
         console.log('cleared', r.deletedCount, 'jobs');
@@ -140,9 +173,23 @@ async function main() {
         doc.otpVerifiedTimes = { orderCreation: now, parkingLocation: now };
         // The return beat: minted when the valet pinned the spot.
         doc.otp = { code: code(), createdAt: now, expiresAt: new Date(now.getTime() + 60 * 60000), verified: false, type: 'return_key' };
+    } else if (mode === 'car-away') {
+        // A park whose car stands a block from where the keys change hands.
+        doc.status = 'pending';
+        delete doc.valet;
+        delete doc.valetLocation;
+        doc.carLocation = { lat: 40.68437, lng: -73.98682, streetAddress: '120 Bergen St, Brooklyn, NY 11217, USA' };
     } else if (mode !== 'job' && mode !== 'job-codes') {
         console.error('unknown mode', mode);
         process.exit(1);
+    }
+    if (doc.valet) {
+        const chat = await fsCall({
+            op: 'add',
+            path: 'conversations',
+            data: { createdAt: { __fv: 'serverTimestamp' }, customerId: String(customer._id), valetId: String(valet._id), status: 'active', lastMessage: null },
+        }).catch(() => null);
+        if (chat && chat.id) doc.conversationId = chat.id;
     }
     const o = await Order.create(doc);
     console.log('job', o._id.toString(), '->', o.status, `· codes ${o.handoffCode ? 'ON' : 'off'}`, `· code ${o.otp && o.otp.code}`);
