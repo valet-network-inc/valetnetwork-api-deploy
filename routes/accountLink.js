@@ -36,30 +36,15 @@ const meter = ({ windowMs, max, keyFrom, message }) =>
 
 const HOUR = 60 * 60 * 1000;
 
-// Minting and scanning: ten an hour each, the doorman link's number. Linking
-// is something a person does once, maybe twice if the first scan misses. The
-// app re-mints silently every ten minutes while the panel sits open, which is
-// six an hour — inside this with room for a panel opened twice. Claim is the
-// one that takes a guess at a secret, so it is the one worth keeping tight.
-const perHourMint = meter({
+// Sending requests: ten an hour per account. Linking is something a person
+// does once, maybe twice after a typo; each request can push somebody, so
+// this is the one worth keeping tight.
+const perHourRequest = meter({
     windowMs: HOUR,
     max: 10,
     keyFrom: bodyUserId,
-    message: 'Too many codes. Try again in a little while.',
+    message: 'Too many requests. Try again in a little while.',
 });
-const perHourClaim = meter({
-    windowMs: HOUR,
-    max: 10,
-    keyFrom: bodyUserId,
-    message: 'Too many scans. Try again in a little while.',
-});
-
-// Authorize, Not them, Unlink and Cancel, sharing one budget of twenty an
-// hour. Each is one tap on a card that only exists after a scan, and scans are
-// already held to ten an hour — so a real person cannot get near twenty. The
-// cap is for a client stuck in a retry loop: Authorize and Unlink both push
-// the OTHER person's phone, and twenty an hour stops a bug from buzzing
-// somebody all afternoon while leaving every honest retry through.
 const perHourAnswer = meter({
     windowMs: HOUR,
     max: 20,
@@ -77,8 +62,7 @@ const perMinuteStatus = meter({
     message: 'Too many refreshes. Give it a moment.',
 });
 
-router.post('/invite', perHourMint, requireSelf(bodyUserId), accountLinkController.invite);
-router.post('/claim', perHourClaim, requireSelf(bodyUserId), accountLinkController.claim);
+router.post('/request', perHourRequest, requireSelf(bodyUserId), accountLinkController.request);
 router.post('/authorize', perHourAnswer, requireSelf(bodyUserId), accountLinkController.authorize);
 router.post('/decline', perHourAnswer, requireSelf(bodyUserId), accountLinkController.decline);
 router.post('/unlink', perHourAnswer, requireSelf(bodyUserId), accountLinkController.unlink);

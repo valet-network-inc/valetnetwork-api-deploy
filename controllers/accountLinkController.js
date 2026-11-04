@@ -5,39 +5,38 @@
  * is a link. Both keep their own login, profile, card and history; each sees
  * the other's parks; a plan held by either covers both, one park at a time.
  * Every rule that READS a pair lives in services/accountLinks.js. This file is
- * only the handshake that makes one and the two ways it ends.
+ * only the handshake that makes one and the ways it ends.
  *
- * THE HANDSHAKE (brief §1, §5). Either phone shows a QR, the other scans it.
+ * THE HANDSHAKE (Nov 4: by phone number; the Sep 23 QR code is gone).
  *
- *   POST /invite     the phone showing the code mints it           → open
- *   POST /claim      the other phone scans it                       → pending
- *   POST /authorize  the phone that SHOWED the code taps Authorize  → active
- *   POST /decline    …or taps "Not them"                            → revoked
- *   POST /unlink     either side, any time; also the scanner's
- *                    "Cancel" while it waits                        → revoked
+ *   POST /request    type their number, send a request            → pending
+ *   POST /authorize  the person asked taps Accept                  → active
+ *   POST /decline    …or Decline                                   → revoked
+ *   POST /unlink     either side, any time; also the sender's
+ *                    "Cancel request" while it waits               → revoked
  *   GET  /status     the panel's one read, polled every 3 s
  *
- * Authorize is the one verification step, and it sits with whoever showed the
- * code on purpose: a QR on a screen can be photographed from across a room, so
- * scanning proves nothing. The person holding the phone that showed it looks
- * at the scanner's name and says yes.
+ * Accept is the one verification step, and it sits with the person asked:
+ * anyone can type a number, so sending proves nothing. The person asked sees
+ * the sender's name AND their full phone number (a name is whatever someone
+ * typed into their profile; the number is the one they signed in with) and
+ * says yes.
  *
- * THE TOKEN is modelled on the doorman link (controllers/shareController.js):
- * 32 random bytes, never derived from an id, and — one step further than that
- * link goes — only its sha256 is stored. A database read never yields a
- * working code. It is good for ten minutes, and a scan starts a second ten
- * minutes for the Authorize tap. Nothing sweeps expired rows; every read that
- * finds an open or pending link past its time marks it `expired` there and
- * then (`lapsed`), so the answer is right whoever asks first.
+ * NOTHING LEAKS TO A SENDER. Every request is answered the same way whatever
+ * is behind the number: an account, no account, a valet, someone already
+ * linked. The sender sees the number they typed and nothing else until the
+ * person asked accepts — never a name. A number with no account keeps the
+ * request (`inviter` unset) until someone signs up with it and reads their
+ * status, which attaches it.
  *
- * ONE ANSWER for "no such" and "not yours", as everywhere else that takes an
- * id or a secret: a code that never existed, was replaced, or was already
- * used is INVALID; a link id that does not exist or is somebody else's is the
- * same 403.
+ * Nothing sweeps expired rows; every read that finds a request past its time
+ * marks it `expired` there and then (`lapsed`), so the answer is right
+ * whoever asks first.
  *
- * WHAT LEAVES THE SERVER about the other person is `partnerSummary` and
- * nothing else: first and last name, photo, last four digits of the phone.
- * Their firebaseUid is read here to push them, and never returned.
+ * WHAT LEAVES THE SERVER about the other person is `partnerSummary` (first and
+ * last name, photo, last four digits of the phone) — plus, to the person asked
+ * and only while they decide, the sender's full number. Their firebaseUid is
+ * read here to push them, and never returned.
  *
  * NO TRANSACTIONS. There are none anywhere in this codebase and the tests run
  * on a standalone mongodb-memory-server that cannot hold one. Every state
@@ -48,7 +47,6 @@
  * answered as ALREADY_LINKED.
  */
 
-const crypto = require('crypto');
 const mongoose = require('mongoose');
 
 const AccountLink = require('../models/AccountLink');
@@ -65,25 +63,18 @@ const {
 // Called through the module rather than destructured so a test can spy on it.
 const notifications = require('./notificationController');
 
-// How long a code on screen can be scanned, and how long a scan waits for the
-// Authorize tap. The app re-mints silently when the first runs out, so the
-// person looking at their own code never sees it expire.
-const TOKEN_TTL_MS = 10 * 60 * 1000;
-const PENDING_TTL_MS = 10 * 60 * 1000;
+// How long a request waits for Accept. Long enough for someone who is not
+// looking at their phone, or has to download the app first.
+const PENDING_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
-// What the QR encodes. The app registers the scheme (app.config.js) so the
-// iPhone's own Camera app can open a scanned code straight into the panel.
-const QR_PREFIX = 'valetnyc://link/';
-
-// Error copy is the brief's (§7). The clients map `code` to their own copy and
-// fall back to "Something went wrong. Try again."; `message` is here so an API
-// reader, or an older client, still gets a sentence a person can act on.
+// Error copy. The clients map `code` to their own copy and fall back to
+// "Something went wrong. Try again."; `message` is here so an API reader, or
+// an older client, still gets a sentence a person can act on.
 const MESSAGES = {
-    EXPIRED: 'That code has expired. Ask them to open Link account again.',
-    SELF_LINK: "That's your own code.",
+    BAD_PHONE: 'Enter their full phone number.',
+    SELF_LINK: "That's your own number.",
     ALREADY_LINKED: 'That account is already linked with someone.',
     BOTH_HAVE_PLANS: 'You both have a plan. One of you has to cancel theirs first.',
-    INVALID: "We don't recognise that code.",
     NOT_PENDING: 'That request is no longer waiting.',
     NOT_LINKED: "You're not linked with anyone.",
     NOT_YOURS: 'That request is not yours.',
@@ -96,27 +87,22 @@ const fail = (res, status, code) =>
 
 const idOf = (v) => (v && v._id ? String(v._id) : v ? String(v) : null);
 
-const hashToken = (token) => crypto.createHash('sha256').update(token).digest('hex');
-
 /**
- * The token out of whatever the scanner read.
- *
- * The in-app scanner and the iPhone Camera app both hand over the whole
- * `valetnyc://link/<token>` string; a client that has already parsed it sends
- * the bare token. Both are accepted. Anything that is not a plausible token
- * comes back null and is answered INVALID without touching the database.
+ * A phone number as accounts store it (E.164), or null. US numbers may come
+ * as typed — "(718) 555-0142", "718-555-0142", "17185550142"; anything with a
+ * leading + is taken as already international.
  */
-function tokenFrom(raw) {
-    if (typeof raw !== 'string') return null;
-    let token = raw.trim();
-    if (token.toLowerCase().startsWith(QR_PREFIX)) token = token.slice(QR_PREFIX.length);
-    // A deep link can arrive with a trailing slash or a query string tacked
-    // on by whatever opened it. Neither is part of the token.
-    token = token.split(/[?#]/)[0].replace(/\/+$/, '');
-    return /^[A-Za-z0-9_-]{32,128}$/.test(token) ? token : null;
+function normalizePhone(raw) {
+    if (typeof raw !== 'string' && typeof raw !== 'number') return null;
+    const text = String(raw).trim();
+    const digits = text.replace(/\D/g, '');
+    if (text.startsWith('+')) return digits.length >= 8 && digits.length <= 15 ? `+${digits}` : null;
+    if (digits.length === 10) return `+1${digits}`;
+    if (digits.length === 11 && digits.startsWith('1')) return `+${digits}`;
+    return null;
 }
 
-/** When this link's current step runs out: the code's TTL, or the Authorize wait. */
+/** When a request runs out: PENDING_TTL_MS after it was sent. */
 function expiresAtOf(link) {
     if (!link) return null;
     if (link.status === 'open') return link.tokenExpiresAt || null;
@@ -148,14 +134,8 @@ const otherMemberOf = (link, me) => {
 };
 
 /**
- * Is this open or pending link past its time? If so it is marked `expired`
- * here — nothing else sweeps them — and the caller treats it as gone.
- *
- * The token hash is deliberately LEFT on a link that simply ran out of time,
- * so the person still holding that code is told "expired" (ask them to open
- * Link account again) rather than "we don't recognise that code", which would
- * send them hunting for a typo. The hash comes off everywhere a code stops
- * meaning anything: replaced, approved, declined, cancelled, unlinked.
+ * Is this request past its time? If so it is marked `expired` here — nothing
+ * else sweeps them — and the caller treats it as gone.
  */
 async function lapsed(link, now = new Date()) {
     if (!link || !['open', 'pending'].includes(link.status)) return false;
@@ -200,20 +180,23 @@ async function pushQuietly(user, title, body, linkStatus) {
 }
 
 /**
- * The code's owner as the person who scanned it sees them before Authorize:
- * a first name for "Waiting for [First name]", and nothing else. Whoever
- * scans a code may have photographed it off someone's screen, and until the
- * owner approves them they are nobody to this account. Same keys as a
- * partner summary, so a client parsing one parses this.
+ * The sender as the person asked sees them while deciding: the summary, plus
+ * their full phone number. A name is whatever someone typed into a profile;
+ * the number is the one they sign in with, and the person asked knows their
+ * partner's number. Same keys as a partner summary, plus `phone`.
  */
-const scannerView = (summary) =>
-    summary ? { ...summary, lastName: '', profileImage: null, phoneMasked: '' } : null;
+const requesterView = (user) => {
+    const summary = partnerSummary(user);
+    if (!summary) return null;
+    return { ...summary, phone: normalizePhone(user && user.phone) || '' };
+};
 
 /**
  * Linking is for two customer accounts (brief §1). A valet linked to a
  * customer would pass the partner gates on that customer's parks — tip off
  * their card, extend on it, read the release codes. The Link account row only
- * exists on the customer Profile; this is the server saying the same.
+ * exists on the customer Profile; this is the server saying the same. A
+ * request to a valet's number goes nowhere, and its sender is not told so.
  */
 async function isCustomer(userId) {
     const u = await User.findById(userId).select('isValet isDoorman isDeleted').lean();
@@ -225,6 +208,25 @@ async function isCustomer(userId) {
  * other (SUMMARY_FIELDS) and to push them (firebaseUid). Callers turn these
  * into `partnerSummary` before anything leaves the server.
  */
+/**
+ * The customer account a number belongs to, or null. Accounts store E.164,
+ * but older ones may lack the + or the country code, so all three spellings
+ * of a US number are tried.
+ */
+async function customerByPhone(phone) {
+    if (!phone) return null;
+    const spellings = [phone];
+    if (phone.startsWith('+1') && phone.length === 12) spellings.push(phone.slice(1), phone.slice(2));
+    return User.findOne({
+        phone: { $in: spellings },
+        isValet: { $ne: true },
+        isDoorman: { $ne: true },
+        isDeleted: { $ne: true },
+    })
+        .select(`${SUMMARY_FIELDS} firebaseUid`)
+        .lean();
+}
+
 async function peopleById(ids, extra = '') {
     const users = await User.find({ _id: { $in: ids.filter(Boolean) } })
         .select(`${SUMMARY_FIELDS} firebaseUid ${extra}`.trim())
@@ -257,10 +259,9 @@ async function bothHavePlans(a, b) {
 /**
  * Take a request off the table and tell the person on the other end.
  *
- * `notifyUserId` is whoever is left waiting on it: the scanner when the code's
- * owner replaces it or cannot approve it any more, the code's owner when the
- * scanner moves on to another code. `accountLink:declined` is what sends a
- * waiting screen, or an Authorize card, back to the QR.
+ * `notifyUserId` is whoever is left looking at it: the sender, whose waiting
+ * screen goes back to the number field, or the person asked, whose Accept
+ * screen goes away. `accountLink:declined` is what does both.
  */
 async function retirePending(io, link, notifyUserId) {
     const retired = await AccountLink.findOneAndUpdate(
@@ -275,41 +276,56 @@ async function retirePending(io, link, notifyUserId) {
 }
 
 /**
- * Everything this account has out as the one who SHOWED a code, retired.
- *
- * Called on mint (a new code replaces the last one, brief §4) and on a
- * successful scan (someone who has just scanned is not also waiting to be
- * scanned). A pending request on one of those codes has a person on the other
- * end watching a spinner, so it is told.
+ * Every request this account is in, either way round, retired. A new request
+ * replaces the last one sent, and someone sending one is not also deciding on
+ * one sent to them (the panel shows the one sent to them first, so this only
+ * happens in a race). Each had a person on the other end, who is told.
  */
-async function retireInvitesBy(io, inviterId, now = new Date()) {
+async function retireRequestsOf(io, me, now = new Date()) {
     const outstanding = await AccountLink.find({
-        inviter: inviterId,
-        status: { $in: ['open', 'pending'] },
+        $or: [{ inviter: me }, { invitee: me }],
+        status: 'pending',
     }).lean();
-
     for (const link of outstanding) {
-        // A code that simply ran out keeps its hash (see `lapsed`), so whoever
-        // still holds it is told it expired rather than that it never existed.
         if (await lapsed(link, now)) continue;
-        if (link.status === 'pending') {
-            await retirePending(io, link, idOf(link.invitee));
-        } else {
-            await AccountLink.updateOne(
-                { _id: link._id, status: 'open' },
-                { $set: { status: 'expired' }, $unset: { tokenHash: 1 } }
-            );
-        }
+        const other = idOf(link.inviter) === me ? idOf(link.invitee) : idOf(link.inviter);
+        await retirePending(io, link, other);
+    }
+}
+
+/**
+ * Requests sent to this account's number before it existed (or while its
+ * number had no account) become requests TO it: the first status read after
+ * sign-up attaches them. Guarded on `inviter` still being unset, so two reads
+ * in the same instant attach each request once.
+ */
+async function attachRequestsByPhone(me, now = new Date()) {
+    const self = await User.findById(me).select('phone isValet isDoorman isDeleted').lean();
+    if (!self || self.isValet || self.isDoorman || self.isDeleted) return;
+    const phone = normalizePhone(self.phone);
+    if (!phone) return;
+    const waiting = await AccountLink.find({
+        requestedPhone: phone,
+        status: 'pending',
+        inviter: { $exists: false },
+    }).lean();
+    for (const link of waiting) {
+        if (await lapsed(link, now)) continue;
+        const senderId = idOf(link.invitee);
+        if (!senderId || senderId === me) continue;
+        await AccountLink.updateOne(
+            { _id: link._id, status: 'pending', inviter: { $exists: false } },
+            { $set: { inviter: me, members: [me, senderId] } }
+        );
     }
 }
 
 /**
  * The link this account is in right now, from its own point of view, or null.
  *
- * Active beats pending beats open. Two pending rows for one account should not
- * happen — a scan retires the scanner's own codes and earlier scans — but if a
- * race leaves two, the newest is the one on screen and the older lapses on its
- * own clock.
+ * Active beats pending. Two people can each have sent this account a request:
+ * the newest is the one on screen, and the other shows once that one is
+ * answered (or lapses on its own clock).
  */
 async function currentLinkFor(me, now = new Date()) {
     const active = await activeLinkFor(me);
@@ -319,13 +335,6 @@ async function currentLinkFor(me, now = new Date()) {
         .sort({ claimedAt: -1 })
         .lean();
     for (const link of pending) {
-        if (!(await lapsed(link, now))) return link;
-    }
-
-    const open = await AccountLink.find({ inviter: me, status: 'open' })
-        .sort({ createdAt: -1 })
-        .lean();
-    for (const link of open) {
         if (!(await lapsed(link, now))) return link;
     }
     return null;
@@ -382,168 +391,73 @@ async function copyCarIfOneSided(a, b) {
 /* -------------------------------------------------------------------------- */
 
 /**
- * POST /api/account-link/invite  { userId }
+ * POST /api/account-link/request  { userId, phone }
  *
- * Mints the code the phone shows. Retires every code this account already has
- * out (brief §4: a new QR expires the last one), including one somebody has
- * scanned and is waiting on — THE CLIENT MUST READ /status BEFORE MINTING, or
- * opening the panel would throw away a request that is sitting there waiting
- * to be authorized.
+ * "Link with someone": the number is the other person's. Refusals are only
+ * ever about the sender, never about the number's owner:
  *
- * An account already in a link cannot show a code: pairs only.
+ *   403 NOT_A_CUSTOMER — the sender is a valet or a doorman
+ *   400 BAD_PHONE      — not a phone number
+ *   400 SELF_LINK      — their own number
+ *   409 ALREADY_LINKED — the SENDER is already in a link
+ *
+ * Everything else is the same 200, `{ link, askedPhone }`, whatever is behind
+ * the number — an account, none, a valet, someone already linked — so typing
+ * numbers tells nobody anything. Both-have-plans is asked at Accept for the
+ * same reason. A new request replaces the last one this account sent.
  */
-exports.invite = async (req, res) => {
+exports.request = async (req, res) => {
     const me = idOf(req.callerUserId || req.body?.userId);
     try {
         if (!(await isCustomer(me))) return fail(res, 403, 'NOT_A_CUSTOMER');
+        const phone = normalizePhone(req.body?.phone);
+        if (!phone) return fail(res, 400, 'BAD_PHONE');
+        const self = await User.findById(me).select('phone').lean();
+        if (self && normalizePhone(self.phone) === phone) return fail(res, 400, 'SELF_LINK');
         if (await activeLinkFor(me)) return fail(res, 409, 'ALREADY_LINKED');
 
         const now = new Date();
-        await retireInvitesBy(req.io, me, now);
+        await retireRequestsOf(req.io, me, now);
 
-        // 32 random bytes, as the doorman link: never sequential, never
-        // derived from an id. Only the hash is kept.
-        const token = crypto.randomBytes(32).toString('base64url');
-        const expiresAt = new Date(now.getTime() + TOKEN_TTL_MS);
-        await AccountLink.create({
-            inviter: me,
-            status: 'open',
-            tokenHash: hashToken(token),
-            tokenExpiresAt: expiresAt,
-        });
-
-        return res.status(200).json({ success: true, token, expiresAt });
-    } catch (err) {
-        console.error('account link invite failed:', err);
-        return res.status(500).json({ success: false, message: 'Could not make a code. Try again.' });
-    }
-};
-
-/**
- * POST /api/account-link/claim  { userId, token }
- *
- * The scanner. `token` is the bare token or the whole `valetnyc://link/<token>`.
- *
- * Refusals, in the order they are asked (brief §5):
- *   404 INVALID         — no such code, replaced, used, declined. One answer.
- *   410 EXPIRED         — the code ran out before anyone scanned it
- *   400 SELF_LINK       — the scanner is the one who showed it
- *   409 ALREADY_LINKED  — either of the two is already in a link
- *   409 BOTH_HAVE_PLANS — both hold a live plan of their own
- *
- * A scan that arrives twice — the same phone retrying after a dropped answer,
- * or a camera firing twice — gets the same success again rather than INVALID
- * for its own request.
- */
-exports.claim = async (req, res) => {
-    const me = idOf(req.callerUserId || req.body?.userId);
-    try {
-        const token = tokenFrom(req.body?.token);
-        if (!token) return fail(res, 404, 'INVALID');
-        if (!(await isCustomer(me))) return fail(res, 403, 'NOT_A_CUSTOMER');
-
-        const now = new Date();
-        // An exact index hit on a hash of a 256-bit secret — there is no
-        // prefix for a guesser to walk, so this lookup is not a timing oracle.
-        let link = await AccountLink.findOne({ tokenHash: hashToken(token) }).lean();
-
-        const answer = async (settled) => {
-            if (!settled) return fail(res, 404, 'INVALID');
-            if (settled.status === 'expired') return fail(res, 410, 'EXPIRED');
-            if (settled.status === 'pending' && idOf(settled.invitee) === me) {
-                if (await lapsed(settled, now)) return fail(res, 410, 'EXPIRED');
-                const people = await peopleById([idOf(settled.inviter)]);
-                return res.status(200).json({
-                    success: true,
-                    link: linkView(settled, me),
-                    waitingFor: scannerView(partnerSummary(people.get(idOf(settled.inviter)))),
-                });
-            }
-            // Active, revoked, or somebody else's scan: not a code this
-            // person can use, and nothing about why.
-            return fail(res, 404, 'INVALID');
-        };
-
-        if (!link || link.status !== 'open') return answer(link);
-        if (await lapsed(link, now)) return fail(res, 410, 'EXPIRED');
-
-        const inviterId = idOf(link.inviter);
-        if (inviterId === me) return fail(res, 400, 'SELF_LINK');
-
-        const [mine, theirs] = await Promise.all([activeLinkFor(me), activeLinkFor(inviterId)]);
-        if (mine || theirs) return fail(res, 409, 'ALREADY_LINKED');
-
-        if (await bothHavePlans(me, inviterId)) return fail(res, 409, 'BOTH_HAVE_PLANS');
-
-        const people = await peopleById([me, inviterId]);
-        // A code whose owner has since been deleted, or is not a customer,
-        // is a dead code.
-        if (!people.get(inviterId) || !(await isCustomer(inviterId))) return fail(res, 404, 'INVALID');
-
-        // The flip. Guarded on `open` and on the clock, so of two phones
-        // scanning one code in the same second exactly one becomes the
-        // request; the other re-reads and is answered from what it finds.
-        const claimed = await AccountLink.findOneAndUpdate(
-            { _id: link._id, status: 'open', tokenExpiresAt: { $gt: now } },
-            {
-                $set: {
-                    invitee: me,
-                    members: [inviterId, me],
-                    status: 'pending',
-                    claimedAt: now,
-                },
-            },
-            { new: true }
-        ).lean();
-        if (!claimed) {
-            link = await AccountLink.findById(link._id).lean();
-            // Still open means the only guard left — the clock — is what
-            // refused it: the code ran out between the check above and here.
-            if (link && link.status === 'open') {
-                await lapsed(link, new Date());
-                return fail(res, 410, 'EXPIRED');
-            }
-            return answer(link);
-        }
-
-        // Someone who has just scanned is not also waiting to be scanned, nor
-        // still waiting on an earlier scan. Each of those had somebody on the
-        // other end, and each is told.
-        await retireInvitesBy(req.io, me, now);
-        const earlier = await AccountLink.find({
+        const target = await customerByPhone(phone);
+        const targetId = target && idOf(target) !== me ? idOf(target) : null;
+        const created = await AccountLink.create({
+            ...(targetId ? { inviter: targetId } : {}),
             invitee: me,
+            members: targetId ? [targetId, me] : [me],
             status: 'pending',
-            _id: { $ne: claimed._id },
-        }).lean();
-        for (const old of earlier) {
-            await retirePending(req.io, old, idOf(old.inviter));
+            claimedAt: now,
+            requestedPhone: phone,
+        });
+        const link = created.toObject();
+
+        // Told only when there is someone to tell. Someone already linked
+        // keeps the request (it is theirs to answer if they unlink while it
+        // waits) but is not pushed about a link they cannot make.
+        const tell = targetId && !(await activeLinkFor(targetId));
+        let from = null;
+        if (tell) {
+            const people = await peopleById([me]);
+            from = requesterView(people.get(me));
+            emitTo(req.io, targetId, 'accountLink:requested', { link: linkView(link, targetId), from });
         }
 
-        const scanner = partnerSummary(people.get(me));
-        const inviter = people.get(inviterId);
+        res.status(200).json({ success: true, link: linkView(link, me), askedPhone: phone });
 
-        emitTo(req.io, inviterId, 'accountLink:requested', {
-            link: linkView(claimed, inviterId),
-            from: scanner,
-        });
-
-        res.status(200).json({
-            success: true,
-            link: linkView(claimed, me),
-            waitingFor: scannerView(partnerSummary(inviter)),
-        });
-
-        // After the answer: the scan has worked whether or not the push lands.
-        await pushQuietly(
-            inviter,
-            'Someone scanned your code',
-            `${firstNameOf(scanner, 'Someone')} wants to link. Open Profile → Link account to approve.`,
-            'pending'
-        );
+        // After the answer: the request has been made whether or not the push
+        // lands.
+        if (tell) {
+            await pushQuietly(
+                target,
+                'Link request',
+                `${firstNameOf(from, 'Someone')} wants to link accounts. Open Profile → Link account to answer.`,
+                'pending'
+            );
+        }
     } catch (err) {
-        console.error('account link claim failed:', err);
+        console.error('account link request failed:', err);
         if (!res.headersSent) {
-            res.status(500).json({ success: false, message: 'Could not read that code. Try again.' });
+            res.status(500).json({ success: false, message: 'Could not send that. Try again.' });
         }
     }
 };
@@ -551,9 +465,9 @@ exports.claim = async (req, res) => {
 /**
  * POST /api/account-link/authorize  { userId, linkId }
  *
- * The one verification step: the person who showed the code has seen the
- * scanner's name and taps Authorize. Only they can; the scanner authorizing
- * their own request would make the step mean nothing.
+ * Accept — the one verification step: the person asked has seen the sender's
+ * name and number and says yes. Only they can; the sender accepting their own
+ * request would make the step mean nothing.
  *
  *   403 NOT_YOURS       — no such link, or not this caller's to approve
  *   409 NOT_PENDING     — declined, cancelled, replaced, or the wait ran out
@@ -578,9 +492,9 @@ exports.authorize = async (req, res) => {
         const inviteeId = idOf(link.invitee);
 
         // Pairs only. If either has been linked to somebody else since the
-        // scan, this request can never succeed — take it off the table so the
-        // scanner's waiting screen goes back to the QR instead of spinning
-        // until the clock runs out.
+        // request, it can never succeed — take it off the table so the
+        // sender's waiting screen goes back to the number field instead of
+        // waiting until the clock runs out.
         const [mine, theirs] = await Promise.all([activeLinkFor(me), activeLinkFor(inviteeId)]);
         // Unless the active link is THIS one: a second tap on the same
         // Authorize button that read the request while it was still pending,
@@ -595,8 +509,8 @@ exports.authorize = async (req, res) => {
             return fail(res, 409, 'ALREADY_LINKED');
         }
 
-        // Left pending on purpose: one of them can cancel a plan and tap again
-        // inside the same ten minutes.
+        // Left pending on purpose: one of them can cancel a plan and tap
+        // Accept again while the request is still waiting.
         if (await bothHavePlans(me, inviteeId)) return fail(res, 409, 'BOTH_HAVE_PLANS');
 
         // The flip. Guarded on `pending` and on the clock so a decline, a
@@ -660,7 +574,7 @@ exports.authorize = async (req, res) => {
         await pushQuietly(
             invitee,
             "You're linked",
-            `${firstNameOf(partnerSummary(inviter), 'They')} approved it. You both see the same parks now.`,
+            `${firstNameOf(partnerSummary(inviter), 'They')} accepted. You both see the same parks now.`,
             'active'
         );
     } catch (err) {
@@ -674,9 +588,8 @@ exports.authorize = async (req, res) => {
 /**
  * POST /api/account-link/decline  { userId, linkId }
  *
- * "Not them." The person who showed the code turns the scan away. The scanner
- * is told over the socket so their waiting screen goes back to the start; no
- * push — they are looking at the screen that would have told them.
+ * Decline. The sender is told over the socket so their waiting screen goes
+ * back to the number field; no push.
  */
 exports.decline = async (req, res) => {
     const me = idOf(req.callerUserId || req.body?.userId);
@@ -764,6 +677,8 @@ exports.unlink = async (req, res) => {
             return;
         }
 
+        // The sender's "Cancel request" — including one to a number with no
+        // account yet, which has nobody else to tell.
         const waiting = await AccountLink.find({ invitee: me, status: 'pending' }).lean();
         if (!waiting.length) return fail(res, 404, 'NOT_LINKED');
 
@@ -800,12 +715,11 @@ exports.unlink = async (req, res) => {
  * every 3 s while the panel is open. Everything is from the caller's point of
  * view:
  *
- *   none     — nothing out. An open code or a request past its time reads as
- *              none (and is marked expired on the way).
- *   open     — this caller's code is on screen, unscanned
- *   pending  — `pendingFrom` when somebody scanned THIS caller's code (show
- *              Authorize); `waitingFor` when this caller scanned somebody's
- *              (show the spinner)
+ *   none     — nothing out. A request past its time reads as none (and is
+ *              marked expired on the way).
+ *   pending  — `pendingFrom` (with their full number) when somebody asked THIS
+ *              caller (show Accept / Decline); `askedPhone` when this caller
+ *              asked somebody (show "Request sent")
  *   active   — `partner`
  *
  * `plan` is the household's plan and whose it is — 'self', 'partner' or null —
@@ -817,6 +731,9 @@ exports.status = async (req, res) => {
     const me = idOf(req.callerUserId || req.query?.userId);
     try {
         const now = new Date();
+        // A request sent to this number before the account existed is this
+        // account's to answer now.
+        await attachRequestsByPhone(me, now);
         const [link, household] = await Promise.all([
             currentLinkFor(me, now),
             getHouseholdSubscription(me, now),
@@ -836,20 +753,26 @@ exports.status = async (req, res) => {
             partner: null,
             pendingFrom: null,
             waitingFor: null,
+            askedPhone: null,
             plan,
         };
         if (!link) return res.status(200).json(answer);
 
         answer.status = link.status;
         answer.link = linkView(link, me);
+        // The sender sees the number they typed, and never the name behind
+        // it before an Accept.
+        if (link.status === 'pending' && answer.link.role === 'invitee') {
+            answer.askedPhone = link.requestedPhone || null;
+        }
 
         const otherId = otherMemberOf(link, me);
         if (otherId && (link.status === 'active' || link.status === 'pending')) {
             const people = await peopleById([otherId]);
             const other = partnerSummary(people.get(otherId));
+            // `waitingFor` stays null: see askedPhone.
             if (link.status === 'active') answer.partner = other;
-            else if (answer.link.role === 'inviter') answer.pendingFrom = other;
-            else answer.waitingFor = scannerView(other);
+            else if (answer.link.role === 'inviter') answer.pendingFrom = requesterView(people.get(otherId));
         }
 
         return res.status(200).json(answer);
@@ -920,8 +843,7 @@ exports.revokeLinksForDeletedAccount = async (io, user) => {
     }
 };
 
-// For the tests: the TTLs and the parser, so a case can be written against
-// the real numbers rather than copies of them.
-exports.TOKEN_TTL_MS = TOKEN_TTL_MS;
+// For the tests: the wait and the number parser, so a case can be written
+// against the real ones rather than copies of them.
 exports.PENDING_TTL_MS = PENDING_TTL_MS;
-exports.tokenFrom = tokenFrom;
+exports.normalizePhone = normalizePhone;

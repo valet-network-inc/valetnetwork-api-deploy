@@ -8,18 +8,21 @@ const mongoose = require('mongoose');
  * the other's parks. A plan held by either of them covers both, one park at a
  * time (services/accountLinks.js holds every rule that reads this).
  *
- * THE HANDSHAKE. Either phone shows a QR; the other scans it. Whoever SHOWED
- * the code is the inviter and taps Authorize — that tap is the one
- * verification step. So:
+ * THE HANDSHAKE (Nov 4: by phone number, replacing the Sep 23 QR code). One
+ * person types the other's number and sends a request; the person asked taps
+ * Accept — that tap is the one verification step. So:
  *
- *   open     — the inviter minted a code; nobody has scanned it
- *   pending  — someone scanned it (`invitee` set), waiting on Authorize
+ *   pending  — requested: `invitee` sent it, `inviter` is the one asked. The
+ *              asked number may not have an account yet: then `inviter` is
+ *              unset until that number signs up and reads its status.
  *   active   — linked
- *   revoked  — declined, unlinked by either side, or an account was deleted
- *   expired  — the code or the request ran out, or a newer code replaced it
+ *   revoked  — declined, withdrawn, unlinked by either side, or an account
+ *              was deleted
+ *   expired  — nobody answered in time, or a newer request replaced it
+ *   open     — a QR code on screen (Sep 23); no longer made
  *
- * The token in the QR is never stored, only its sha256, exactly as the
- * doorman share link does it (controllers/shareController.js).
+ * The field names are the Sep 23 ones: `inviter` is still the person who
+ * approves and `invitee` the person who waits.
  *
  * Deliberately no car on this document. A plan will later take a list of cars,
  * and that belongs on the plan, not on the pair.
@@ -27,12 +30,13 @@ const mongoose = require('mongoose');
 const AccountLinkSchema = new mongoose.Schema(
     {
         // Showed the QR; taps Authorize.
+        // Approves: the person a request was sent to. Unset while the number
+        // they were asked at has no account.
         inviter: {
             type: mongoose.Schema.Types.ObjectId,
             ref: 'User',
-            required: true,
         },
-        // Scanned it. Unset until the code is claimed.
+        // Sent the request, and waits for the answer.
         invitee: {
             type: mongoose.Schema.Types.ObjectId,
             ref: 'User',
@@ -56,6 +60,11 @@ const AccountLinkSchema = new mongoose.Schema(
         // settled, so a spent token can never be looked up again.
         tokenHash: { type: String },
         tokenExpiresAt: { type: Date },
+        // The number the request was sent to, E.164. Shown back to whoever
+        // sent it (never the name behind it before they accept), and how a
+        // request finds an account that signs up with that number later.
+        requestedPhone: { type: String },
+        // When the request was sent: the answer is due within PENDING_TTL_MS.
         claimedAt: { type: Date },
         authorizedAt: { type: Date },
         revokedAt: { type: Date },
@@ -73,6 +82,8 @@ AccountLinkSchema.index({ tokenHash: 1 }, { unique: true, sparse: true });
 // as a duplicate of the partial unique index below and skip building one.
 AccountLinkSchema.index({ inviter: 1, status: 1 });
 AccountLinkSchema.index({ invitee: 1, status: 1 });
+// Requests waiting on a number with no account yet.
+AccountLinkSchema.index({ requestedPhone: 1, status: 1 });
 
 // One active link per account, even under a race: two Authorize taps landing
 // together cannot both win.

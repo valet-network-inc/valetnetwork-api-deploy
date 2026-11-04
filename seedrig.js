@@ -7,14 +7,14 @@
  *   node seedrig.js job          <- a codes-OFF job: Marcus on the way to Rishi Test
  *   node seedrig.js job-codes    <- the same for Codes On (2-digit codes)
  *
- * Link account (Rishi Test + Alex Test, through the real API, so the phone
- * hears every step over its socket):
- *   node seedrig.js claim <code> <- Alex scans the code on Rishi's screen (the
- *                                   valetnyc://link/... text, or just the token)
- *   node seedrig.js invite       <- Alex shows a code; prints the deep link for
- *                                   `xcrun simctl openurl booted <link>`
- *   node seedrig.js authorize    <- Alex taps Authorize on a waiting request
- *   node seedrig.js link         <- all three at once: linked, no taps
+ * Link account by phone number (Rishi Test + Alex Test, through the real API,
+ * so the phone hears every step over its socket):
+ *   node seedrig.js request      <- Alex sends Rishi a request (Rishi's phone:
+ *                                   "Link with Alex?", Accept / Decline)
+ *   node seedrig.js approve      <- Alex accepts the request Rishi sent from the
+ *                                   phone (Rishi typed 555-555-0104)
+ *   node seedrig.js decline      <- Alex declines it
+ *   node seedrig.js link         <- linked, no taps
  *   node seedrig.js unlink       <- Rishi unlinks
  *   WHO=alex node seedrig.js parked  <- any job mode, on Alex instead
  *   WHO=alex node seedrig.js chat Hi <- a chat message from Alex (or Rishi) on the newest job
@@ -154,43 +154,30 @@ async function main() {
         const s = await asAlex('GET', `/api/account-link/status?userId=${partner._id}`);
         return s.json || {};
     };
-    if (mode === 'claim') {
-        const raw = process.argv[3] || '';
-        const token = (raw.match(/([A-Za-z0-9_-]{16,128})\/?$/) || [])[1];
-        if (!token) {
-            console.log('Usage: node seedrig.js claim <valetnyc://link/... or the token>');
-            return done();
-        }
-        const r = await asAlex('POST', '/api/account-link/claim', { userId: String(partner._id), token });
-        say('Alex scans the code', r);
+    if (mode === 'request') {
+        const r = await asAlex('POST', '/api/account-link/request', { userId: String(partner._id), phone: user.phone });
+        say(`Alex asks ${user.phone}`, r);
         return done();
     }
-    if (mode === 'invite') {
-        const r = await asAlex('POST', '/api/account-link/invite', { userId: String(partner._id) });
-        say('Alex shows a code', r);
-        if (r.json && r.json.token) console.log(`xcrun simctl openurl booted 'valetnyc://link/${r.json.token}'`);
-        return done();
-    }
-    if (mode === 'authorize') {
+    if (mode === 'approve' || mode === 'decline') {
         const s = await pendingFor();
-        if (s.status !== 'pending' || !s.link) {
+        if (s.status !== 'pending' || !s.link || s.link.role !== 'inviter') {
             console.log('Nothing waiting on Alex (status:', s.status || 'none', ')');
             return done();
         }
-        const r = await asAlex('POST', '/api/account-link/authorize', { userId: String(partner._id), linkId: String(s.link._id) });
-        say('Alex taps Authorize', r);
+        const r = await asAlex('POST', `/api/account-link/${mode === 'approve' ? 'authorize' : 'decline'}`, {
+            userId: String(partner._id),
+            linkId: String(s.link._id),
+        });
+        say(mode === 'approve' ? 'Alex taps Accept' : 'Alex taps Decline', r);
         return done();
     }
     if (mode === 'link') {
-        const inv = await asAlex('POST', '/api/account-link/invite', { userId: String(partner._id) });
-        say('Alex shows a code', inv);
-        if (!inv.json || !inv.json.token) return done();
-        const claim = await api(user, 'POST', '/api/account-link/claim', { userId: String(user._id), token: inv.json.token });
-        say('Rishi scans it', claim);
-        const s = await pendingFor();
-        if (!s.link) return done();
-        const ok = await asAlex('POST', '/api/account-link/authorize', { userId: String(partner._id), linkId: String(s.link._id) });
-        say('Alex taps Authorize', ok);
+        const sent = await asAlex('POST', '/api/account-link/request', { userId: String(partner._id), phone: user.phone });
+        say(`Alex asks ${user.phone}`, sent);
+        if (!sent.json || !sent.json.link) return done();
+        const ok = await api(user, 'POST', '/api/account-link/authorize', { userId: String(user._id), linkId: String(sent.json.link._id) });
+        say('Rishi taps Accept', ok);
         return done();
     }
     if (mode === 'unlink') {

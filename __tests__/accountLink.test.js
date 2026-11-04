@@ -97,6 +97,7 @@ const orderController = require('../controllers/orderController');
 const quoteController = require('../controllers/quoteController');
 const subscriptionController = require('../controllers/subscriptionController');
 const notificationController = require('../controllers/notificationController');
+const accountLinkController = require('../controllers/accountLinkController');
 const subscriptionService = require('../services/subscriptionService');
 const curbCustody = require('../services/curbCustody');
 const accountLinks = require('../services/accountLinks');
@@ -229,8 +230,7 @@ const post = (path, user, body = {}) =>
         .send({ userId: String(user._id), ...body });
 
 const api = {
-    invite: (u) => post('/invite', u),
-    claim: (u, token) => post('/claim', u, { token }),
+    request: (u, phone) => post('/request', u, { phone }),
     authorize: (u, linkId) => post('/authorize', u, { linkId: String(linkId) }),
     decline: (u, linkId) => post('/decline', u, { linkId: String(linkId) }),
     unlink: (u) => post('/unlink', u),
@@ -241,13 +241,11 @@ const api = {
             .set(...as(u)),
 };
 
-/** Show a code on `shower`'s phone, scan it on `scanner`'s, tap Authorize. */
-const linkByQr = async (shower, scanner) => {
-    const minted = await api.invite(shower);
-    expect(minted.statusCode).toBe(200);
-    const claimed = await api.claim(scanner, minted.body.token);
-    expect(claimed.statusCode).toBe(200);
-    const approved = await api.authorize(shower, claimed.body.link._id);
+/** `requester` types `approver`'s number and sends it; `approver` taps Accept. */
+const linkByPhone = async (approver, requester) => {
+    const sent = await api.request(requester, approver.phone);
+    expect(sent.statusCode).toBe(200);
+    const approved = await api.authorize(approver, sent.body.link._id);
     expect(approved.statusCode).toBe(200);
     return approved.body;
 };
@@ -364,41 +362,47 @@ afterEach(async () => {
 /* ========================================================================== */
 
 describe('the brief: tests to write', () => {
-    it('invite → claim → authorize yields one active link, and householdIds returns both ids for both', async () => {
+    it('request → accept yields one active link, and householdIds returns both ids for both', async () => {
         const alice = await makeUser({ firstName: 'Alice', lastName: 'Ames' });
         const peter = await makeUser({ firstName: 'Peter', lastName: 'Park' });
 
-        const minted = await api.invite(alice);
-        expect(minted.statusCode).toBe(200);
-        expect(minted.body.success).toBe(true);
-        // 32 random bytes, base64url: 43 characters and nothing to guess from.
-        expect(minted.body.token).toMatch(/^[A-Za-z0-9_-]{43}$/);
-        expect(new Date(minted.body.expiresAt).getTime()).toBeGreaterThan(Date.now());
-        // Only its hash is kept. A database read never yields a working code.
-        const stored = await AccountLink.findOne({ inviter: alice._id }).lean();
-        expect(stored.status).toBe('open');
-        expect(JSON.stringify(stored)).not.toContain(minted.body.token);
+        // Peter types Alice's number.
+        const sent = await api.request(peter, alice.phone);
+        expect(sent.statusCode).toBe(200);
+        expect(sent.body.success).toBe(true);
+        expect(sent.body.link).toMatchObject({ status: 'pending', role: 'invitee' });
+        expect(sent.body.link.expiresAt).toBeTruthy();
+        // Back comes the number he typed, and nothing about whose it is.
+        expect(sent.body.askedPhone).toBe(alice.phone);
+        expect(JSON.stringify(sent.body)).not.toContain('Alice');
 
-        const claimed = await api.claim(peter, minted.body.token);
-        expect(claimed.statusCode).toBe(200);
-        expect(claimed.body.link).toMatchObject({ status: 'pending', role: 'invitee' });
-        expect(claimed.body.link.expiresAt).toBeTruthy();
-        expect(claimed.body.waitingFor.firstName).toBe('Alice');
-
-        // The phone that showed the code hears about the scan, live and by push.
+        // Alice hears about it, live and by push, with Peter's name and number.
         const requested = emitsTo(alice, 'accountLink:requested');
         expect(requested).toHaveLength(1);
-        expect(requested[0].payload.from.firstName).toBe('Peter');
+        expect(requested[0].payload.from).toMatchObject({ firstName: 'Peter', phone: peter.phone });
         expect(requested[0].payload.link.role).toBe('inviter');
         expect(pushes).toHaveBeenCalledWith(
             alice.firebaseUid,
-            'Someone scanned your code',
-            'Peter wants to link. Open Profile → Link account to approve.',
+            'Link request',
+            'Peter wants to link accounts. Open Profile → Link account to answer.',
             { type: 'accountLink', linkStatus: 'pending' }
         );
 
+        // Alice decides; Peter waits on the number he typed.
+        const aliceSees = await api.status(alice);
+        expect(aliceSees.body).toMatchObject({ status: 'pending', askedPhone: null, waitingFor: null });
+        expect(aliceSees.body.pendingFrom).toMatchObject({ firstName: 'Peter', lastName: 'Park', phone: peter.phone });
+        const peterSees = await api.status(peter);
+        expect(peterSees.body).toMatchObject({
+            status: 'pending',
+            askedPhone: alice.phone,
+            pendingFrom: null,
+            waitingFor: null,
+            partner: null,
+        });
+
         pushes.mockClear();
-        const approved = await api.authorize(alice, claimed.body.link._id);
+        const approved = await api.authorize(alice, sent.body.link._id);
         expect(approved.statusCode).toBe(200);
         expect(approved.body.link).toMatchObject({ status: 'active', role: 'inviter' });
         expect(approved.body.link.authorizedAt).toBeTruthy();
@@ -411,7 +415,7 @@ describe('the brief: tests to write', () => {
         expect(links[0].members.map(String).sort()).toEqual(
             [String(alice._id), String(peter._id)].sort()
         );
-        expect(links[0].tokenHash).toBeUndefined();
+        expect(links[0].requestedPhone).toBe(alice.phone);
 
         // Own id first, then the partner's — from both sides.
         expect(await accountLinks.householdIds(alice._id)).toEqual([
@@ -436,111 +440,119 @@ describe('the brief: tests to write', () => {
         expect(pushes).toHaveBeenCalledWith(
             peter.firebaseUid,
             "You're linked",
-            'Alice approved it. You both see the same parks now.',
+            'Alice accepted. You both see the same parks now.',
             { type: 'accountLink', linkStatus: 'active' }
         );
     });
-
-    it('minting a second invite expires the first token; the first then 404s on claim', async () => {
+    it("a second request replaces the first; the first one's Accept is then NOT_PENDING", async () => {
         const alice = await makeUser({ firstName: 'Alice' });
+        const carol = await makeUser({ firstName: 'Carol' });
         const peter = await makeUser({ firstName: 'Peter' });
 
-        const first = await api.invite(alice);
-        const second = await api.invite(alice);
+        const first = await api.request(peter, alice.phone);
+        const second = await api.request(peter, carol.phone);
         expect(second.statusCode).toBe(200);
-        expect(second.body.token).not.toBe(first.body.token);
 
-        const stale = await api.claim(peter, first.body.token);
-        expect(stale.statusCode).toBe(404);
-        expect(stale.body).toMatchObject({ success: false, code: 'INVALID' });
+        // One request out at a time: the first is retired, and Alice is told.
+        const rows = await AccountLink.find({ invitee: peter._id }).sort({ _id: 1 }).lean();
+        expect(rows.map((r) => r.status)).toEqual(['expired', 'pending']);
+        expect(emitsTo(alice, 'accountLink:declined')).toHaveLength(1);
 
-        // One live code at a time: the replaced one is expired on the record.
-        const rows = await AccountLink.find({ inviter: alice._id }).sort({ _id: 1 }).lean();
-        expect(rows.map((r) => r.status)).toEqual(['expired', 'open']);
+        const stale = await api.authorize(alice, first.body.link._id);
+        expect(stale.statusCode).toBe(409);
+        expect(stale.body.code).toBe('NOT_PENDING');
+        expect((await api.status(alice)).body.status).toBe('none');
 
-        const fresh = await api.claim(peter, second.body.token);
+        const fresh = await api.authorize(carol, second.body.link._id);
         expect(fresh.statusCode).toBe(200);
     });
-
-    it('expired token → 410; self-claim → 400; claim by an already-linked user → 409 ALREADY_LINKED', async () => {
+    it("own number → 400 SELF_LINK; not a number → 400 BAD_PHONE; a linked sender → 409; the sender learns nothing about the number", async () => {
         const alice = await makeUser({ firstName: 'Alice' });
-        const peter = await makeUser({ firstName: 'Peter' });
         const carol = await makeUser({ firstName: 'Carol' });
         const dan = await makeUser({ firstName: 'Dan' });
+        const val = await makeUser({ firstName: 'Val', isValet: true });
 
-        // Expired: the code ran out before anyone scanned it.
-        const old = await api.invite(alice);
-        await AccountLink.updateOne(
-            { inviter: alice._id, status: 'open' },
-            { $set: { tokenExpiresAt: new Date(Date.now() - 1000) } }
-        );
-        const expired = await api.claim(peter, old.body.token);
-        expect(expired.statusCode).toBe(410);
-        expect(expired.body).toMatchObject({
-            success: false,
-            code: 'EXPIRED',
-            message: 'That code has expired. Ask them to open Link account again.',
-        });
-
-        // Self: scanning the code on your own screen.
-        const own = await api.invite(alice);
-        const self = await api.claim(alice, own.body.token);
+        // Her own number, however she types it.
+        const d = alice.phone.replace(/\D/g, '').slice(-10);
+        const self = await api.request(alice, `(${d.slice(0, 3)}) ${d.slice(3, 6)}-${d.slice(6)}`);
         expect(self.statusCode).toBe(400);
-        expect(self.body).toMatchObject({ code: 'SELF_LINK', message: "That's your own code." });
+        expect(self.body).toMatchObject({ code: 'SELF_LINK', message: "That's your own number." });
 
-        // Already linked: pairs only.
-        await linkByQr(carol, dan);
-        const alices = await api.invite(alice);
-        const taken = await api.claim(dan, alices.body.token);
-        expect(taken.statusCode).toBe(409);
-        expect(taken.body).toMatchObject({
+        // Not a phone number.
+        for (const bad of ['', '12345', 'call me', '+1']) {
+            const r = await api.request(alice, bad);
+            expect(r.statusCode).toBe(400);
+            expect(r.body).toMatchObject({ code: 'BAD_PHONE', message: 'Enter their full phone number.' });
+        }
+
+        // A linked sender: pairs only.
+        await linkByPhone(carol, dan);
+        const linkedSender = await api.request(dan, alice.phone);
+        expect(linkedSender.statusCode).toBe(409);
+        expect(linkedSender.body).toMatchObject({
             code: 'ALREADY_LINKED',
             message: 'That account is already linked with someone.',
         });
-        // …and a linked account cannot show a code either.
-        const linkedInvite = await api.invite(carol);
-        expect(linkedInvite.statusCode).toBe(409);
-        expect(linkedInvite.body.code).toBe('ALREADY_LINKED');
+
+        // Whatever is behind the number — someone already linked, a valet,
+        // nobody at all — the sender gets the same answer.
+        io = mockIo();
+        pushes.mockClear();
+        const shape = (r) => ({
+            statusCode: r.statusCode,
+            keys: Object.keys(r.body).sort(),
+            link: { status: r.body.link.status, role: r.body.link.role },
+        });
+        const toLinked = await api.request(alice, carol.phone);
+        const toValet = await api.request(alice, val.phone);
+        const toNobody = await api.request(alice, '+12125550199');
+        expect(shape(toLinked)).toEqual(shape(toNobody));
+        expect(shape(toValet)).toEqual(shape(toNobody));
+        expect(toNobody.body.askedPhone).toBe('+12125550199');
+
+        // …and nobody behind those numbers was told anything: Carol is linked,
+        // Val is a valet.
+        expect(emitsTo(carol, 'accountLink:requested')).toHaveLength(0);
+        expect(emitsTo(val, 'accountLink:requested')).toHaveLength(0);
+        expect(pushes).not.toHaveBeenCalled();
 
         expect(await AccountLink.countDocuments({ status: 'active' })).toBe(1);
     });
-
-    it('both hold a live plan → 409 BOTH_HAVE_PLANS on claim, and on authorize when the plan was bought after the scan', async () => {
+    it('both hold a live plan → 409 BOTH_HAVE_PLANS at Accept, never at the request (that would tell a stranger the number has a plan)', async () => {
         const both = 'You both have a plan. One of you has to cancel theirs first.';
 
-        // At the scan.
         const alice = await makeUser({ firstName: 'Alice' });
         const peter = await makeUser({ firstName: 'Peter' });
         await makePlan(alice);
         await makePlan(peter, streetCleaning);
-        const minted = await api.invite(alice);
-        const refused = await api.claim(peter, minted.body.token);
+        const sent = await api.request(peter, alice.phone);
+        expect(sent.statusCode).toBe(200);
+        const refused = await api.authorize(alice, sent.body.link._id);
         expect(refused.statusCode).toBe(409);
         expect(refused.body).toMatchObject({ code: 'BOTH_HAVE_PLANS', message: both });
+        // Left waiting: one of them can cancel a plan and Accept again.
+        expect((await AccountLink.findById(sent.body.link._id).lean()).status).toBe('pending');
 
-        // Between the scan and the tap.
+        // Bought between the request and the tap.
         const carol = await makeUser({ firstName: 'Carol' });
         const dan = await makeUser({ firstName: 'Dan' });
         await makePlan(carol);
-        const code = await api.invite(carol);
-        const claimed = await api.claim(dan, code.body.token);
-        expect(claimed.statusCode).toBe(200);
+        const asked = await api.request(dan, carol.phone);
+        expect(asked.statusCode).toBe(200);
         await makePlan(dan, streetCleaning);
 
-        const late = await api.authorize(carol, claimed.body.link._id);
+        const late = await api.authorize(carol, asked.body.link._id);
         expect(late.statusCode).toBe(409);
         expect(late.body).toMatchObject({ code: 'BOTH_HAVE_PLANS', message: both });
 
         expect(await AccountLink.countDocuments({ status: 'active' })).toBe(0);
         expect(await accountLinks.householdIds(carol._id)).toEqual([String(carol._id)]);
     });
-
     it('two concurrent authorizes cannot produce two active links for one user', async () => {
         // The double tap: one request, Authorize landing twice.
         const alice = await makeUser({ firstName: 'Alice' });
         const peter = await makeUser({ firstName: 'Peter' });
-        const minted = await api.invite(alice);
-        const claimed = await api.claim(peter, minted.body.token);
+        const claimed = await api.request(peter, alice.phone);
         const taps = await Promise.all([
             api.authorize(alice, claimed.body.link._id),
             api.authorize(alice, claimed.body.link._id),
@@ -572,8 +584,8 @@ describe('the brief: tests to write', () => {
         expect(emitsTo(peter, 'accountLink:declined')).toHaveLength(0);
 
         // Two different requests on one account, approved in the same second.
-        // The API retires a scanner's earlier request when they scan again, so
-        // this is the state a race between two scans leaves behind.
+        // The API retires a sender's earlier request when they send another,
+        // so this is the state a race between two sends leaves behind.
         const carol = await makeUser({ firstName: 'Carol' });
         const dan = await makeUser({ firstName: 'Dan' });
         const erin = await makeUser({ firstName: 'Erin' });
@@ -620,7 +632,7 @@ describe('the brief: tests to write', () => {
         const alice = await makeUser({ firstName: 'Alice' });
         const peter = await makeUser({ firstName: 'Peter' });
         await saveCar(alice, { color: 'Blue', model: 'Honda Civic', licensePlate: 'abc1234' });
-        const approved = await linkByQr(peter, alice); // Peter showed, Alice scanned
+        const approved = await linkByPhone(peter, alice); // Alice asked, Peter accepted
         const civic = { color: 'Blue', model: 'Honda Civic', licensePlate: 'ABC1234' };
         expect(await carOf(peter)).toEqual(civic);
         expect(await carOf(alice)).toEqual(civic);
@@ -635,14 +647,14 @@ describe('the brief: tests to write', () => {
         const dan = await makeUser({ firstName: 'Dan' });
         await saveCar(carol, { color: 'Red', model: 'Mini', licensePlate: 'CAR0001' });
         await saveCar(dan, { color: 'Black', model: 'Volvo', licensePlate: 'DAN0002' });
-        await linkByQr(carol, dan);
+        await linkByPhone(carol, dan);
         expect(await carOf(carol)).toEqual({ color: 'Red', model: 'Mini', licensePlate: 'CAR0001' });
         expect(await carOf(dan)).toEqual({ color: 'Black', model: 'Volvo', licensePlate: 'DAN0002' });
 
         // Neither has one: nothing is invented.
         const erin = await makeUser({ firstName: 'Erin' });
         const finn = await makeUser({ firstName: 'Finn' });
-        const bare = await linkByQr(erin, finn);
+        const bare = await linkByPhone(erin, finn);
         expect(bare.vehicle).toBeNull();
         expect(await carOf(erin)).toBeUndefined();
         expect(await carOf(finn)).toBeUndefined();
@@ -652,7 +664,7 @@ describe('the brief: tests to write', () => {
         const ann = await makeUser({ firstName: 'Ann' });
         const bob = await makeUser({ firstName: 'Bob' });
         const plan = await makePlan(ann);
-        await linkByQr(ann, bob);
+        await linkByPhone(ann, bob);
 
         const { req, passed } = await validate({ customer: String(bob._id) });
         expect(passed).toBe(true);
@@ -673,7 +685,7 @@ describe('the brief: tests to write', () => {
         const ann = await makeUser({ firstName: 'Ann' });
         const bob = await makeUser({ firstName: 'Bob' });
         const plan = await makePlan(ann, streetCleaning);
-        await linkByQr(ann, bob);
+        await linkByPhone(ann, bob);
 
         const annsMove = await book(ann, aspMove);
         expect(annsMove.res.body.coveredBySubscription).toBe(true);
@@ -713,7 +725,7 @@ describe('the brief: tests to write', () => {
         const ann = await makeUser({ firstName: 'Ann' });
         const bob = await makeUser({ firstName: 'Bob' });
         const plan = await makePlan(ann); // Fixed garage: one free park a day
-        await linkByQr(ann, bob);
+        await linkByPhone(ann, bob);
 
         expect(await subscriptionService.freeParksUsedToday(plan)).toBe(0);
         const bobsPark = await book(bob);
@@ -735,7 +747,7 @@ describe('the brief: tests to write', () => {
         const ann = await makeUser({ firstName: 'Ann' });
         const bob = await makeUser({ firstName: 'Bob' });
         const plan = await makePlan(ann);
-        await linkByQr(ann, bob);
+        await linkByPhone(ann, bob);
 
         const status = mockRes();
         await subscriptionController.getSubscriptionStatus({ params: { userId: String(bob._id) } }, status);
@@ -788,7 +800,7 @@ describe('the brief: tests to write', () => {
         const ann = await makeUser({ firstName: 'Ann' });
         const bob = await makeUser({ firstName: 'Bob' });
         const plan = await makePlan(ann);
-        await linkByQr(ann, bob);
+        await linkByPhone(ann, bob);
 
         // Bob's covered park, now with the valet.
         const bobsPark = await book(bob);
@@ -823,7 +835,7 @@ describe('the brief: tests to write', () => {
         expect(after.updatedAt.getTime()).toBe(before.updatedAt.getTime());
 
         // The holder unlinks.
-        await linkByQr(bob, ann);
+        await linkByPhone(bob, ann);
         expect((await quote(bob)).plan).toMatchObject({ tier: 'home_garage' });
         const byAnn = await api.unlink(ann);
         expect(byAnn.statusCode).toBe(200);
@@ -843,7 +855,7 @@ describe('the brief: tests to write', () => {
     it("hasActiveOrder for B returns A's live order with own-first ordering; getOrdersByUser for B includes A's history", async () => {
         const a = await makeUser({ firstName: 'Ann' });
         const b = await makeUser({ firstName: 'Bob' });
-        await linkByQr(a, b);
+        await linkByPhone(a, b);
 
         const active = async (user) => {
             const res = mockRes();
@@ -892,7 +904,7 @@ describe('the brief: tests to write', () => {
         const ann = await makeUser({ firstName: 'Ann' });
         const bob = await makeUser({ firstName: 'Bob' });
         const stranger = await makeUser({ firstName: 'Zed' });
-        await linkByQr(ann, bob);
+        await linkByPhone(ann, bob);
         const annsPark = await makeOrder(ann);
 
         const gate = requireOrderOwner();
@@ -936,7 +948,7 @@ describe('the brief: tests to write', () => {
         const ann = await makeUser({ firstName: 'Ann' });
         const bob = await makeUser({ firstName: 'Bob' });
         await makePlan(ann, streetCleaning);
-        await linkByQr(ann, bob);
+        await linkByPhone(ann, bob);
 
         const annsMove = await book(ann, aspMove);
         expect(annsMove.res.body.coveredBySubscription).toBe(true);
@@ -969,7 +981,7 @@ describe('the brief: tests to write', () => {
         const ann = await makeUser({ firstName: 'Ann' });
         const bob = await makeUser({ firstName: 'Bob' });
         await makePlan(ann);
-        await linkByQr(ann, bob);
+        await linkByPhone(ann, bob);
         pushes.mockClear();
 
         const res = mockRes();
@@ -996,7 +1008,7 @@ describe('the brief: tests to write', () => {
         expect(await accountLinks.householdIds(bob._id)).toEqual([String(bob._id)]);
         // Bob is free to link with somebody else.
         const carol = await makeUser({ firstName: 'Carol' });
-        await linkByQr(carol, bob);
+        await linkByPhone(carol, bob);
     });
 });
 
@@ -1015,7 +1027,7 @@ describe('what the other person may see', () => {
             profileImage: 'https://example.com/ann.jpg',
         });
         const bob = await makeUser({ firstName: 'Bob' });
-        await linkByQr(ann, bob);
+        await linkByPhone(ann, bob);
 
         await makeOrder(ann, { status: 'parked' });
         await makeOrder(ann, { status: 'completed', pickUpTime: new Date(Date.now() - DAY) });
@@ -1085,11 +1097,14 @@ describe('what the other person may see', () => {
         await saveCar(alice);
         await makePlan(alice);
 
-        const TOP_KEYS = ['link', 'partner', 'pendingFrom', 'plan', 'status', 'success', 'waitingFor'];
+        const TOP_KEYS = ['askedPhone', 'link', 'partner', 'pendingFrom', 'plan', 'status', 'success', 'waitingFor'];
         const LINK_KEYS = ['_id', 'authorizedAt', 'expiresAt', 'role', 'status'];
-        const noSecrets = (body, other) => {
+        // `phoneOk`: the one place a full number is meant to show — the
+        // sender's, to the person deciding on their request, and the number
+        // the sender typed, back to them.
+        const noSecrets = (body, other, phoneOk = false) => {
             const text = JSON.stringify(body);
-            expect(text).not.toContain(other.phone.replace(/\D/g, '').slice(-10));
+            if (!phoneOk) expect(text).not.toContain(other.phone.replace(/\D/g, '').slice(-10));
             expect(text).not.toContain(other.firebaseUid);
             expect(text).not.toContain('cus_');
             expect(text).not.toContain('sub_');
@@ -1101,43 +1116,39 @@ describe('what the other person may see', () => {
         expect(Object.keys(s.body).sort()).toEqual(TOP_KEYS);
         expect(s.body).toMatchObject({ status: 'none', link: null, partner: null, pendingFrom: null, waitingFor: null });
 
-        // Alice's code is on her screen.
-        const minted = await api.invite(alice);
+        // Peter sends Alice a request. Alice sees who is asking, with the
+        // number they signed in with; Peter sees the number he typed and
+        // nothing else.
+        const claimed = await api.request(peter, alice.phone);
         s = await api.status(alice);
-        expect(s.body.status).toBe('open');
+        expect(Object.keys(s.body).sort()).toEqual(TOP_KEYS);
+        expect(s.body.status).toBe('pending');
         expect(Object.keys(s.body.link).sort()).toEqual(LINK_KEYS);
         expect(s.body.link.role).toBe('inviter');
         expect(s.body.link.expiresAt).toBeTruthy();
         expect(s.body.plan).toEqual({ heldBy: 'self', tier: 'home_garage', name: 'Permanent valet' });
-        expect(JSON.stringify(s.body)).not.toContain(minted.body.token);
-
-        // Peter scanned it. Alice sees who is asking; Peter sees who he is waiting on.
-        const claimed = await api.claim(peter, minted.body.token);
-        s = await api.status(alice);
-        expect(s.body.status).toBe('pending');
-        expect(s.body.link.role).toBe('inviter');
         expect(s.body.partner).toBeNull();
         expect(s.body.waitingFor).toBeNull();
-        expect(Object.keys(s.body.pendingFrom).sort()).toEqual(SUMMARY_KEYS);
-        expect(s.body.pendingFrom).toMatchObject({ _id: String(peter._id), firstName: 'Peter', phoneMasked: '0222' });
-        noSecrets(s.body, peter);
+        expect(s.body.askedPhone).toBeNull();
+        expect(Object.keys(s.body.pendingFrom).sort()).toEqual([...SUMMARY_KEYS, 'phone'].sort());
+        expect(s.body.pendingFrom).toMatchObject({
+            _id: String(peter._id),
+            firstName: 'Peter',
+            phoneMasked: '0222',
+            phone: '+12125550222',
+        });
+        noSecrets(s.body, peter, true);
 
         s = await api.status(peter);
         expect(s.body.status).toBe('pending');
         expect(s.body.link.role).toBe('invitee');
         expect(s.body.partner).toBeNull();
         expect(s.body.pendingFrom).toBeNull();
-        expect(Object.keys(s.body.waitingFor).sort()).toEqual(SUMMARY_KEYS);
-        // Before Authorize the scanner learns a first name and nothing else:
-        // they may have photographed the code off somebody's screen.
-        expect(s.body.waitingFor).toEqual({
-            _id: String(alice._id),
-            firstName: 'Alice',
-            lastName: '',
-            profileImage: null,
-            phoneMasked: '',
-        });
-        noSecrets(s.body, alice);
+        expect(s.body.waitingFor).toBeNull();
+        expect(s.body.askedPhone).toBe('+12125550111');
+        // Before Accept the sender learns nothing about whose number it is.
+        expect(JSON.stringify(s.body)).not.toContain('Alice');
+        noSecrets(s.body, alice, true);
 
         // Linked.
         await api.authorize(alice, claimed.body.link._id);
@@ -1155,15 +1166,17 @@ describe('what the other person may see', () => {
         expect(s.body.partner.firstName).toBe('Peter');
         noSecrets(s.body, peter);
 
-        // Every socket payload the handshake sent is held to the same rule.
+        // Every socket payload the handshake sent is held to the same rule,
+        // the request's `from` carrying the sender's number on purpose.
         for (const e of io.emits) {
             const other = e.room === String(alice._id) ? peter : alice;
             const text = JSON.stringify(e.payload);
             expect(text).not.toContain(other.firebaseUid);
-            expect(text).not.toContain(other.phone.replace(/\D/g, '').slice(-10));
-            for (const key of ['from', 'partner']) {
-                if (e.payload[key]) expect(Object.keys(e.payload[key]).sort()).toEqual(SUMMARY_KEYS);
+            if (e.event !== 'accountLink:requested') {
+                expect(text).not.toContain(other.phone.replace(/\D/g, '').slice(-10));
             }
+            if (e.payload.partner) expect(Object.keys(e.payload.partner).sort()).toEqual(SUMMARY_KEYS);
+            if (e.payload.from) expect(Object.keys(e.payload.from).sort()).toEqual([...SUMMARY_KEYS, 'phone'].sort());
         }
 
         // Asking about somebody else's panel is the gate's 403, not their panel.
@@ -1186,7 +1199,7 @@ describe('what the other person may see', () => {
             trialEndsAt: new Date(Date.now() + 5 * DAY),
             payments: [{ invoiceId: 'in_ann', amountCents: 25000, paidAt: new Date() }],
         });
-        await linkByQr(ann, bob);
+        await linkByPhone(ann, bob);
 
         const res = mockRes();
         await subscriptionController.getSubscriptionStatus({ params: { userId: String(bob._id) } }, res);
@@ -1256,101 +1269,104 @@ describe('what the other person may see', () => {
 });
 
 describe('the handshake, the ways it can go sideways', () => {
-    it('claim accepts the full valetnyc://link/<token> string', async () => {
-        const alice = await makeUser({ firstName: 'Alice' });
+    it('a request to a number with no account waits, and becomes theirs to answer when that number signs up', async () => {
         const peter = await makeUser({ firstName: 'Peter' });
-        const minted = await api.invite(alice);
 
-        // Exactly what the QR encodes, and what the iPhone Camera app hands over.
-        const claimed = await api.claim(peter, `valetnyc://link/${minted.body.token}`);
-        expect(claimed.statusCode).toBe(200);
-        expect(claimed.body.link).toMatchObject({ status: 'pending', role: 'invitee' });
+        // Typed the way people type a number.
+        const sent = await api.request(peter, '(917) 555-0188');
+        expect(sent.statusCode).toBe(200);
+        expect(sent.body.askedPhone).toBe('+19175550188');
+        const row = await AccountLink.findById(sent.body.link._id).lean();
+        expect(row).toMatchObject({ status: 'pending', requestedPhone: '+19175550188' });
+        expect(row.inviter).toBeUndefined();
+        expect((await api.status(peter)).body).toMatchObject({ status: 'pending', askedPhone: '+19175550188' });
 
-        // A camera firing twice on the same code is the same answer, not INVALID.
-        const twice = await api.claim(peter, minted.body.token);
-        expect(twice.statusCode).toBe(200);
-        expect(twice.body.link._id).toBe(claimed.body.link._id);
+        // Someone signs up with that number: their first status read finds it.
+        const nina = await makeUser({ firstName: 'Nina', phone: '+19175550188' });
+        const s = await api.status(nina);
+        expect(s.body.status).toBe('pending');
+        expect(s.body.link.role).toBe('inviter');
+        expect(s.body.pendingFrom).toMatchObject({ firstName: 'Peter', phone: peter.phone });
 
-        // Anybody else holding the same code is told nothing about it.
-        const carol = await makeUser({ firstName: 'Carol' });
-        const third = await api.claim(carol, `valetnyc://link/${minted.body.token}`);
-        expect(third.statusCode).toBe(404);
-        expect(third.body.code).toBe('INVALID');
+        const ok = await api.authorize(nina, s.body.link._id);
+        expect(ok.statusCode).toBe(200);
+        expect(await accountLinks.householdIds(peter._id)).toEqual([String(peter._id), String(nina._id)]);
 
-        // Something that is not a code at all.
-        const junk = await api.claim(carol, 'valetnyc://link/');
-        expect(junk.statusCode).toBe(404);
-        expect(junk.body.code).toBe('INVALID');
+        // Phone numbers as they come.
+        const { normalizePhone } = accountLinkController;
+        expect(normalizePhone('718-555-0142')).toBe('+17185550142');
+        expect(normalizePhone('1 718 555 0142')).toBe('+17185550142');
+        expect(normalizePhone('+44 20 7946 0958')).toBe('+442079460958');
+        expect(normalizePhone('555-0142')).toBeNull();
     });
-
-    it("the invitee's Cancel (POST /unlink on a pending link) revokes it; decline by a non-inviter is refused", async () => {
+    it("the sender's Cancel request (POST /unlink on a pending link) revokes it; only the person asked can Decline or Accept", async () => {
         const alice = await makeUser({ firstName: 'Alice' });
         const peter = await makeUser({ firstName: 'Peter' });
         const stranger = await makeUser({ firstName: 'Zed' });
 
-        const minted = await api.invite(alice);
-        const claimed = await api.claim(peter, minted.body.token);
-        const linkId = claimed.body.link._id;
+        const sent = await api.request(peter, alice.phone);
+        const linkId = sent.body.link._id;
 
-        // Only the one who showed the code can say "Not them".
-        const byScanner = await api.decline(peter, linkId);
-        expect(byScanner.statusCode).toBe(403);
-        expect(byScanner.body.success).toBe(false);
+        // Only the person asked can Decline…
+        const bySender = await api.decline(peter, linkId);
+        expect(bySender.statusCode).toBe(403);
+        expect(bySender.body.success).toBe(false);
         const byStranger = await api.decline(stranger, linkId);
         expect(byStranger.statusCode).toBe(403);
-        // …or Authorize.
+        // …or Accept.
         const selfApprove = await api.authorize(peter, linkId);
         expect(selfApprove.statusCode).toBe(403);
         expect((await AccountLink.findById(linkId).lean()).status).toBe('pending');
 
-        // Peter taps Cancel on his waiting screen.
+        // Peter taps Cancel request on his waiting screen.
         const cancelled = await api.unlink(peter);
         expect(cancelled.statusCode).toBe(200);
         const row = await AccountLink.findById(linkId).lean();
         expect(row.status).toBe('revoked');
         expect(String(row.revokedBy)).toBe(String(peter._id));
-        // Alice's Authorize card goes back to the QR.
+        // Alice's Accept screen goes away.
         const declined = emitsTo(alice, 'accountLink:declined');
         expect(declined).toHaveLength(1);
         expect(declined[0].payload.link._id).toBe(linkId);
-        // A withdrawn request is no push: Alice is looking at the card.
-        expect(pushes).toHaveBeenCalledTimes(1); // the scan's, and only that
+        // A withdrawn request is no push.
+        expect(pushes).toHaveBeenCalledTimes(1); // the request's, and only that
 
-        // Nothing left to approve.
+        // Nothing left to accept.
         const late = await api.authorize(alice, linkId);
         expect(late.statusCode).toBe(409);
         expect(late.body.code).toBe('NOT_PENDING');
         expect((await api.status(alice)).body.status).toBe('none');
         expect((await api.status(peter)).body.status).toBe('none');
 
-        // And "Not them" from the right person does what it says.
-        const again = await api.invite(alice);
-        const rescan = await api.claim(peter, again.body.token);
-        const notThem = await api.decline(alice, rescan.body.link._id);
-        expect(notThem.statusCode).toBe(200);
-        expect((await AccountLink.findById(rescan.body.link._id).lean()).status).toBe('revoked');
+        // And Decline from the right person does what it says.
+        const again = await api.request(peter, alice.phone);
+        const no = await api.decline(alice, again.body.link._id);
+        expect(no.statusCode).toBe(200);
+        expect((await AccountLink.findById(again.body.link._id).lean()).status).toBe('revoked');
         expect(emitsTo(peter, 'accountLink:declined')).toHaveLength(1);
-    });
 
-    it('a request nobody approves within ten minutes reads as none on both phones', async () => {
+        // A request to a number with no account can be withdrawn too.
+        const toNobody = await api.request(peter, '+12125550177');
+        expect((await api.unlink(peter)).statusCode).toBe(200);
+        expect((await AccountLink.findById(toNobody.body.link._id).lean()).status).toBe('revoked');
+    });
+    it('a request nobody answers within seven days reads as none on both phones', async () => {
         const alice = await makeUser({ firstName: 'Alice' });
         const peter = await makeUser({ firstName: 'Peter' });
-        const minted = await api.invite(alice);
-        const claimed = await api.claim(peter, minted.body.token);
+        const sent = await api.request(peter, alice.phone);
 
         await AccountLink.updateOne(
-            { _id: claimed.body.link._id },
-            { $set: { claimedAt: new Date(Date.now() - 11 * 60 * 1000) } }
+            { _id: sent.body.link._id },
+            { $set: { claimedAt: new Date(Date.now() - accountLinkController.PENDING_TTL_MS - 60 * 1000) } }
         );
 
         expect((await api.status(alice)).body.status).toBe('none');
         expect((await api.status(peter)).body.status).toBe('none');
-        const late = await api.authorize(alice, claimed.body.link._id);
+        const late = await api.authorize(alice, sent.body.link._id);
         expect(late.statusCode).toBe(409);
         expect(late.body.code).toBe('NOT_PENDING');
         expect(await AccountLink.countDocuments({ status: 'active' })).toBe(0);
     });
-
     it('the unique indexes alone refuse a second active link when the pre-check is raced past (E11000 → 409 ALREADY_LINKED)', async () => {
         const carol = await makeUser({ firstName: 'Carol' });
         const dan = await makeUser({ firstName: 'Dan' });
@@ -1393,7 +1409,7 @@ describe('the handshake, the ways it can go sideways', () => {
 
         expect(await AccountLink.countDocuments({ members: dan._id, status: 'active' })).toBe(1);
         // The request that can never succeed is taken off the table, and the
-        // scanner's waiting screen is told.
+        // sender's waiting screen is told.
         expect((await AccountLink.findById(pending._id).lean()).status).toBe('expired');
         expect(emitsTo(dan, 'accountLink:declined')).toHaveLength(1);
     });
@@ -1404,7 +1420,7 @@ describe("acting on the other one's park", () => {
         const ann = await makeUser({ firstName: 'Ann' });
         const bob = await makeUser({ firstName: 'Bob' });
         const stranger = await makeUser({ firstName: 'Zed' });
-        await linkByQr(ann, bob);
+        await linkByPhone(ann, bob);
         const annsPark = await makeOrder(ann, {
             serviceType: 'park-and-hold',
             paymentIntentId: 'pi_ann_park',
@@ -1455,7 +1471,7 @@ describe("acting on the other one's park", () => {
         const ann = await makeUser({ firstName: 'Ann' });
         const bob = await makeUser({ firstName: 'Bob' });
         const plan = await makePlan(ann); // Fixed garage: we hold the car
-        await linkByQr(ann, bob);
+        await linkByPhone(ann, bob);
 
         // Ann's covered park from two days ago. Its order is completed — the
         // valet closed it out — but the car is still ours on the street.
@@ -1516,7 +1532,7 @@ describe("acting on the other one's park", () => {
         await accountLinks.emitToHousehold(alone, ann._id, 'orderUpdated', annsPark);
         expect(alone.emits.map((e) => e.room)).toEqual([String(ann._id)]);
 
-        await linkByQr(ann, bob);
+        await linkByPhone(ann, bob);
 
         // Linked: the booker first, then the partner.
         const both = mockIo();
@@ -1548,7 +1564,7 @@ describe('the one-park rule at its edges, and what a partner never holds', () =>
         const ann = await makeUser({ firstName: 'Ann' });
         const bob = await makeUser({ firstName: 'Bob' });
         const plan = await makePlan(ann, streetCleaning);
-        await linkByQr(ann, bob);
+        await linkByPhone(ann, bob);
 
         // Ann's covered move, booked ahead for three days from now.
         const annsMove = await makeOrder(ann, {
@@ -1581,7 +1597,7 @@ describe('the one-park rule at its edges, and what a partner never holds', () =>
         const ann = await makeUser({ firstName: 'Ann' });
         const bob = await makeUser({ firstName: 'Bob' });
         const plan = await makePlan(ann, { tier: 'valet_anywhere', amountCents: 30000 });
-        await linkByQr(ann, bob);
+        await linkByPhone(ann, bob);
 
         // Bob's covered park for tomorrow: held with no end once it starts.
         await makeOrder(bob, {
@@ -1607,7 +1623,7 @@ describe('the one-park rule at its edges, and what a partner never holds', () =>
         const ann = await makeUser({ firstName: 'Ann' });
         const bob = await makeUser({ firstName: 'Bob' });
         await makePlan(ann); // Fixed garage: we hold the car
-        await linkByQr(ann, bob);
+        await linkByPhone(ann, bob);
 
         // Ann's second park of the day: paid, held with no end time, no plan
         // stamp, and no custody row yet because no valet has parked it.
@@ -1630,7 +1646,7 @@ describe('the one-park rule at its edges, and what a partner never holds', () =>
         const ann = await makeUser({ firstName: 'Ann' });
         const bob = await makeUser({ firstName: 'Bob' });
         const plan = await makePlan(ann);
-        await linkByQr(ann, bob);
+        await linkByPhone(ann, bob);
         await Subscription.updateOne({ _id: plan._id }, { status: 'past_due' });
 
         const res = mockRes();
@@ -1645,7 +1661,7 @@ describe('the one-park rule at its edges, and what a partner never holds', () =>
     it("a partner who cancels the booker's park gets it back without the booker's payment details", async () => {
         const ann = await makeUser({ firstName: 'Ann' });
         const bob = await makeUser({ firstName: 'Bob' });
-        await linkByQr(ann, bob);
+        await linkByPhone(ann, bob);
         const annsPark = await makeOrder(ann, {
             status: 'pending',
             paymentIntentId: 'pi_ann_cancel',
@@ -1670,37 +1686,37 @@ describe('the one-park rule at its edges, and what a partner never holds', () =>
         expect(String((await Order.findById(annsPark._id)).actedBy)).toBe(String(bob._id));
     });
 
-    it('only customer accounts can link: a valet can neither show a code nor scan one', async () => {
+    it("only customer accounts can link: a valet can't send a request, and one sent to a valet's number reaches nobody", async () => {
         const ann = await makeUser({ firstName: 'Ann' });
         const val = await makeUser({ firstName: 'Val', isValet: true });
 
-        const minted = await api.invite(val);
-        expect(minted.statusCode).toBe(403);
-        expect(minted.body.code).toBe('NOT_A_CUSTOMER');
+        const fromValet = await api.request(val, ann.phone);
+        expect(fromValet.statusCode).toBe(403);
+        expect(fromValet.body.code).toBe('NOT_A_CUSTOMER');
+        expect(await AccountLink.countDocuments({})).toBe(0);
 
-        const annsCode = await api.invite(ann);
-        const scanned = await api.claim(val, annsCode.body.token);
-        expect(scanned.statusCode).toBe(403);
-        expect(scanned.body.code).toBe('NOT_A_CUSTOMER');
-        expect((await AccountLink.findOne({ inviter: ann._id })).status).toBe('open');
+        const toValet = await api.request(ann, val.phone);
+        expect(toValet.statusCode).toBe(200);
+        expect((await AccountLink.findById(toValet.body.link._id).lean()).inviter).toBeUndefined();
+        // Not even after the valet reads their own status.
+        expect((await api.status(val)).body.status).toBe('none');
+        expect(emitsTo(val, 'accountLink:requested')).toHaveLength(0);
     });
-
     it('a past-due plan still counts as a plan: linking two people who each hold one is refused', async () => {
         const ann = await makeUser({ firstName: 'Ann' });
         const bob = await makeUser({ firstName: 'Bob' });
         await makePlan(ann);
         await makePlan(bob, { status: 'past_due' });
 
-        const minted = await api.invite(ann);
-        const claimed = await api.claim(bob, minted.body.token);
-        expect(claimed.statusCode).toBe(409);
-        expect(claimed.body.code).toBe('BOTH_HAVE_PLANS');
+        const sent = await api.request(bob, ann.phone);
+        const accepted = await api.authorize(ann, sent.body.link._id);
+        expect(accepted.statusCode).toBe(409);
+        expect(accepted.body.code).toBe('BOTH_HAVE_PLANS');
     });
-
     it("the partner's copy of an order carries no Stripe id and no card; the booker's own copy is untouched", async () => {
         const ann = await makeUser({ firstName: 'Ann' });
         const bob = await makeUser({ firstName: 'Bob' });
-        await linkByQr(ann, bob);
+        await linkByPhone(ann, bob);
 
         const annsPark = await makeOrder(ann, {
             paymentIntentId: 'pi_ann_park',
