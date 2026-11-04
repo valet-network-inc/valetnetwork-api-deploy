@@ -3,9 +3,21 @@
  * user and valet sides can be tried end to end without the live API.
  *
  * Run from inside the backend clone, with localrig.js up:
- *   node seedrig.js accounts     <- the three accounts below (always safe to rerun)
+ *   node seedrig.js accounts     <- the four accounts below (always safe to rerun)
  *   node seedrig.js job          <- a codes-OFF job: Marcus on the way to Rishi Test
- *   node seedrig.js job-codes    <- the same for Codes On (3-digit codes)
+ *   node seedrig.js job-codes    <- the same for Codes On (2-digit codes)
+ *
+ * Link account (Rishi Test + Alex Test, through the real API, so the phone
+ * hears every step over its socket):
+ *   node seedrig.js claim <code> <- Alex scans the code on Rishi's screen (the
+ *                                   valetnyc://link/... text, or just the token)
+ *   node seedrig.js invite       <- Alex shows a code; prints the deep link for
+ *                                   `xcrun simctl openurl booted <link>`
+ *   node seedrig.js authorize    <- Alex taps Authorize on a waiting request
+ *   node seedrig.js link         <- all three at once: linked, no taps
+ *   node seedrig.js unlink       <- Rishi unlinks
+ *   WHO=alex node seedrig.js parked  <- any job mode, on Alex instead
+ *   WHO=alex node seedrig.js chat Hi <- a chat message from Alex (or Rishi) on the newest job
  *   node seedrig.js pending      <- a job no valet has taken yet
  *   node seedrig.js parked       <- parked, keys walked back
  *   node seedrig.js returning    <- keys coming back: the say-the-code beat
@@ -25,6 +37,9 @@ const CAR = { color: 'Blue', make: 'Subaru', model: 'Outback', licensePlate: 'KD
 const ACCOUNTS = {
     user: { phone: '+15555550101', firstName: 'Rishi', lastName: 'Test', handoffCodes: false, vehicle: CAR },
     codes: { phone: '+15555550103', firstName: 'Codes', lastName: 'On', handoffCodes: true },
+    // Rishi Test's partner for Link account. No car, so linking copies Rishi's
+    // into the empty profile (decision: copied once, never overwritten).
+    partner: { phone: '+15555550104', firstName: 'Alex', lastName: 'Test', handoffCodes: false },
     valet: {
         phone: '+15555550102',
         firstName: 'Marcus',
@@ -83,6 +98,43 @@ async function upsert(User, fields) {
     return User.create({ firebaseUid: `rig-${fields.phone.replace(/\D/g, '')}`, verified: true, isActive: true, ...fields });
 }
 
+// One call to the rig API as `who` (a seeded account), the way their phone
+// would make it.
+function api(who, method, path, payload) {
+    const body = payload ? JSON.stringify(payload) : '';
+    return new Promise((resolve, reject) => {
+        const req = http.request(
+            {
+                host: '127.0.0.1',
+                port: 8099,
+                path,
+                method,
+                headers: {
+                    'content-type': 'application/json',
+                    'content-length': Buffer.byteLength(body),
+                    authorization: `Bearer rig-${who.phone.replace(/\D/g, '')}`,
+                },
+            },
+            (res) => {
+                let raw = '';
+                res.on('data', (c) => (raw += c));
+                res.on('end', () => {
+                    let json = null;
+                    try {
+                        json = JSON.parse(raw);
+                    } catch (e) {}
+                    resolve({ status: res.statusCode, json, raw });
+                });
+            }
+        );
+        req.on('error', reject);
+        req.end(body);
+    });
+}
+
+const say = (label, r) =>
+    console.log(label, '->', r.status, r.status === 200 ? '' : (r.json && (r.json.code || r.json.message)) || r.raw.slice(0, 160));
+
 async function main() {
     const mode = process.argv[2] || 'accounts';
     await mongoose.connect(URI);
@@ -92,8 +144,78 @@ async function main() {
     const user = await upsert(User, ACCOUNTS.user);
     const codes = await upsert(User, ACCOUNTS.codes);
     const valet = await upsert(User, ACCOUNTS.valet);
-    console.log('accounts:', [user, codes, valet].map((u) => `${u.firstName} ${u.phone}`).join(' | '));
+    const partner = await upsert(User, ACCOUNTS.partner);
+    console.log('accounts:', [user, codes, partner, valet].map((u) => `${u.firstName} ${u.phone}`).join(' | '));
     if (mode === 'accounts') return done();
+
+    // Link account, played from Alex's side through the real routes.
+    const asAlex = (method, path, payload) => api(partner, method, path, payload);
+    const pendingFor = async () => {
+        const s = await asAlex('GET', `/api/account-link/status?userId=${partner._id}`);
+        return s.json || {};
+    };
+    if (mode === 'claim') {
+        const raw = process.argv[3] || '';
+        const token = (raw.match(/([A-Za-z0-9_-]{16,128})\/?$/) || [])[1];
+        if (!token) {
+            console.log('Usage: node seedrig.js claim <valetnyc://link/... or the token>');
+            return done();
+        }
+        const r = await asAlex('POST', '/api/account-link/claim', { userId: String(partner._id), token });
+        say('Alex scans the code', r);
+        return done();
+    }
+    if (mode === 'invite') {
+        const r = await asAlex('POST', '/api/account-link/invite', { userId: String(partner._id) });
+        say('Alex shows a code', r);
+        if (r.json && r.json.token) console.log(`xcrun simctl openurl booted 'valetnyc://link/${r.json.token}'`);
+        return done();
+    }
+    if (mode === 'authorize') {
+        const s = await pendingFor();
+        if (s.status !== 'pending' || !s.link) {
+            console.log('Nothing waiting on Alex (status:', s.status || 'none', ')');
+            return done();
+        }
+        const r = await asAlex('POST', '/api/account-link/authorize', { userId: String(partner._id), linkId: String(s.link._id) });
+        say('Alex taps Authorize', r);
+        return done();
+    }
+    if (mode === 'link') {
+        const inv = await asAlex('POST', '/api/account-link/invite', { userId: String(partner._id) });
+        say('Alex shows a code', inv);
+        if (!inv.json || !inv.json.token) return done();
+        const claim = await api(user, 'POST', '/api/account-link/claim', { userId: String(user._id), token: inv.json.token });
+        say('Rishi scans it', claim);
+        const s = await pendingFor();
+        if (!s.link) return done();
+        const ok = await asAlex('POST', '/api/account-link/authorize', { userId: String(partner._id), linkId: String(s.link._id) });
+        say('Alex taps Authorize', ok);
+        return done();
+    }
+    if (mode === 'unlink') {
+        const r = await api(user, 'POST', '/api/account-link/unlink', { userId: String(user._id) });
+        say('Rishi unlinks', r);
+        return done();
+    }
+    // `chat <text>`: a message from Rishi (WHO=alex: from Alex) into their
+    // newest job's chat, written the way their phone writes it.
+    if (mode === 'chat') {
+        const who = process.env.WHO === 'alex' ? partner : user;
+        const text = process.argv.slice(3).join(' ') || 'Hi!';
+        const job = await Order.findOne({ customer: who._id, conversationId: { $exists: true, $ne: null } }).sort({ createdAt: -1 });
+        if (!job) {
+            console.log(`No chat on ${who.firstName}'s jobs. Seed one first (WHO=alex node seedrig.js job).`);
+            return done();
+        }
+        await fsCall({
+            op: 'add',
+            path: `conversations/${job.conversationId}/messages`,
+            data: { text, senderId: String(who._id), createdAt: { __fv: 'serverTimestamp' }, serverCreatedAt: { __fv: 'serverTimestamp' } },
+        });
+        console.log(`${who.firstName} says "${text}" on job ${job._id}`);
+        return done();
+    }
 
     // `accept`: Marcus takes the newest job waiting for a valet (a key
     // delivery, a booking made in the app), the way his phone would: a chat
@@ -141,11 +263,20 @@ async function main() {
         return done();
     }
 
-    const customer = mode === 'job-codes' ? codes : user;
-    await Order.deleteMany({ customer: { $in: [user._id, codes._id] }, status: { $ne: 'completed' } });
-    await clearChats([user._id, codes._id]).catch(() => console.log('(rig chat store not running; chats not cleared)'));
+    // WHO=alex seeds the job on Alex Test (Rishi's link partner) instead.
+    const customer = mode === 'job-codes' ? codes : process.env.WHO === 'alex' ? partner : user;
+    // Alex's jobs clear only Alex's, so Rishi's park stays put and Home can
+    // show both tickets. Rishi's and Codes On's clear each other, as before.
+    const scope =
+        mode === 'clear'
+            ? [user._id, codes._id, partner._id]
+            : customer === partner
+            ? [partner._id]
+            : [user._id, codes._id];
+    await Order.deleteMany({ customer: { $in: scope }, status: { $ne: 'completed' } });
+    await clearChats(scope).catch(() => console.log('(rig chat store not running; chats not cleared)'));
     if (mode === 'clear') {
-        const r = await Order.deleteMany({ customer: { $in: [user._id, codes._id] } });
+        const r = await Order.deleteMany({ customer: { $in: scope } });
         console.log('cleared', r.deletedCount, 'jobs');
         return done();
     }
