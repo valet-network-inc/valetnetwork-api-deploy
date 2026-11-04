@@ -189,6 +189,17 @@ exports.createParkingNote = async (req, res) => {
             { upsert: true, new: true, setDefaultsOnInsert: true }
         );
 
+        // The user's ticket and receipt read the sweep where the car sits
+        // from the order. Best effort: the note is the record either way.
+        try {
+            await Order.updateOne(
+                { _id: order._id },
+                { $set: { 'parkingLocation.streetCleaning': streetCleaning } }
+            );
+        } catch (err) {
+            console.error('copy streetCleaning to order failed:', err.message);
+        }
+
         // This is the moment a managed car stops being a car we are holding
         // blind and becomes one we know the sweep days for. The ordering is
         // fixed and cannot be changed: this endpoint hard-requires

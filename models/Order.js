@@ -41,6 +41,13 @@ const OrderSchema = new mongoose.Schema({
         streetAddress: {
             type: String,
         },
+        // The sweep windows where the car sits, copied from the valet's
+        // parking note when they save the rules, so the user's ticket and
+        // receipt can say when that block is swept (Nov 4).
+        streetCleaning: {
+            type: [{ _id: false, day: Number, startTime: String, endTime: String }],
+            default: undefined,
+        },
     },
 
     // Where the car is when it isn't where the keys change hands (Nov 2026,

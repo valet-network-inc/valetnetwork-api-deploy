@@ -207,9 +207,14 @@ async function main() {
         delete doc.valet;
         delete doc.valetLocation;
     } else if (mode === 'parked') {
-        doc.status = 'parked';
+        // A plain park ends "completed" when the keys go back (the valet's
+        // swipe); the car stays on the street until the user asks for it.
+        doc.status = 'completed';
+        doc.completedAt = now;
+        // The valet read the signs: swept Thursdays 9-10:30 (the ticket's note).
+        doc.parkingType = 'street';
+        doc.parkingLocation = { ...PARKED, streetCleaning: [{ day: 4, startTime: '09:00', endTime: '10:30' }] };
         doc.vehicle = CAR;
-        doc.parkingLocation = PARKED;
         doc.otp.verified = true;
         doc.otpVerifiedTimes = { orderCreation: now, parkingLocation: now, returnKey: now };
     } else if (mode === 'returning') {
