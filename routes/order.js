@@ -92,6 +92,8 @@ router.post('/valetCancelOrder', valetCancelOrder);
 // holding one could tip a valet off somebody else's card. The web client had
 // to start sending its token for this one — createTip was hand rolled around
 // `fetch` and was the only call in that app with no Authorization header.
+// The booker's linked partner passes the gate too (models/AccountLink.js); the
+// tip still goes on the booker's card, never the partner's.
 router.post('/:orderId/tip', requireOrderOwner(), tipController.createTip);
 router.get('/:orderId/tips', tipController.getOrderTips);
 

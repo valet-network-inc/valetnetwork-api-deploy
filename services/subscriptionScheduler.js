@@ -93,6 +93,17 @@ async function bookOccurrence(sub, day, occurrence, { io, notify, now }) {
     // checkout in progress); older ones are abandoned carts that the
     // auto-cancel job will clear, and they must not block the sweep.
     // Retried next tick while the window stays open.
+    //
+    // The HOLDER's orders only, and deliberately so now that accounts can be
+    // linked. A plan covers one park at a time across the pair
+    // (services/accountLinks.js householdCoveredParkLive), but that rule is
+    // applied where a person books — createOrder and the quote — not here. So
+    // a partner's park riding this plan does NOT stop the holder's cleaning
+    // move: this car is on a swept block either way, and skipping the move
+    // earns the holder a ticket to protect the rule. The move is stamped with
+    // the plan like any covered one, so while it is live it is the park
+    // holding the plan, and a partner booking in that window is quoted and
+    // charged list price (`partner_park_live`) until it ends.
     const activeOrder = await Order.findOne({
         customer: sub.user,
         $or: [

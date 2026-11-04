@@ -32,10 +32,21 @@
  * Exposure: this reads a plan by userId, the same as GET /api/subscription/
  * status/:userId, which already returns the customer's home address outright.
  * It adds no field that endpoint does not already hand out.
+ *
+ * LINKED ACCOUNTS (2026-09-23). The plan is the HOUSEHOLD's: the customer's
+ * own, else the one their linked partner holds (services/accountLinks.js), the
+ * same lookup validateSubscriptionForOrder hands createOrder. And a plan covers
+ * one park at a time across the pair, so while some other car is riding it the
+ * answer is `partner_park_live` — charged at list price and NOT indefinite,
+ * which is exactly what createOrder does with that booking. The only new thing
+ * this can say about somebody else is the partner's first name, which the pair
+ * already see on each other's screens.
  */
 
 const User = require('../models/User');
+const Order = require('../models/Order');
 const subscriptionService = require('../services/subscriptionService');
+const accountLinks = require('../services/accountLinks');
 const orderPricing = require('../services/orderPricing');
 const { HOME_RADIUS_METERS, getPlan } = require('../services/subscriptionPlans');
 
@@ -55,6 +66,14 @@ const BLOCK_METERS = 80;
 const blocksAway = (meters) => Math.max(1, Math.ceil(meters / BLOCK_METERS));
 const blocksWithin = (meters) => Math.max(1, Math.floor(meters / BLOCK_METERS));
 
+// "Sam's", or "their" for an account with no first name on it. firstName is
+// optional on User, and "them's plan" is worse than no name at all.
+const possessive = (summary) => {
+    const name = accountLinks.firstNameOf(summary, '');
+    return name ? `${name}'s` : 'their';
+};
+const capitalize = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+
 /**
  * Plain words for one reason code.
  *
@@ -66,32 +85,66 @@ const blocksWithin = (meters) => Math.max(1, Math.floor(meters / BLOCK_METERS));
  * Every refusal names its cause. A customer four blocks from their fixed
  * address has to be told that is why, before they commit, or they learn it from
  * a charge.
+ *
+ * `ctx.holder` is set only for a linked partner riding the other one's plan
+ * (the plan holder's summary). On their screen "your plan" is false — they
+ * hold none, cannot change it, and cannot save a home spot on it — so every
+ * sentence that says whose plan or whose home spot names the holder instead.
+ * The holder, and everyone who is not linked, read exactly what they always
+ * have.
  */
 function describe(reason, ctx) {
     const price = money(ctx.priceCents);
+    const partnersPlan = !!ctx.holder;
+    const plan = partnersPlan ? `${possessive(ctx.holder)} plan` : 'your plan';
+    const homeSpot = partnersPlan ? `${possessive(ctx.holder)} home spot` : 'your home spot';
 
     switch (reason) {
         // --- covered -------------------------------------------------------
         case 'daily_free_park':
             return {
-                label: 'Free with your plan',
+                label: `Free with ${plan}`,
                 detail: 'This is your free park for today. Tap Park — nothing to pay.',
             };
         case 'asp_move_covered':
             return {
-                label: 'Free with your plan',
-                detail:
-                    'Your plan pays for this street cleaning move. Tap Park — nothing to pay.',
+                label: `Free with ${plan}`,
+                detail: `${capitalize(
+                    plan
+                )} pays for this street cleaning move. Tap Park — nothing to pay.`,
             };
 
         // --- already paid for, without a plan ------------------------------
         case 'retrieval_included_with_park':
+            // Bringing back the park your partner booked: they paid for it,
+            // not you, and it is not your car.
+            if (ctx.parkedBy) {
+                const name = accountLinks.firstNameOf(ctx.parkedBy, '');
+                return {
+                    label: 'Already paid',
+                    detail: name
+                        ? `${name} paid for the ride back when they parked. Tap to get the car.`
+                        : 'The ride back was paid for when the car was parked. Tap to get the car.',
+                };
+            }
             return {
                 label: 'Already paid',
                 detail: 'You paid for the ride back when you parked. Tap to get your car.',
             };
 
         // --- refusals ------------------------------------------------------
+        case 'partner_park_live': {
+            // One park at a time across a linked pair. Named only when the park
+            // holding the plan is the booker's partner's — quoteOrder leaves
+            // `busyName` empty for anyone else, an ex-partner included.
+            const who = ctx.busyName;
+            return {
+                label: who
+                    ? `Not covered — ${who}'s park is using the plan`
+                    : 'Not covered — another park is using the plan',
+                detail: "It's covered again once that park ends.",
+            };
+        }
         case 'no_active_subscription':
             return {
                 label: `${price} to park`,
@@ -102,31 +155,58 @@ function describe(reason, ctx) {
             const moves = n === 1 ? 'move' : 'moves';
             return {
                 label: `Not covered — this week's ${moves} are used`,
-                detail: `Your plan pays for ${n} street cleaning ${moves} a week and this week's are used. This one is ${price}. Tap Pay & park, or wait for Monday.`,
+                detail: `${capitalize(
+                    plan
+                )} pays for ${n} street cleaning ${moves} a week and this week's are used. This one is ${price}. Tap Pay & park, or wait for Monday.`,
             };
         }
         case 'tier_has_no_free_park':
             return {
-                label: 'Not covered — your plan is street cleaning',
-                detail: `Your plan pays for street cleaning moves. Other parks are ${price}. Tap Pay & park.`,
+                label: `Not covered — ${plan} is street cleaning`,
+                detail: `${capitalize(
+                    plan
+                )} pays for street cleaning moves. Other parks are ${price}. Tap Pay & park.`,
             };
         case 'daily_free_park_used':
+            // Across a linked pair this is one free park between them, so the
+            // holder's park this morning is why the partner's is not free.
             return {
                 label: "Not covered — today's free park is used",
-                detail: `Your plan gives one free park a day and today's is used. This one is ${price}. Tap Pay & park, or park free tomorrow.`,
+                detail: `${capitalize(
+                    plan
+                )} gives one free park a day and today's is used. This one is ${price}. Tap Pay & park, or park free tomorrow.`,
             };
         case 'no_home_address_on_file':
+            // The partner cannot save one — the plan screen is read-only for
+            // them — so they are told who can.
             return {
                 label: 'Not covered — no home spot saved',
-                detail: `Your free park works at your home spot and none is saved. Add your home spot in your plan, or pay ${price} for this park.`,
+                detail: partnersPlan
+                    ? `The free park works at ${homeSpot} and none is saved. Ask ${
+                          accountLinks.firstNameOf(ctx.holder, '') || 'them'
+                      } to add it, or pay ${price} for this park.`
+                    : `Your free park works at your home spot and none is saved. Add your home spot in your plan, or pay ${price} for this park.`,
             };
         case 'order_location_missing':
             return {
                 label: "Not covered — we can't see your spot",
-                detail:
-                    'We need your map pin to check it against your home spot. Drop the pin again.',
+                detail: `We need your map pin to check it against ${homeSpot}. Drop the pin again.`,
             };
         case 'not_at_home_address':
+            // The fixed address is the holder's. "From home" would be a guess
+            // about where the partner lives.
+            if (partnersPlan) {
+                return {
+                    label: `Not covered — about ${blocksAway(
+                        ctx.distanceMeters
+                    )} blocks from ${homeSpot}`,
+                    detail: `The free park works about ${blocksWithin(
+                        HOME_RADIUS_METERS
+                    )} blocks from ${homeSpot} and this is about ${blocksAway(
+                        ctx.distanceMeters
+                    )} blocks away. Park here for ${price}, or move the pin closer to it.`,
+                };
+            }
             return {
                 label: `Not covered — about ${blocksAway(ctx.distanceMeters)} blocks from home`,
                 detail: `Your free park works about ${blocksWithin(
@@ -158,6 +238,39 @@ function describe(reason, ctx) {
                 label: `${price} to park`,
                 detail: `This booking is ${price}. Tap Pay & park.`,
             };
+    }
+}
+
+/**
+ * Is another car riding this plan — and may the quote say whose?
+ *
+ * `false`, or `{ name }`: the booker's partner's first name when the park
+ * holding the plan is theirs, '' when it is anyone else's (an ex-partner's park
+ * still finishing on the plan) or they have no name on file. The rule itself is
+ * accountLinks.coveredParkLiveBy, the one createOrder applies through
+ * householdCoveredParkLive; this only decides what may be printed about it.
+ */
+async function planBusyFor(sub, userId, park) {
+    const whose = await accountLinks.coveredParkLiveBy(sub, userId, park);
+    if (!whose) return false;
+    const partner = await accountLinks.partnerOf(userId);
+    const name = partner && partner._id === whose ? accountLinks.firstNameOf(partner, '') : '';
+    return { name };
+}
+
+/**
+ * The partner's summary when the park being brought back is one THEY booked,
+ * else null. Only changes the words: a linked retrieval is already paid for
+ * whoever taps. Never throws — a bad id costs the sentence, not the quote.
+ */
+async function partnerWhoBooked(userId, orderId) {
+    try {
+        const order = await Order.findById(orderId).select('customer').lean();
+        if (!order || String(order.customer) === String(userId)) return null;
+        const partner = await accountLinks.partnerOf(userId);
+        return partner && partner._id === String(order.customer) ? partner : null;
+    } catch (err) {
+        return null;
     }
 }
 
@@ -233,13 +346,21 @@ exports.quoteOrder = async (req, res) => {
         });
         const listPriceCents = quote.amountCents;
 
-        const sub = await subscriptionService.getActiveSubscription(userId);
+        // Their own plan, else the one their linked partner holds. `heldBy` is
+        // 'self' for their own, the holder's summary for the partner's.
+        const { sub, heldBy } = await accountLinks.getHouseholdSubscription(userId);
         const plan = sub ? getPlan(sub.tier) : null;
+        const holder = sub && heldBy && heldBy !== 'self' ? heldBy : null;
 
         let covered = false;
         let reason;
         let priceCents = listPriceCents;
         let distanceMeters = 0;
+        // Another car riding the plan (partner_park_live). Also switches off
+        // `indefinite` below: createOrder neither covers nor holds that park.
+        let planBusy = false;
+        let busyName = '';
+        let parkedBy = null;
 
         if (finalOrderType === 'retrieval') {
             // Coverage never runs on a retrieval — createOrder gates it on
@@ -250,9 +371,13 @@ exports.quoteOrder = async (req, res) => {
             // createRetrievalOrder zeroes every linked leg (the park-and-hold
             // portion was collected at parking time). Only a standalone one
             // costs the $5.
+            //
+            // Never refused by the one-park-at-a-time rule: bringing a car back
+            // is how a park ends, and that is what frees the plan.
             if (originalOrderId) {
                 reason = 'retrieval_included_with_park';
                 priceCents = 0;
+                parkedBy = await partnerWhoBooked(userId, originalOrderId);
             } else if (!sub) {
                 reason = 'no_active_subscription';
             } else {
@@ -268,6 +393,19 @@ exports.quoteOrder = async (req, res) => {
             // createOrder refuses coverage on away bookings: the weekly cap
             // means nothing across a multi-week hold.
             reason = 'away_not_covered';
+        } else if (
+            (planBusy = await planBusyFor(sub, userId, {
+                at: pickUpTime,
+                durationMinutes: duration,
+                indefinite: subscriptionService.parkIsIndefinite(sub, { lat, lng }),
+            }))
+        ) {
+            // One park at a time across a linked pair, the same call createOrder
+            // makes. Ahead of the Car Watch gate on purpose: "turn Car Watch off
+            // to use your free park" would be a promise the plan cannot keep
+            // while another car is on it.
+            reason = 'partner_park_live';
+            busyName = planBusy.name;
         } else if (carWatch) {
             // createOrder refuses coverage on a Car Watch booking too — zeroing
             // the order would hand over the paid add-on with it.
@@ -301,6 +439,9 @@ exports.quoteOrder = async (req, res) => {
             listPriceCents,
             distanceMeters,
             movesPerWeek: sub ? sub.movesPerWeek || 2 : 2,
+            holder,
+            busyName,
+            parkedBy,
         });
 
         return res.status(200).json({
@@ -319,9 +460,13 @@ exports.quoteOrder = async (req, res) => {
             // to `covered`: the second park of a day is charged for and still
             // indefinite. The clients drop the duration step on this, so it has
             // to answer for the paid case too.
+            //
+            // Except when another car is riding the plan: that park is an
+            // ordinary paid one with an end time, not a second car held on it.
             indefinite:
                 (orderType || 'parking') === 'parking' &&
                 !awayMode &&
+                !planBusy &&
                 subscriptionService.parkIsIndefinite(sub, { lat, lng }),
             indefiniteLabel: 'Parked until you ask for it back',
             plan: plan

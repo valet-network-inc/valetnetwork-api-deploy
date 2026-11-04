@@ -117,13 +117,28 @@ function requireValet() {
 module.exports.requireValet = requireValet;
 
 /**
- * "You are the customer this ORDER belongs to."
+ * "You are the customer this ORDER belongs to — or the account linked to them."
  *
  * For routes that name an order rather than a person — tipping, and minting a
  * payment intent. Both move money on a saved card, and both took the orderId
  * alone: order ids are handed out with the order documents themselves, so a
  * stranger holding one could tip a valet off somebody else's card, or mint a
  * payment intent against their booking.
+ *
+ * A linked pair (models/AccountLink.js) see and act on each other's parks, so
+ * the partner of the person who booked passes too. That is the whole widening:
+ * anyone else still gets the one answer below.
+ *
+ * Sets two things, and they are different people when a partner is asking:
+ *   req.callerUserId — who is asking (their own id; never impersonated)
+ *   req.orderOwnerId — who booked the order, and so whose card any charge on
+ *                      it goes on. Money follows the park, not the tap.
+ *
+ * The partner is found from the OWNER's link and then checked against the
+ * token, rather than by looking the token's uid up among all users. A uid can
+ * sit on more than one user document (an account deleted and signed up again
+ * on the same number), and "which of those did you mean" is not a question an
+ * authorization check should have to guess at.
  *
  * @param {(req) => string|undefined} pickOrderId
  */
@@ -149,12 +164,33 @@ function requireOrderOwner(pickOrderId = (req) => req.params?.orderId || req.bod
             }
 
             const owner = await User.findById(order.customer).select('firebaseUid').lean();
-            if (!owner || !owner.firebaseUid || owner.firebaseUid !== uid) {
+            if (!owner) {
                 return res.status(403).json({ success: false, message: 'That is not your order.' });
             }
 
-            req.callerUserId = String(owner._id);
-            noteAppBuild(req, owner._id);
+            let caller = null;
+            if (owner.firebaseUid && owner.firebaseUid === uid) {
+                caller = owner;
+            } else {
+                // Not the booker. Their linked partner may act on it too.
+                const { partnerIdOf } = require('../services/accountLinks');
+                const partnerId = await partnerIdOf(owner._id);
+                if (partnerId) {
+                    const partner = await User.findById(partnerId).select('firebaseUid').lean();
+                    if (partner && partner.firebaseUid && partner.firebaseUid === uid) {
+                        caller = partner;
+                    }
+                }
+            }
+            // Still one answer: a stranger learns nothing about whether this
+            // order exists, or whose it is, or that it has a partner at all.
+            if (!caller) {
+                return res.status(403).json({ success: false, message: 'That is not your order.' });
+            }
+
+            req.callerUserId = String(caller._id);
+            req.orderOwnerId = String(owner._id);
+            noteAppBuild(req, caller._id);
             return next();
         } catch (err) {
             console.error('requireOrderOwner failed:', err.message);

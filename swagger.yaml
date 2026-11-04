@@ -27,6 +27,8 @@ tags:
     description: Push notifications and alerts
   - name: Subscription
     description: Subscription management
+  - name: Account Link
+    description: Two customer accounts sharing their parks and a plan (Profile → Link account)
   - name: Event
     description: Event code validation
   - name: Key Transfer
@@ -37,6 +39,12 @@ tags:
     description: Admin dashboard and analytics
 
 components:
+  securitySchemes:
+    FirebaseIdToken:
+      type: http
+      scheme: bearer
+      description: The signed-in customer's Firebase ID token. Its uid must match `firebaseUid` on the user the request names (middleware/requireSelf.js).
+
   schemas:
     User:
       type: object
@@ -402,6 +410,87 @@ components:
           type: string
           format: date-time
 
+    PartnerSummary:
+      type: object
+      description: |
+        The only shape the other person in a linked pair ever leaves the server
+        in (services/accountLinks.js partnerSummary). Never a user document: no
+        full phone, email, address, Stripe id or Firebase uid.
+      properties:
+        _id:
+          type: string
+        firstName:
+          type: string
+        lastName:
+          type: string
+        profileImage:
+          type: string
+          nullable: true
+        phoneMasked:
+          type: string
+          description: The last four digits of the phone, bare. Clients render it as "•••• 4821".
+          example: '4821'
+
+    AccountLinkView:
+      type: object
+      description: A link as one of its two people sees it. The same shape in every response and every accountLink:* socket event.
+      properties:
+        _id:
+          type: string
+        status:
+          type: string
+          enum: [open, pending, active, revoked, expired]
+        role:
+          type: string
+          enum: [inviter, invitee]
+          description: inviter showed the QR and taps Authorize; invitee scanned it
+        expiresAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: When the current step runs out — 10 minutes from mint while open, 10 minutes from the scan while pending. Null otherwise.
+        authorizedAt:
+          type: string
+          format: date-time
+          nullable: true
+
+    AccountLinkError:
+      type: object
+      description: Clients map `code` to their own copy and fall back to "Something went wrong. Try again."
+      properties:
+        success:
+          type: boolean
+          default: false
+        code:
+          type: string
+          enum: [INVALID, EXPIRED, SELF_LINK, ALREADY_LINKED, BOTH_HAVE_PLANS, NOT_PENDING, NOT_LINKED, NOT_YOURS, BAD_REQUEST]
+        message:
+          type: string
+
+    SavedVehicle:
+      type: object
+      description: Profile → Your car. Stored on the account and hidden from every read that does not ask for it; only loginUser returns it.
+      properties:
+        color:
+          type: string
+        model:
+          type: string
+        licensePlate:
+          type: string
+          description: Upper-cased
+
+    HouseholdOrder:
+      description: An order in a customer read. Orders the caller's linked partner booked carry `bookedBy`; the caller's own carry none. A partner's order also arrives without the booker's payment details - no `paymentIntentId`, no `paymentDetails.clientSecret`, `chargeId`, `receiptUrl` or `paymentMethodDetails`, no `paymentIntentId` on `extensions` or `awayCharges`, and no `checkout.failureCode`/`failureMessage`. Amounts and `paymentStatus` stay. The same applies to the partner's copy of every order socket event.
+      allOf:
+        - $ref: '#/components/schemas/Order'
+        - type: object
+          properties:
+            bookedBy:
+              $ref: '#/components/schemas/PartnerSummary'
+            actedBy:
+              type: string
+              description: Set when the linked partner, not the booker, acted on this order (audit trail only; it still bills the booker)
+
 paths:
   /auth/loginUser:
     post:
@@ -442,7 +531,13 @@ paths:
                     type: string
                     description: Status message
                   user:
-                    $ref: '#/components/schemas/User'
+                    allOf:
+                      - $ref: '#/components/schemas/User'
+                      - type: object
+                        properties:
+                          vehicle:
+                            $ref: '#/components/schemas/SavedVehicle'
+                    description: The account, including its saved car (Profile → Your car) when there is one
         '500':
           description: Server error
           content:
@@ -491,6 +586,22 @@ paths:
                 userAgreementAccepted:
                   type: boolean
                   description: Whether user has accepted the user agreement
+                vehicle:
+                  type: object
+                  nullable: true
+                  description: |
+                    Profile → Your car. Stored as exactly these three strings,
+                    trimmed, the plate upper-cased; anything else on the object is
+                    ignored. All three blank, or null, removes the saved car. Not
+                    echoed back in `user` (the field is hidden from reads; loginUser
+                    returns it).
+                  properties:
+                    color:
+                      type: string
+                    model:
+                      type: string
+                    licensePlate:
+                      type: string
               required: [phone]
               example:
                 phone: "+1234567890"
@@ -627,6 +738,11 @@ paths:
     delete:
       summary: Delete user account
       tags: [Auth]
+      description: |
+        Also revokes the account's link, if it is in one (and any code or
+        request it has out): both rooms get `accountLink:revoked` and the
+        partner gets the "Account unlinked" push. That side-work never fails
+        the delete.
       parameters:
         - in: path
           name: userId
@@ -638,6 +754,412 @@ paths:
           description: Account deleted successfully
         '404':
           description: User not found
+
+  /account-link/invite:
+    post:
+      summary: Mint the QR code that links two accounts
+      tags: [Account Link]
+      description: |
+        The phone showing the code calls this. Returns a fresh 32-byte base64url
+        token, good for 10 minutes; the QR the clients render encodes
+        `valetnyc://link/<token>`. Only a sha256 of the token is stored.
+
+        Minting retires every code the caller already has out — including one
+        somebody has scanned and is waiting on (that scanner gets
+        `accountLink:declined`). Read `GET /account-link/status` before minting
+        so a waiting request is shown, not thrown away.
+
+        Rate limit: 10 an hour per userId (401/403 answers are not counted).
+      security:
+        - FirebaseIdToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                userId:
+                  type: string
+                  description: The caller's own user id (must match the token)
+              required: [userId]
+      responses:
+        '200':
+          description: Code minted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  token:
+                    type: string
+                    description: 43 characters, base64url. Never returned again.
+                  expiresAt:
+                    type: string
+                    format: date-time
+        '401':
+          description: No valid Firebase ID token
+        '403':
+          description: The token is not this account's
+        '409':
+          description: "`ALREADY_LINKED` — the caller is already linked. Pairs only."
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountLinkError'
+        '429':
+          description: Too many codes this hour
+
+  /account-link/claim:
+    post:
+      summary: Scan someone's code and ask to link
+      tags: [Account Link]
+      description: |
+        The scanner. Sets the link `pending` with the caller as invitee; the
+        person who showed the code then has 10 minutes to Authorize.
+
+        Emits `accountLink:requested { link, from }` to the code owner's room
+        (`from` = the scanner's PartnerSummary) and pushes them
+        "Someone scanned your code" / "[First name] wants to link. Open
+        Profile → Link account to approve." with data
+        `{ type: 'accountLink', linkStatus: 'pending' }`.
+
+        A successful scan also retires the scanner's own open code and any
+        earlier request they were waiting on (the other end of each gets
+        `accountLink:declined`). The same scanner sending the same code again
+        while it is pending gets the same 200.
+
+        Refusals are checked in this order: INVALID, EXPIRED, SELF_LINK,
+        ALREADY_LINKED, BOTH_HAVE_PLANS.
+
+        Rate limit: 10 an hour per userId (401/403 answers are not counted).
+      security:
+        - FirebaseIdToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                userId:
+                  type: string
+                token:
+                  type: string
+                  description: The bare token, or the whole scanned `valetnyc://link/<token>` string
+              required: [userId, token]
+      responses:
+        '200':
+          description: Request made; waiting on the code owner's Authorize
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  link:
+                    $ref: '#/components/schemas/AccountLinkView'
+                  waitingFor:
+                    $ref: '#/components/schemas/PartnerSummary'
+        '400':
+          description: "`SELF_LINK` — \"That's your own code.\""
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountLinkError'
+        '401':
+          description: No valid Firebase ID token
+        '403':
+          description: The token is not this account's
+        '404':
+          description: |
+            `INVALID` — "We don't recognise that code." One answer for a code
+            that never existed, was replaced by a newer one, was already used,
+            declined or cancelled, or is somebody else's pending request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountLinkError'
+        '409':
+          description: |
+            `ALREADY_LINKED` — "That account is already linked with someone."
+            (either of the two), or `BOTH_HAVE_PLANS` — "You both have a plan.
+            One of you has to cancel theirs first."
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountLinkError'
+        '410':
+          description: "`EXPIRED` — \"That code has expired. Ask them to open Link account again.\""
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountLinkError'
+        '429':
+          description: Too many scans this hour
+
+  /account-link/authorize:
+    post:
+      summary: Approve a scan — the one verification step
+      tags: [Account Link]
+      description: |
+        Only the person who SHOWED the code (the inviter) can call this. Flips
+        the link `pending → active` with a write guarded on the status; the
+        partial unique indexes on AccountLink refuse a second active link for
+        either account under any race.
+
+        Then, if exactly one of the two has a car saved (a licence plate), it is
+        copied into the other's empty profile — never over a saved one.
+
+        Emits `accountLink:active { link, partner, vehicle }` to EACH room
+        separately: `partner` is the other person's summary and `vehicle` that
+        room owner's own saved car after the copy (or null). Pushes the scanner
+        "You're linked" / "[First name] approved it. You both see the same parks
+        now." with data `{ type: 'accountLink', linkStatus: 'active' }`.
+
+        Rate limit: 20 an hour per userId, shared with decline and unlink.
+      security:
+        - FirebaseIdToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                userId:
+                  type: string
+                linkId:
+                  type: string
+              required: [userId, linkId]
+      responses:
+        '200':
+          description: Linked
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  link:
+                    $ref: '#/components/schemas/AccountLinkView'
+                  partner:
+                    $ref: '#/components/schemas/PartnerSummary'
+                  vehicle:
+                    allOf:
+                      - $ref: '#/components/schemas/SavedVehicle'
+                    nullable: true
+                    description: The caller's own saved car after the copy, or null
+        '400':
+          description: "`BAD_REQUEST` — linkId is missing"
+        '401':
+          description: No valid Firebase ID token
+        '403':
+          description: |
+            Either the token is not this account's, or `NOT_YOURS` — no such
+            link, or the caller is not the one who showed the code. One answer
+            for both.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountLinkError'
+        '409':
+          description: |
+            `NOT_PENDING` — "That request is no longer waiting." (declined,
+            cancelled, replaced, or its 10 minutes ran out);
+            `BOTH_HAVE_PLANS` — re-checked here because a plan can be bought
+            between the scan and the tap (the request stays pending);
+            `ALREADY_LINKED` — one of them was linked elsewhere in the meantime
+            (the request is retired and the scanner gets `accountLink:declined`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountLinkError'
+        '429':
+          description: Too many changes this hour
+
+  /account-link/decline:
+    post:
+      summary: Turn a scan away ("Not them")
+      tags: [Account Link]
+      description: |
+        Inviter only. Sets the link `revoked` and emits
+        `accountLink:declined { link }` to the scanner's room. No push.
+        The scanner cancelling their own request is `POST /account-link/unlink`,
+        not this.
+      security:
+        - FirebaseIdToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                userId:
+                  type: string
+                linkId:
+                  type: string
+              required: [userId, linkId]
+      responses:
+        '200':
+          description: Declined
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+        '400':
+          description: "`BAD_REQUEST` — linkId is missing"
+        '401':
+          description: No valid Firebase ID token
+        '403':
+          description: The token is not this account's, or `NOT_YOURS` (no such link / not the inviter)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountLinkError'
+        '409':
+          description: "`NOT_PENDING` — \"That request is no longer waiting.\""
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountLinkError'
+        '429':
+          description: Too many changes this hour
+
+  /account-link/unlink:
+    post:
+      summary: Unlink, or cancel a scan that is waiting
+      tags: [Account Link]
+      description: |
+        Either of the pair, any time. Revokes the caller's ACTIVE link
+        (`revokedBy` = the caller), emits `accountLink:revoked { link }` to both
+        rooms and pushes the other person "Account unlinked" / "[First name]
+        unlinked from you. You no longer see each other's parks." with data
+        `{ type: 'accountLink', linkStatus: 'revoked' }`. Touches no order and
+        no plan: coverage for the non-holder simply stops being found, and a
+        park already in progress finishes on the terms it was booked on.
+
+        With no active link, withdraws the caller's PENDING request as the
+        scanner (the waiting screen's Cancel) and emits
+        `accountLink:declined { link }` to the code owner's room.
+      security:
+        - FirebaseIdToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                userId:
+                  type: string
+              required: [userId]
+      responses:
+        '200':
+          description: Unlinked, or the request withdrawn
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+        '401':
+          description: No valid Firebase ID token
+        '403':
+          description: The token is not this account's
+        '404':
+          description: "`NOT_LINKED` — \"You're not linked with anyone.\" No link and no request to withdraw."
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountLinkError'
+        '429':
+          description: Too many changes this hour
+
+  /account-link/status:
+    get:
+      summary: Where the caller's link stands — the panel's one read
+      tags: [Account Link]
+      description: |
+        From the caller's point of view. Polled every 3 s while the Link account
+        panel is open, as the fallback for the socket events. An open code or a
+        pending request past its 10 minutes reads as `none` (and is marked
+        expired on the way).
+
+        Rate limit: 60 a minute per userId.
+      security:
+        - FirebaseIdToken: []
+      parameters:
+        - in: query
+          name: userId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Link status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  status:
+                    type: string
+                    enum: [none, open, pending, active]
+                  link:
+                    allOf:
+                      - $ref: '#/components/schemas/AccountLinkView'
+                    nullable: true
+                  partner:
+                    allOf:
+                      - $ref: '#/components/schemas/PartnerSummary'
+                    nullable: true
+                    description: Set when active
+                  pendingFrom:
+                    allOf:
+                      - $ref: '#/components/schemas/PartnerSummary'
+                    nullable: true
+                    description: Set when pending and the caller showed the code (show Authorize)
+                  waitingFor:
+                    allOf:
+                      - $ref: '#/components/schemas/PartnerSummary'
+                    nullable: true
+                    description: Set when pending and the caller scanned (show the spinner)
+                  plan:
+                    type: object
+                    description: The plan covering the caller, and whose it is
+                    properties:
+                      heldBy:
+                        type: string
+                        enum: [self, partner]
+                        nullable: true
+                      tier:
+                        type: string
+                        enum: [street_cleaning, home_garage, valet_anywhere]
+                        nullable: true
+                      name:
+                        type: string
+                        nullable: true
+                        description: Display name from services/subscriptionPlans.js, e.g. "Fixed garage"
+        '400':
+          description: userId is required
+        '401':
+          description: No valid Firebase ID token
+        '403':
+          description: The token is not this account's
+        '429':
+          description: Too many refreshes
 
   /payment/createPaymentIntent:
     post:
@@ -1104,12 +1626,25 @@ paths:
     get:
       summary: Check if user has active order
       tags: [Order]
+      description: |
+        Customer side: a linked customer's live orders include their partner's.
+        `activeOrder` is the caller's own live order when they have one, else
+        the partner's; `activeOrders` is the full set, own first. Every order
+        the caller did not book carries `bookedBy` (the partner's summary).
+        Valet side (`isValet=true`) is unchanged.
+      security:
+        - FirebaseIdToken: []
       parameters:
         - in: query
           name: userId
           required: true
           schema:
             type: string
+        - in: query
+          name: isValet
+          schema:
+            type: string
+            enum: ['true', 'false']
       responses:
         '200':
           description: Active order status
@@ -1122,8 +1657,18 @@ paths:
                     type: boolean
                   hasActiveOrder:
                     type: boolean
-                  order:
-                    $ref: '#/components/schemas/Order'
+                  activeOrder:
+                    allOf:
+                      - $ref: '#/components/schemas/HouseholdOrder'
+                    nullable: true
+                  activeOrders:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/HouseholdOrder'
+        '401':
+          description: No valid Firebase ID token
+        '403':
+          description: The token is not this account's
 
   /order/updateValetLocation:
     post:
@@ -1290,6 +1835,13 @@ paths:
     get:
       summary: Get orders for a user
       tags: [Order]
+      description: |
+        Customer side: every order either of a linked pair booked, live and
+        past, newest pickup first. Each one the caller did not book carries
+        `bookedBy` (the partner's summary); the caller's own carry none.
+        Valet side (`isValet=true`) is unchanged.
+      security:
+        - FirebaseIdToken: []
       parameters:
         - in: query
           name: userId
@@ -1297,22 +1849,30 @@ paths:
           schema:
             type: string
         - in: query
-          name: limit
+          name: isValet
           schema:
-            type: number
-        - in: query
-          name: skip
-          schema:
-            type: number
+            type: string
+            enum: ['true', 'false']
       responses:
         '200':
           description: User's orders
           content:
             application/json:
               schema:
-                type: array
-                items:
-                  $ref: '#/components/schemas/Order'
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  orders:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/HouseholdOrder'
+        '401':
+          description: No valid Firebase ID token
+        '403':
+          description: The token is not this account's
 
   /order/checkKeyTagAvailability:
     post:
@@ -1596,8 +2156,14 @@ paths:
 
   /subscription/create:
     post:
-      summary: Create a new subscription
+      summary: Buy a plan (Subscriptions v2, Stripe Billing)
       tags: [Subscription]
+      description: |
+        Starts a Stripe subscription for the caller and answers with what the
+        payment sheet needs. A customer covered by their linked partner's plan
+        cannot buy one of their own while linked (409 `ON_PARTNERS_PLAN`) —
+        one plan covers the pair. A customer holding their own live plan keeps
+        the older 400 answer.
       requestBody:
         required: true
         content:
@@ -1607,21 +2173,51 @@ paths:
               properties:
                 userId:
                   type: string
-                planType:
+                tier:
                   type: string
-                  enum: [monthly, annual]
-                paymentMethodId:
+                  enum: [street_cleaning, home_garage, valet_anywhere]
+                interval:
                   type: string
-                referralCode:
+                  enum: [week, month]
+                movesPerWeek:
+                  type: integer
+                  enum: [1, 2]
+                  description: street_cleaning only
+                aspSchedule:
+                  type: object
+                  description: Required on street_cleaning (the cleaning days the auto-booker runs on)
+                homeAddress:
+                  type: object
+                  description: Required on home_garage (the fixed address); dropped on other tiers
+                promoCode:
                   type: string
-              required: [userId, planType, paymentMethodId]
+                supportsSetupIntent:
+                  type: boolean
+              required: [userId, tier, interval]
       responses:
-        '200':
-          description: Subscription created successfully
+        '201':
+          description: Subscription started — present the payment sheet, or already active when nothing is due
+        '400':
+          description: Missing or unknown fields, a bad promo code, or "You already have a subscription. Manage it from your profile."
+        '404':
+          description: User not found
+        '409':
+          description: "`ON_PARTNERS_PLAN` — \"You're on [First name]'s plan.\" The caller's linked partner holds a live plan that already covers them."
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Subscription'
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    default: false
+                  code:
+                    type: string
+                    enum: [ON_PARTNERS_PLAN]
+                  message:
+                    type: string
+        '503':
+          description: Stripe not configured
 
   /subscription/generate-referral:
     post:
@@ -1654,8 +2250,19 @@ paths:
 
   /subscription/status/{userId}:
     get:
-      summary: Get subscription status for user
+      summary: The plan covering this customer
       tags: [Subscription]
+      description: |
+        The customer's own live plan if they hold one. Otherwise, when they are
+        linked and their partner holds a live plan, that plan — read-only:
+        `hasActiveSubscription: true` (shipped builds read this and treat the
+        partner as subscribed, which is correct), `readOnly: true`, and
+        `heldBy` naming the holder. In that partner payload the fields about
+        paying for and managing the plan are null (amountCents, interval,
+        currentPeriodEnd, cancelAtPeriodEnd, homeAddressChangedAt,
+        periodUsageCents, refundIfCancelledCents, promoCode, trial,
+        valueIndicator); the tier, the coverage rows, the cleaning days and the
+        fixed address stay. No Stripe id or card detail is in either payload.
       parameters:
         - in: path
           name: userId
@@ -1668,7 +2275,274 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Subscription'
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  hasActiveSubscription:
+                    type: boolean
+                  subscription:
+                    type: object
+                    nullable: true
+                    description: buildStatusPayload (services/subscriptionService.js), or null
+                  readOnly:
+                    type: boolean
+                    description: Present and true only when the plan is the linked partner's. The caller can see it and is covered by it, and cannot change, cancel or pay for it.
+                  heldBy:
+                    allOf:
+                      - $ref: '#/components/schemas/PartnerSummary'
+                    description: Present only with readOnly — the partner who holds the plan
+        '500':
+          description: Server error
+
+  /subscription/quote:
+    post:
+      summary: What this booking will cost, and why
+      tags: [Subscription]
+      description: |
+        Mounted at /api/subscription/quote (routes/quote.js). Uses the same
+        coverage and pricing functions as createOrder. The plan considered is
+        the customer's own, else their linked partner's.
+
+        A plan covers one park at a time across a linked pair: while another car
+        is riding it (an unfinished order stamped with the plan, or a car we are
+        still holding on it, booked by someone other than this customer) a new
+        park is `partner_park_live` — charged at list price and not indefinite.
+        A retrieval is never refused by that rule.
+
+        On a partner's plan, the sentences that say whose plan or whose home
+        spot name the holder ("Free with Sam's plan").
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                userId:
+                  type: string
+                  description: Also accepted as `customer`
+                orderType:
+                  type: string
+                  enum: [parking, retrieval]
+                aspMode:
+                  type: boolean
+                lat:
+                  type: number
+                lng:
+                  type: number
+                serviceType:
+                  type: string
+                carWatch:
+                  type: boolean
+                duration:
+                  type: number
+                originalOrderId:
+                  type: string
+                awayMode:
+                  type: boolean
+                awayService:
+                  type: string
+                awayDays:
+                  type: number
+                pickUpTime:
+                  type: string
+                  format: date-time
+                awayEndTime:
+                  type: string
+                  format: date-time
+              required: [userId]
+      responses:
+        '200':
+          description: The quote
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  covered:
+                    type: boolean
+                  reason:
+                    type: string
+                    enum:
+                      - daily_free_park
+                      - asp_move_covered
+                      - retrieval_included_with_park
+                      - no_active_subscription
+                      - partner_park_live
+                      - weekly_asp_limit_reached
+                      - tier_has_no_free_park
+                      - daily_free_park_used
+                      - no_home_address_on_file
+                      - order_location_missing
+                      - not_at_home_address
+                      - car_watch_not_covered
+                      - away_not_covered
+                      - retrieval_not_covered
+                  label:
+                    type: string
+                    description: |
+                      The short line next to the button. For partner_park_live:
+                      "Not covered — [First name]'s park is using the plan"
+                      (the partner's name), or "Not covered — another park is
+                      using the plan" for anyone else's park.
+                  detail:
+                    type: string
+                    description: One sentence. For partner_park_live, "It's covered again once that park ends."
+                  priceCents:
+                    type: integer
+                    description: The only number to render; 0 means no payment step
+                  listPriceCents:
+                    type: integer
+                  savedCents:
+                    type: integer
+                  indefinite:
+                    type: boolean
+                    description: False for a partner_park_live park — an ordinary paid park with an end time
+                  indefiniteLabel:
+                    type: string
+                  plan:
+                    type: object
+                    nullable: true
+                    properties:
+                      tier:
+                        type: string
+                      name:
+                        type: string
+                      movesPerWeek:
+                        type: integer
+        '400':
+          description: userId is required
+        '404':
+          description: User not found
+
+  /subscription/cancel:
+    post:
+      summary: Cancel the caller's plan now, refunding what was not used
+      tags: [Subscription]
+      security:
+        - FirebaseIdToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                userId:
+                  type: string
+              required: [userId]
+      responses:
+        '200':
+          description: Cancelled, with the refund outcome
+        '401':
+          description: No valid Firebase ID token
+        '403':
+          description: The token is not this account's
+        '404':
+          description: |
+            The caller holds no live plan. When they are covered by their linked
+            partner's plan the message says so: "That plan is on [First name]'s
+            account." (only the holder can cancel it). Otherwise "No
+            subscription to cancel".
+
+  /subscription/change:
+    post:
+      summary: Change the caller's tier, interval or moves per week
+      tags: [Subscription]
+      security:
+        - FirebaseIdToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                userId:
+                  type: string
+                tier:
+                  type: string
+                  enum: [street_cleaning, home_garage, valet_anywhere]
+                interval:
+                  type: string
+                  enum: [week, month]
+                movesPerWeek:
+                  type: integer
+                homeAddress:
+                  type: object
+              required: [userId, tier, interval]
+      responses:
+        '200':
+          description: Changed; answers with the new status payload
+        '400':
+          description: Unknown tier or interval, a bad address, or a change not allowed right now
+        '401':
+          description: No valid Firebase ID token
+        '403':
+          description: The token is not this account's
+        '404':
+          description: |
+            The caller holds no live plan. When they are covered by their linked
+            partner's plan: "That plan is on [First name]'s account."
+            Otherwise "No subscription to change".
+        '503':
+          description: Payment service unavailable
+
+  /subscription/schedule:
+    put:
+      summary: Change the plan's cleaning days or fixed address
+      tags: [Subscription]
+      security:
+        - FirebaseIdToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                userId:
+                  type: string
+                aspSchedule:
+                  type: object
+                homeAddress:
+                  type: object
+              required: [userId]
+      responses:
+        '200':
+          description: Updated
+        '400':
+          description: Invalid schedule or address, or the address was changed too recently
+        '401':
+          description: No valid Firebase ID token
+        '403':
+          description: The token is not this account's
+        '404':
+          description: |
+            The caller holds no live plan. When they are covered by their linked
+            partner's plan: "That plan is on [First name]'s account."
+            Otherwise "No subscription found".
+
+  /subscription/prefill/{userId}:
+    get:
+      summary: Seed the plan wizard from what the customer already told us
+      tags: [Subscription]
+      parameters:
+        - in: path
+          name: userId
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: "`{ success, prefill }` — prefill is null when there is nothing to seed"
+        '404':
+          description: |
+            The caller is covered by their linked partner's plan and cannot buy
+            one: "That plan is on [First name]'s account."
 
   /subscription/process-billing:
     post:
@@ -1705,20 +2579,6 @@ paths:
       responses:
         '200':
           description: Payouts processed
-
-  /subscription/cancel/{subscriptionId}:
-    delete:
-      summary: Cancel subscription
-      tags: [Subscription]
-      parameters:
-        - in: path
-          name: subscriptionId
-          required: true
-          schema:
-            type: string
-      responses:
-        '200':
-          description: Subscription cancelled
 
   /subscription/count:
     get:

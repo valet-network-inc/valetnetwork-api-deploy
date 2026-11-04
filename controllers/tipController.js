@@ -124,10 +124,25 @@ exports.createTip = async (req, res) => {
                 message: `Order in status '${order.status}' cannot be tipped.`,
             });
         }
+        // Money follows the park. A linked partner (routes/order.js mounts
+        // requireOrderOwner, which lets them through) may tip on a park the
+        // other one booked, and the tip still goes on the BOOKER's card —
+        // `order.customer`, never the caller. `byPartner` only changes what we
+        // say and what we record, never whose card is charged.
+        const ownerId = String(order.customer._id);
+        const callerId = req.callerUserId ? String(req.callerUserId) : ownerId;
+        const byPartner = callerId !== ownerId;
+        const ownerFirstName = (order.customer.firstName || '').trim();
+        const partnerNoCard = ownerFirstName
+            ? `${ownerFirstName} has no card saved. A tip on their park goes on their card.`
+            : 'They have no card saved. A tip on their park goes on their card.';
+
         if (!order.customer.stripeCustomerId) {
             return res.status(400).json({
                 success: false,
-                message: 'No saved payment method on file for this customer.',
+                message: byPartner
+                    ? partnerNoCard
+                    : 'No saved payment method on file for this customer.',
             });
         }
 
@@ -140,7 +155,9 @@ exports.createTip = async (req, res) => {
         if (!paymentMethods.data.length) {
             return res.status(400).json({
                 success: false,
-                message: 'No saved card for this customer — please add one in the order flow first.',
+                message: byPartner
+                    ? partnerNoCard
+                    : 'No saved card for this customer — please add one in the order flow first.',
             });
         }
         const paymentMethodId = paymentMethods.data[0].id;
@@ -163,9 +180,32 @@ exports.createTip = async (req, res) => {
                     customerId: order.customer._id.toString(),
                     percentagePreset: percentagePreset ?? '',
                     context: context || 'general',
+                    // Audit only: who tapped, when it was not the booker.
+                    ...(byPartner ? { actedBy: callerId } : {}),
                 },
             });
         } catch (stripeErr) {
+            // The booker's bank wants a challenge, and the partner is holding
+            // the phone. Handing them the intent's client secret would put a
+            // 3-D Secure prompt for somebody else's card on their screen — the
+            // one thing a linked pair never shares. The intent is left
+            // unconfirmed (nothing is charged) and they are told who can
+            // finish it.
+            if (byPartner && stripeErr.code === 'authentication_required') {
+                const strandedId = stripeErr.raw?.payment_intent?.id;
+                if (strandedId) {
+                    try {
+                        await stripe.paymentIntents.cancel(strandedId);
+                    } catch (cancelErr) {
+                        console.error('Tip: could not cancel the unconfirmed intent', strandedId, cancelErr.message);
+                    }
+                }
+                return res.status(402).json({
+                    success: false,
+                    requiresAction: false,
+                    message: `${ownerFirstName ? `${ownerFirstName}'s` : 'Their'} bank wants them to approve this. Ask them to tip from their phone.`,
+                });
+            }
             // Card requires 3DS / authentication — return clientSecret so
             // mobile can use the Stripe SDK to complete the challenge.
             if (stripeErr.code === 'authentication_required' && stripeErr.raw?.payment_intent?.client_secret) {
@@ -219,6 +259,16 @@ exports.createTip = async (req, res) => {
                     totalTips: amountNet,
                 },
             });
+        }
+
+        // Ownership-adjacent audit: the linked partner tipped on the booker's
+        // park. The order, the Tip row and the charge all stay the booker's.
+        if (byPartner) {
+            try {
+                await Order.updateOne({ _id: order._id }, { $set: { actedBy: callerId } });
+            } catch (stampErr) {
+                console.error('Tip: actedBy stamp failed:', stampErr.message);
+            }
         }
 
         return res.json({

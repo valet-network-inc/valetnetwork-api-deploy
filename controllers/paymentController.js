@@ -153,6 +153,39 @@ exports.createPaymentIntent = async (req, res) => {
             });
         }
 
+        // Billing lookup, not an ownership gate — this route stays ungated (see
+        // routes/payment.js). But a linked partner can now SEE the other one's
+        // bookings, an unpaid one included, and the answer below hands over the
+        // booker's Stripe customer and an ephemeral key: their saved cards, on
+        // the partner's screen. A park is paid on the card of whoever booked
+        // it, so when the token on this request proves it is the partner
+        // asking, they are told whose it is instead. No token, or the booker's
+        // own, is answered exactly as before.
+        try {
+            const { partnerIdOf } = require('../services/accountLinks');
+            const partnerId = await partnerIdOf(order.customer._id);
+            if (partnerId) {
+                const { callerFirebaseUid } = require('../middleware/requireSelf');
+                const uid = await callerFirebaseUid(req);
+                if (uid && uid !== order.customer.firebaseUid) {
+                    const partner = await User.findById(partnerId).select('firebaseUid').lean();
+                    if (partner && partner.firebaseUid === uid) {
+                        const name = (order.customer.firstName || '').trim();
+                        return res.status(403).json({
+                            success: false,
+                            message: name
+                                ? `This park goes on ${name}'s card. Ask them to pay from their phone.`
+                                : 'This park goes on their card. Ask them to pay from their phone.',
+                        });
+                    }
+                }
+            }
+        } catch (linkErr) {
+            // Fails toward today's answer: a lookup error must never cost the
+            // booker their checkout.
+            console.error('createPaymentIntent: partner check failed:', linkErr.message);
+        }
+
         // Fetch amount from order's totalAmount
         // const amount = 50;
         // Gift card money comes off first; the card pays what is left.

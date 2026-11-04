@@ -244,8 +244,15 @@ async function buildStatusPayload(sub, now = new Date()) {
         try {
             const CurbCustody = require('../models/CurbCustody');
             const sweepWindows = require('./sweepWindows');
+            // Only a car of the holder's household as it stands today. A park
+            // a linked partner booked on this plan finishes on the plan after
+            // they unlink, and where their car stands is no longer the
+            // holder's business. Required here, not at the top: accountLinks
+            // requires this file.
+            const household = await require('./accountLinks').householdIds(sub.user);
             const custody = await CurbCustody.findOne({
                 subscription: sub._id,
+                customer: { $in: household },
                 closedAt: { $exists: false },
             })
                 .sort({ openedAt: -1 })

@@ -16,6 +16,7 @@ const Order = require('../models/Order');
 const User = require('../models/User');
 const CurbCustody = require('../models/CurbCustody');
 const curbCustody = require('../services/curbCustody');
+const { partnerIdOf, emitToHousehold } = require('../services/accountLinks');
 
 const OTP_EXPIRY_RETURN_KEY = 30 * 24 * 60 * 60 * 1000; // matches orderController
 
@@ -71,13 +72,26 @@ exports.requestKeys = async (req, res) => {
             return res.status(400).json({ success: false, message: 'userId is required' });
         }
 
-        const custody = await curbCustody.openFor(userId);
+        // Ownership gate, widened for the linked partner. A plan held by either
+        // of a linked pair covers both, one park at a time, so the car we are
+        // holding may be the one the OTHER of them booked — and either of them
+        // may ask for its keys. Their own car first; the partner's only when
+        // we hold none of theirs. From here on the car's owner is `keyOwner`:
+        // the delivery is their job, on their park, with `actedBy` recording
+        // who asked.
+        let custody = await curbCustody.openFor(userId);
+        if (!custody) {
+            const partnerId = await partnerIdOf(userId);
+            if (partnerId) custody = await curbCustody.openFor(partnerId);
+        }
         if (!custody) {
             return res.status(409).json({
                 success: false,
                 message: 'We are not holding a car for you right now.',
             });
         }
+        const keyOwner = String(custody.customer);
+        const byPartner = keyOwner !== String(userId);
         if (custody.keysWith !== 'valet') {
             return res.status(409).json({
                 success: false,
@@ -93,16 +107,18 @@ exports.requestKeys = async (req, res) => {
             return res.status(409).json({
                 success: false,
                 message: 'Your keys are already on the way.',
-                keys: await keyStateFor(userId),
+                keys: await keyStateFor(keyOwner),
             });
         }
 
         const parkOrder = await Order.findById(custody.currentOrder).lean();
-        const customer = await User.findById(userId).select('firstName lastName firebaseUid').lean();
+        // The car's owner: theirs is the name on the valet's push and job.
+        const customer = await User.findById(keyOwner).select('firstName lastName firebaseUid').lean();
 
         const now = new Date();
         const delivery = new Order({
-            customer: userId,
+            customer: keyOwner,
+            ...(byPartner ? { actedBy: userId } : {}),
             // Where the customer is, which is where the keys have to go — NOT
             // where the car is. This job never touches the car.
             customerLocation:
@@ -128,6 +144,11 @@ exports.requestKeys = async (req, res) => {
             totalAmount: 0,
             paymentStatus: 'paid',
             serviceType: 'park-and-hold',
+            // The plan that is holding this car, read off the custody row —
+            // never looked up for whoever asked. Since accounts can be linked
+            // that matters: the row was opened on the household's plan
+            // (curbCustody.classify), which may be the partner's, and it stays
+            // right after an unlink, when the asker may have no plan at all.
             coveredBySubscription: custody.subscription,
             keyDeliveryOnly: true,
             linkedOrderId: custody.currentOrder,
@@ -178,13 +199,15 @@ exports.requestKeys = async (req, res) => {
             if (custody.keyHolder) {
                 req.io.to(String(custody.keyHolder)).emit('newOrder', delivery);
             }
-            req.io.to(String(userId)).emit('orderUpdated', delivery);
+            // The car's owner and, when linked, their partner — one of whom
+            // just asked.
+            await emitToHousehold(req.io, keyOwner, 'orderUpdated', delivery);
         }
 
         return res.json({
             success: true,
             order: delivery,
-            keys: await keyStateFor(userId),
+            keys: await keyStateFor(keyOwner),
             message: 'A valet is bringing your keys. Your car stays parked.',
         });
     } catch (err) {

@@ -182,6 +182,9 @@ app.use('/api/auth', require('./routes/auth'));
 app.use('/api/order', require('./routes/order'));
 app.use('/api/photo', require('./routes/photoLink'));
 app.use('/api/share', require('./routes/share'));
+// Link account: two customers sharing their parks and a plan
+// (controllers/accountLinkController.js).
+app.use('/api/account-link', require('./routes/accountLink'));
 app.use('/api/pricing', require('./routes/pricing'));
 app.use('/api/chauffeur', require('./routes/chauffeur'));
 app.use('/api/parking-notes', require('./routes/parkingNote'));

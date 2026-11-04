@@ -31,6 +31,12 @@
  * extra hour on a car we are already holding for them under a flat monthly
  * fee. That is money taken for something already paid for. `coveredByPlan`
  * below is now the first question both phases ask.
+ *
+ * A linked partner (models/AccountLink.js) can extend a park the other one
+ * booked, and the extension goes on the BOOKER's card — money follows the
+ * park, whoever tapped. That one takes neither phase either: it is charged
+ * off-session on the booker's saved card and applied at once, so the booker's
+ * cards never appear on the partner's phone. See `resolveCaller`.
  */
 
 const stripeModule = require('stripe');
@@ -42,6 +48,8 @@ const Order = require('../models/Order');
 const User = require('../models/User');
 const giftBalance = require('../services/giftBalance');
 const { sendPushNotification } = require('./notificationController');
+const { callerFirebaseUid } = require('../middleware/requireSelf');
+const { partnerIdOf } = require('../services/accountLinks');
 
 const ACTIVE_STATUSES = ['accepted', 'in-progress', 'in_progress', 'parked'];
 
@@ -105,6 +113,198 @@ const pushValetExtension = async (order, additionalHours) => {
         console.error('extension valet push failed:', err.message);
     }
 };
+
+/**
+ * Who is asking for the time, as far as the request can prove it.
+ *
+ * These routes have never asked. The shipped iOS app calls them with raw
+ * `fetch` and no token (services/extensionService.js), so gating them would
+ * take "add more time" off every phone in the field — and for the person who
+ * booked the park, nothing changes here: an unproven caller is answered exactly
+ * as before, on their own saved cards.
+ *
+ * A linked partner is different, because money follows the park. An extension
+ * on a park the OTHER one booked goes on the booker's card, and the normal
+ * answer would hand the partner's phone the booker's Stripe customer and an
+ * ephemeral key — their saved cards, on somebody else's screen. So a partner
+ * is charged off-session on the booker's saved card instead (the way a tip
+ * is), and that only happens for a caller whose token proves they are that
+ * partner. `requestedBy` naming the partner without a token is a claim, not a
+ * proof, and it moves nobody's money.
+ *
+ *   { kind: 'owner' }                     — proven, or unproven as today
+ *   { kind: 'partner', callerId }         — proven linked partner
+ *   { kind: 'unproven_partner' }          — names the partner, proves nothing
+ *
+ * Never throws; a failed lookup reads as the old, unproven answer.
+ */
+async function resolveCaller(req, order) {
+    const ownerId = String((order.customer && order.customer._id) || order.customer);
+    const named = req.body && req.body.requestedBy ? String(req.body.requestedBy) : null;
+    try {
+        const partnerId = await partnerIdOf(ownerId);
+        if (!partnerId) return { kind: 'owner' };
+
+        const uid = await callerFirebaseUid(req);
+        if (uid) {
+            const partner = await User.findById(partnerId).select('firebaseUid').lean();
+            if (partner && partner.firebaseUid && partner.firebaseUid === uid) {
+                return { kind: 'partner', callerId: partnerId };
+            }
+            const owner = await User.findById(ownerId).select('firebaseUid').lean();
+            if (owner && owner.firebaseUid && owner.firebaseUid === uid) {
+                return { kind: 'owner' };
+            }
+        }
+        if (named && named === partnerId) return { kind: 'unproven_partner' };
+        return { kind: 'owner' };
+    } catch (err) {
+        console.error('extension: caller lookup failed:', err.message);
+        return { kind: 'owner' };
+    }
+}
+
+/**
+ * The partner's extension: charged off-session to the BOOKER's saved card and
+ * applied on the spot, so there is no PaymentSheet (and no second phase) on the
+ * partner's phone. Answers with no clientSecret — both clients already read
+ * that as "nothing left to pay here", and `applied` as "the time is on".
+ */
+async function extendForPartner({ order, hours, callerId, res }) {
+    const booker = order.customer;
+    const bookerName = ((booker && booker.firstName) || '').trim();
+    // "Sam's" / "Their" — the start of a sentence either way.
+    const theirs = bookerName ? `${bookerName}'s` : 'Their';
+    const noCard = bookerName
+        ? `${bookerName} has no card saved. Time on their park goes on their card.`
+        : 'They have no card saved. Time on their park goes on their card.';
+
+    if (!booker || !booker.stripeCustomerId) {
+        return res.status(400).json({ success: false, message: noCard });
+    }
+    const methods = await stripe.paymentMethods.list({
+        customer: booker.stripeCustomerId,
+        type: 'card',
+        limit: 1,
+    });
+    if (!methods.data.length) {
+        return res.status(400).json({ success: false, message: noCard });
+    }
+
+    const amountCents = calcExtensionCents(hours);
+    let intent;
+    try {
+        intent = await stripe.paymentIntents.create(
+            {
+                amount: amountCents,
+                currency: 'usd',
+                customer: booker.stripeCustomerId,
+                payment_method: methods.data[0].id,
+                off_session: true,
+                confirm: true,
+                description: `Parking extension (order ${order._id})`,
+                // `purpose: 'extension'` is what keeps the Stripe webhook from
+                // writing this charge over the order's own payment
+                // (paymentController.handleStripeWebhook).
+                metadata: {
+                    orderId: String(order._id),
+                    customerId: String(booker._id),
+                    purpose: 'extension',
+                    additionalHours: String(hours),
+                    requestedBy: String(callerId),
+                    actedBy: String(callerId),
+                },
+            },
+            // There is no PaymentSheet between the tap and the charge here, so
+            // nothing stops a double tap except this: the same partner asking
+            // for the same hours on the same park inside one minute is the
+            // same charge, and Stripe answers the second with the first.
+            {
+                idempotencyKey: `extension-${order._id}-${callerId}-${hours}-${Math.floor(
+                    Date.now() / 60000
+                )}`,
+            }
+        );
+    } catch (stripeErr) {
+        // The booker's bank wants a challenge. Their 3-D Secure prompt does
+        // not belong on the partner's phone, so nothing is charged and the
+        // partner is told who can finish it.
+        if (stripeErr.code === 'authentication_required') {
+            const strandedId = stripeErr.raw && stripeErr.raw.payment_intent && stripeErr.raw.payment_intent.id;
+            if (strandedId) {
+                try {
+                    await stripe.paymentIntents.cancel(strandedId);
+                } catch (cancelErr) {
+                    console.error('extension: could not cancel the unconfirmed intent', strandedId, cancelErr.message);
+                }
+            }
+            return res.status(402).json({
+                success: false,
+                message: `${theirs} bank wants them to approve this. Ask them to add the time from their phone.`,
+            });
+        }
+        console.error('extension: partner charge failed:', stripeErr.message);
+        return res.status(402).json({
+            success: false,
+            message: stripeErr.message || 'Payment failed',
+        });
+    }
+
+    if (intent.status !== 'succeeded') {
+        // Off-session and confirmed in one call, so anything else is a
+        // charge that did not land. Do not add time we were not paid for.
+        return res.status(402).json({
+            success: false,
+            message: `${theirs} card didn't go through. Ask them to add the time from their phone.`,
+        });
+    }
+
+    const charged = intent.amount_received || intent.amount || amountCents;
+    // Applied once per intent, atomically: a double tap that Stripe answered
+    // with the same intent must not add the hours twice.
+    const applied = await Order.findOneAndUpdate(
+        { _id: order._id, 'extensions.paymentIntentId': { $ne: intent.id } },
+        {
+            $inc: { duration: hours * 60 },
+            $push: {
+                extensions: {
+                    additionalHours: hours,
+                    amountCents: charged,
+                    paymentIntentId: intent.id,
+                    chargedAt: new Date(),
+                    requestedBy: callerId,
+                },
+            },
+            // Audit only. The order, the charge and the receipt stay the booker's.
+            $set: { actedBy: callerId },
+        },
+        { new: true }
+    );
+    const current = applied || (await Order.findById(order._id));
+
+    if (applied) await pushValetExtension(applied, hours);
+
+    return res.json({
+        success: true,
+        covered: false,
+        charged: true,
+        applied: true,
+        ...(applied ? {} : { alreadyApplied: true }),
+        amountCents: charged,
+        additionalHours: hours,
+        newDurationMinutes: current.duration,
+        // The ledger without its PaymentIntent ids: those charges are the
+        // booker's, and no Stripe id of one reaches the other.
+        extensions: (current.extensions || []).map((e) => {
+            const { paymentIntentId, ...row } = typeof e.toObject === 'function' ? e.toObject() : e;
+            return row;
+        }),
+        // Printed verbatim by both clients, like the covered answer's.
+        message: bookerName
+            ? `Time added. It went on ${bookerName}'s card.`
+            : 'Time added. It went on their card.',
+    });
+}
 
 /**
  * POST /api/order/:orderId/extend
@@ -172,8 +372,15 @@ exports.createExtensionIntent = async (req, res) => {
             });
         }
 
+        // Owner or linked partner — see resolveCaller. Asked once, here,
+        // because both the free answer below and the paid one record it.
+        const caller = await resolveCaller(req, order);
+
         if (coveredByPlan(order)) {
             order.duration = (order.duration || 0) + hours * 60;
+            // Ownership gate widened for the linked partner: audit who added
+            // the time when it was not the booker. Nothing is charged here.
+            if (caller.kind === 'partner') order.actedBy = caller.callerId;
             await order.save();
 
             // No `extensions` row is written. That array is the ledger of
@@ -200,6 +407,20 @@ exports.createExtensionIntent = async (req, res) => {
                 success: false,
                 message: 'Stripe is not configured.',
             });
+        }
+
+        // Money follows the park: a partner's extension goes on the booker's
+        // saved card, charged here, never through a PaymentSheet on the
+        // partner's phone. Someone merely NAMING the partner gets nothing —
+        // not the booker's Stripe customer, not an off-session charge.
+        if (caller.kind === 'unproven_partner') {
+            return res.status(401).json({
+                success: false,
+                message: 'Sign in again to continue.',
+            });
+        }
+        if (caller.kind === 'partner') {
+            return extendForPartner({ order, hours, callerId: caller.callerId, res });
         }
 
         // Ensure Stripe customer exists (mirrors createPaymentIntent flow).

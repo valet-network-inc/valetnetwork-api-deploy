@@ -586,7 +586,13 @@ exports.notifyClosestValets = async (req, res) => {
         // `.toString()` on it serialises the whole user document into the room
         // name — a room nobody is in. The customer's own socket joins a room
         // named by their id, so it has to be `._id`.
-        req.io.to(order.customer._id.toString()).emit('orderUpdated', {
+        //
+        // To their linked partner's room too: a paid park is announced to
+        // the customer nowhere else, so without this the partner's home screen
+        // would not see it until a valet accepted. The partner's copy has the
+        // populated customer cut down to a partner summary.
+        const { emitToHousehold } = require('../services/accountLinks');
+        await emitToHousehold(req.io, order.customer._id, 'orderUpdated', {
             type: 'NEW_ORDER',
             order: order,
         });

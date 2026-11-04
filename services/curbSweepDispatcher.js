@@ -325,7 +325,10 @@ async function bookMove(custody, occurrence, window, { io, notify, now, staggerM
 
     if (io) {
         io.emit('newOrder', order);
-        io.to(String(custody.customer)).emit('orderUpdated', order);
+        // The car's owner and, when linked, their partner: both home screens
+        // show the parks either of them booked, and the sweep move is one.
+        const { emitToHousehold } = require('./accountLinks');
+        await emitToHousehold(io, custody.customer, 'orderUpdated', order);
     }
 
     try {

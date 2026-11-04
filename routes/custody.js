@@ -19,7 +19,9 @@ const requireSelf = require('../middleware/requireSelf');
 // both the delivery and the code for it.
 //
 // Both callers are the account holder on a signed-in screen — iOS
-// KeyCustody.js:169 and web keys-card.tsx:110 — and both send the token. No
+// KeyCustody.js:169 and web keys-card.tsx:110 — and both send the token. (A
+// linked partner names THEIR OWN id here too; the controller finds the car we
+// hold for either of the pair, so the gate never has to trust a second id.) No
 // valet, admin, webhook or unauthenticated page calls it. The custody unit
 // tests invoke the controller function directly, so they do not pass through
 // this middleware.

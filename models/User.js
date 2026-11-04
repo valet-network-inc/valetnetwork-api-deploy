@@ -66,6 +66,15 @@ const UserSchema = new mongoose.Schema({
     profileImage: {
         type: String,
     },
+    // Profile → Your car. The app has always posted this to updateUser, which
+    // dropped it, so a saved car lasted until the next launch. Stored now so
+    // it survives, and so linking two accounts can copy it into an empty
+    // profile (controllers/accountLinkController.js).
+    //
+    // select:false keeps it out of every read that does not ask for it by
+    // name — above all GET /api/auth/getUserById, which is ungated and returns
+    // the whole record, and every `populate('customer')` a valet sees. Only
+    // loginUser (the account's own session) asks for it.
     currentLocation: {
         lat: { type: Number },
         lng: { type: Number },
@@ -357,13 +366,24 @@ const UserSchema = new mongoose.Schema({
     // Handoff codes at the key handoffs: off unless the user switches them on
     // (Profile → Handoff codes). Copied onto each order as `handoffCode`.
     handoffCodes: { type: Boolean, default: false },
+    // select:false (Sep 23, account linking): kept out of every read that does
+    // not ask for it by name, above all the ungated getUserById and every
+    // populate('customer') a valet sees. The account's own session reads it
+    // (loginUser, updateUser's reply); the valet's prefill asks for it
+    // (services/accountVehicle.js); linking copies it into an empty profile.
     vehicle: {
-        color: { type: String, trim: true },
-        model: { type: String, trim: true },
-        licensePlate: { type: String, trim: true, uppercase: true },
-        source: { type: String, enum: ['customer', 'valet', 'operator'] },
-        by: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-        at: { type: Date },
+        type: new mongoose.Schema(
+            {
+                color: { type: String, trim: true },
+                model: { type: String, trim: true },
+                licensePlate: { type: String, trim: true, uppercase: true },
+                source: { type: String, enum: ['customer', 'valet', 'operator'] },
+                by: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+                at: { type: Date },
+            },
+            { _id: false }
+        ),
+        select: false,
     },
 
     // --- The handoff link the customer gives their doorman ----------------

@@ -75,8 +75,13 @@ test('the Your car screen saves the car on the account', async () => {
         .send({ phone: user.phone, vehicle: { color: ' Black ', model: 'Subaru Forester', licensePlate: 'mjz-5749' } });
     expect(res.status).toBe(200);
 
+    // Stored on the account; the open user read never carries it (account
+    // linking, Sep 23: anyone with an id could read a plate), so the account's
+    // own reads ask for it by name.
     const got = await request(app).get(`/api/auth/getUserById/${user._id}`);
-    expect(got.body.user.vehicle).toMatchObject({
+    expect(got.body.user.vehicle).toBeUndefined();
+    const stored = await User.findById(user._id).select('+vehicle').lean();
+    expect(stored.vehicle).toMatchObject({
         color: 'Black',
         model: 'Subaru Forester',
         licensePlate: 'MJZ-5749',
@@ -88,10 +93,10 @@ test('all three fields blank clears the car, and a car with no plate is ignored'
     const user = await makeUser({ vehicle: { color: 'Black', model: 'Subaru Forester', licensePlate: 'MJZ-5749', source: 'valet' } });
 
     await request(app).post('/api/auth/updateUser').send({ phone: user.phone, vehicle: { color: 'Red', model: 'Mini', licensePlate: '' } });
-    expect((await User.findById(user._id).lean()).vehicle.licensePlate).toBe('MJZ-5749');
+    expect((await User.findById(user._id).select('+vehicle').lean()).vehicle.licensePlate).toBe('MJZ-5749');
 
     await request(app).post('/api/auth/updateUser').send({ phone: user.phone, vehicle: { color: '', model: '', licensePlate: '' } });
-    expect((await User.findById(user._id).lean()).vehicle).toBeUndefined();
+    expect((await User.findById(user._id).select('+vehicle').lean()).vehicle).toBeUndefined();
 });
 
 test('the car a valet logs lands on the customer account', async () => {
@@ -104,7 +109,7 @@ test('the car a valet logs lands on the customer account', async () => {
         .send({ orderId: String(order._id), vehicle: CAR });
     expect(res.status).toBe(200);
 
-    const after = await User.findById(customer._id).lean();
+    const after = await User.findById(customer._id).select('+vehicle').lean();
     expect(after.vehicle).toMatchObject({
         color: 'Black',
         model: 'Subaru Forester',
@@ -137,6 +142,6 @@ test('a note typed into the car fields never becomes the customer\'s car', async
         .post('/api/order/addVehicleInfo')
         .send({ orderId: String(order._id), vehicle: { color: 'Can\u2019t find vehicle/phone won\u2019t dial', model: 'x', licensePlate: 'X' } });
 
-    const after = await User.findById(customer._id).lean();
+    const after = await User.findById(customer._id).select('+vehicle').lean();
     expect(after.vehicle && after.vehicle.licensePlate).toBeFalsy();
 });

@@ -19,6 +19,7 @@
 
 const dotenv = require('dotenv');
 dotenv.config({ path: `.env.${process.env.NODE_ENV}` });
+const mongoose = require('mongoose');
 const Subscription = require('../models/Subscription');
 const { adoptFromSubscription } = require('../services/cleaningSchedule');
 const User = require('../models/User');
@@ -68,6 +69,116 @@ const {
 const { buildPriceQuote, shortDate, perUnit } = require('../services/priceQuote');
 const { nyClock } = require('../services/nyTime');
 const unlocks = require('../services/neighborhoodUnlocks');
+const accountLinks = require('../services/accountLinks');
+
+// ---------------------------------------------------------------------------
+// Linked accounts (2026-09-23).
+//
+// A plan held by either of a linked pair covers both (services/accountLinks.js),
+// and only the one who holds it controls it. The partner sees it on their own
+// Profile, read-only, headed "On [Name]'s plan"; Change plan, Cancel, the fixed
+// address and the card stay on the holder's phone.
+//
+// Nothing below had to learn a new way to find a plan for that. Every route
+// that changes, cancels or re-addresses one finds it by `user: userId` and
+// proves the caller IS that user (requireSelf in routes/subscription.js —
+// /schedule joined /change and /cancel for this), so the partner's own id
+// finds nothing and the holder's id is refused to them. What changes is how
+// "nothing" is said: a 404 that names whose account the plan is on, instead of
+// telling a covered customer they have no plan. The two answers that DO change
+// are status (the partner's plan, read-only) and create (no second plan on top
+// of the partner's; naming the holder there only ever meets the holder's own
+// "you already have a subscription").
+// ---------------------------------------------------------------------------
+
+/** "Sam's", or "their" for an account with no first name on it. */
+const possessive = (summary) => {
+    const name = accountLinks.firstNameOf(summary, '');
+    return name ? `${name}'s` : 'their';
+};
+
+/**
+ * The holder's partner summary when this customer is covered by their linked
+ * partner's plan and has none of their own, else null.
+ *
+ * "None of their own" includes a past_due one. That plan no longer covers
+ * them (getHouseholdSubscription looks past it to the partner's), but it is
+ * still theirs to fix or cancel, and every route keeps answering about it.
+ */
+async function partnersPlanHolder(userId) {
+    const { sub, heldBy } = await accountLinks.getHouseholdSubscription(userId);
+    if (!sub || !heldBy || heldBy === 'self') return null;
+    const own = await Subscription.exists({
+        user: userId,
+        status: { $in: ['active', 'past_due'] },
+    });
+    return own ? null : heldBy;
+}
+
+const onPartnersAccount = (holder) => `That plan is on ${possessive(holder)} account.`;
+
+// What the partner is not shown of the holder's plan: what it costs, when it
+// renews, the free-trial block (its card check and promo code), what a cancel
+// would refund, what the holder has paid, and when the fixed address last
+// moved (the address editor's once-a-month lock). No Stripe id or card detail
+// is in buildStatusPayload to begin with.
+//
+// Nulled rather than deleted. Shipped builds read `hasActiveSubscription` and
+// render this as if it were the partner's own plan, and their manage screen
+// reads these keys; a null formats as nothing, an absent key can throw.
+const PARTNER_HIDDEN_FIELDS = [
+    'amountCents',
+    'interval',
+    'currentPeriodEnd',
+    'cancelAtPeriodEnd',
+    'homeAddressChangedAt',
+    'periodUsageCents',
+    'refundIfCancelledCents',
+    'promoCode',
+    'trial',
+    'valueIndicator',
+];
+
+/**
+ * The holder's plan as their partner sees it: the tier, the coverage rows
+ * (moves this week, today's free park), the cleaning days and the fixed
+ * address — the partner's parks are judged against both — and the held-car and
+ * key state, since either of them may be the one whose car we are holding.
+ */
+function forPartner(payload) {
+    const out = { ...payload };
+    for (const field of PARTNER_HIDDEN_FIELDS) out[field] = null;
+    return out;
+}
+
+/**
+ * GET /status for a customer with no live plan of their own: covered by their
+ * linked partner's plan (read-only), or not covered at all.
+ */
+async function statusWithoutOwnPlan(userId) {
+    const { sub, heldBy } = await accountLinks.getHouseholdSubscription(userId);
+    if (!sub) {
+        // No plan on either account: a plan waiting on a neighborhood, if any.
+        return { success: true, hasActiveSubscription: false, subscription: await waitingPlanFor(userId) };
+    }
+    if (heldBy === 'self') {
+        // Went live between the two reads (a webhook landing mid-request).
+        return {
+            success: true,
+            hasActiveSubscription: true,
+            subscription: await buildStatusPayload(sub),
+        };
+    }
+    return {
+        success: true,
+        // True for shipped builds too, which treat the partner as subscribed —
+        // correct, their parks are covered.
+        hasActiveSubscription: true,
+        subscription: forPartner(await buildStatusPayload(sub)),
+        heldBy,
+        readOnly: true,
+    };
+}
 
 // A free month needs a card behind it, and an app build that can only open a
 // payment sheet cannot save a card without charging something. Stripe's floor
@@ -385,6 +496,43 @@ exports.createSubscription = async (req, res) => {
     } = req.body;
 
     try {
+        // Covered by the plan their linked partner holds. One plan covers the
+        // pair, and a second bought on top would be a second bill for the same
+        // cover — which is also why linking is refused while both hold one.
+        // They can buy their own once they unlink, or once the holder cancels.
+        //
+        // Asked before anything else, Stripe included: the answer does not
+        // depend on it, and nothing about a purchase should start for someone
+        // who cannot make one. Their OWN live plan is not this check — that
+        // keeps its answer below, and a customer holding one is never told
+        // they are on somebody else's.
+        //
+        // Here a partner's past_due plan counts too. It covers nobody while
+        // the card is bouncing, but it is still live: the moment it clears it
+        // covers them both again, and a plan bought in the meantime would
+        // leave the pair holding two.
+        if (mongoose.isValidObjectId(userId)) {
+            let holder = await partnersPlanHolder(userId);
+            if (!holder) {
+                const partner = await accountLinks.partnerOf(userId);
+                const live = { $in: ['active', 'past_due'] };
+                if (
+                    partner &&
+                    !(await Subscription.exists({ user: userId, status: live })) &&
+                    (await Subscription.exists({ user: partner._id, status: live }))
+                ) {
+                    holder = partner;
+                }
+            }
+            if (holder) {
+                return res.status(409).json({
+                    success: false,
+                    code: 'ON_PARTNERS_PLAN',
+                    message: `You're on ${possessive(holder)} plan.`,
+                });
+            }
+        }
+
         if (!stripe()) {
             return res.status(503).json({
                 success: false,
@@ -819,12 +967,9 @@ exports.getSubscriptionStatus = async (req, res) => {
             status: { $in: ['active', 'past_due', 'incomplete'] },
         }).sort({ createdAt: -1 });
 
+        // No plan of their own — possibly covered by their linked partner's.
         if (!sub) {
-            return res.status(200).json({
-                success: true,
-                hasActiveSubscription: false,
-                subscription: await waitingPlanFor(userId),
-            });
+            return res.status(200).json(await statusWithoutOwnPlan(userId));
         }
 
         // An incomplete doc can be waiting on webhook delivery — reconcile
@@ -859,12 +1004,11 @@ exports.getSubscriptionStatus = async (req, res) => {
             }
         }
 
+        // Still not live: an abandoned purchase, or one Stripe has since
+        // expired. It must not hide the partner's plan — a partner who once
+        // opened the payment sheet and walked away is still covered by it.
         if (!['active', 'past_due'].includes(sub.status)) {
-            return res.status(200).json({
-                success: true,
-                hasActiveSubscription: false,
-                subscription: await waitingPlanFor(userId),
-            });
+            return res.status(200).json(await statusWithoutOwnPlan(userId));
         }
 
         res.status(200).json({
@@ -911,7 +1055,13 @@ exports.cancelSubscription = async (req, res) => {
             status: { $in: ['active', 'past_due'] },
         });
         if (!sub) {
-            return res.status(404).json({ success: false, message: 'No subscription to cancel' });
+            // A linked partner is covered by the plan but does not hold it.
+            // Cancelling it is the holder's call, from the holder's phone.
+            const holder = await partnersPlanHolder(userId);
+            return res.status(404).json({
+                success: false,
+                message: holder ? onPartnersAccount(holder) : 'No subscription to cancel',
+            });
         }
 
         const usedCents = await periodUsageCents(sub);
@@ -1080,7 +1230,13 @@ exports.changePlan = async (req, res) => {
             status: { $in: ['active', 'past_due'] },
         });
         if (!sub) {
-            return res.status(404).json({ success: false, message: 'No subscription to change' });
+            // Same as cancel: a plan is changed by whoever holds it. The
+            // upgrade it would bill lands on the holder's card.
+            const holder = await partnersPlanHolder(userId);
+            return res.status(404).json({
+                success: false,
+                message: holder ? onPartnersAccount(holder) : 'No subscription to change',
+            });
         }
 
         // Switching plans mid-trial would move the free month onto a more
@@ -1327,7 +1483,13 @@ exports.updateSchedule = async (req, res) => {
             status: { $in: ['active', 'past_due'] },
         });
         if (!sub) {
-            return res.status(404).json({ success: false, message: 'No subscription found' });
+            // The address editor and the cleaning days on a partner's plan
+            // belong to the holder, like the rest of it.
+            const holder = await partnersPlanHolder(userId);
+            return res.status(404).json({
+                success: false,
+                message: holder ? onPartnersAccount(holder) : 'No subscription found',
+            });
         }
 
         if (aspSchedule) {
@@ -1446,6 +1608,16 @@ exports.updateSchedule = async (req, res) => {
 exports.getPrefill = async (req, res) => {
     const { userId } = req.params;
     try {
+        // The wizard this seeds only ends in a purchase, and a linked partner
+        // covered by the other one's plan cannot make one (createSubscription
+        // answers ON_PARTNERS_PLAN). Say so here, before they fill it in.
+        if (mongoose.isValidObjectId(userId)) {
+            const holder = await partnersPlanHolder(userId);
+            if (holder) {
+                return res.status(404).json({ success: false, message: onPartnersAccount(holder) });
+            }
+        }
+
         const owner = await User.findById(userId).select('cleaningSchedule').lean();
         const cs = owner && owner.cleaningSchedule;
         if (cs && (cs.days || []).length && cs.address) {

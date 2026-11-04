@@ -3,6 +3,7 @@ const FCMToken = require('../models/FCMToken');
 const { resolveSignupPlatform } = require('../services/signupPlatform');
 const { ensurePushChannelDoc } = require('../services/pushChannel');
 const { normalizeVehicle } = require('../services/accountVehicle');
+const { revokeLinksForDeletedAccount } = require('./accountLinkController');
 
 // Function to generate a random 6-character code (numbers and capital letters)
 const generateReferralCode = () => {
@@ -138,19 +139,25 @@ async function upsertLoginUser({ phone, firebaseUid, signupPlatform }) {
         $setOnInsert: { signupPlatform },
     };
 
+    // `+vehicle`: the saved car (Profile → Your car) is `select: false` on the
+    // schema so the ungated reads — getUserById, every populate a valet sees —
+    // never carry a plate. This is the account's own session, and the app sets
+    // its user from this answer, so without it a saved car vanished on every
+    // launch. Chained onto the same findOneAndUpdate: still ONE atomic write,
+    // no follow-up read for a twin launch call to race.
     try {
         return await User.findOneAndUpdate({ phone }, update, {
             new: true,
             upsert: true,
             setDefaultsOnInsert: true,
-        });
+        }).select('+vehicle');
     } catch (err) {
         if (err && err.code === 11000) {
             return User.findOneAndUpdate(
                 { phone },
                 { $set: update.$set },
                 { new: true }
-            );
+            ).select('+vehicle');
         }
         throw err;
     }
@@ -218,7 +225,7 @@ exports.updateUser = async (req, res) => {
 
         const user = await User.findOneAndUpdate({ phone }, updateData, {
             new: true,
-        });
+        }).select('+vehicle');
 
         res.status(200).json({
             success: true,
@@ -324,6 +331,18 @@ exports.deleteAccount = async (req, res) => {
 
         // Store phone number to ensure deletion by phone as well
         const phoneNumber = user.phone;
+
+        // Deleting an account revokes its link (Link account). Done BEFORE the
+        // document goes: a partner left linked to an account that no longer
+        // exists could never link with anyone else, and would stay covered by
+        // its plan if it held one. The partner is told the way an unlink tells
+        // them. Side-work only — whatever happens in here, the delete the
+        // customer asked for goes ahead.
+        try {
+            await revokeLinksForDeletedAccount(req.io, user);
+        } catch (linkErr) {
+            console.error('deleteAccount: could not revoke account links —', linkErr.message);
+        }
 
         // Delete by ID
         await User.findByIdAndDelete(userId);

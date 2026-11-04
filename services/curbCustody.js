@@ -26,9 +26,6 @@ const ParkingNote = require('../models/ParkingNote');
 const StreetParkingMark = require('../models/StreetParkingMark');
 const Subscription = require('../models/Subscription');
 const sweepWindows = require('./sweepWindows');
-// No cycle: subscriptionService requires only models, subscriptionPlans and
-// nyTime — never this file.
-const subscriptionService = require('./subscriptionService');
 const operatorAlert = require('./operatorAlert');
 const { nyDateKey, nyClock } = require('./nyTime');
 
@@ -120,13 +117,25 @@ async function classify(order) {
     // Prefer the stamp when the plan paid, because it names the exact
     // subscription that was charged. Fall back to the customer's live plan for
     // an indefinite park the plan did not pay for — there is no stamp on those.
+    //
+    // "The customer's live plan" is the HOUSEHOLD's since accounts can be
+    // linked: their own, else the one their partner holds — the same plan that
+    // made createOrder stamp the park indefinite in the first place. Asking for
+    // their own alone found nothing for a partner, so the park promised "until
+    // you ask for it back" would have opened no custody and had nobody watching
+    // its block. A park the one-park-at-a-time rule refused never reaches here:
+    // createOrder leaves it without the stamp and without `indefinite`.
     let sub = null;
     if (order.coveredBySubscription) {
         const subId = order.coveredBySubscription._id || order.coveredBySubscription;
         sub = await Subscription.findById(subId).select('tier user status').lean();
     } else {
-        const live = await subscriptionService.getActiveSubscription(customerIdOf(order));
-        // .lean() below is not available on the doc getActiveSubscription
+        // Required here rather than at the top: accountLinks pulls in
+        // subscriptionService and the models, and keeping it out of this
+        // file's load keeps the dispatcher free of any cycle through it.
+        const { getHouseholdSubscription } = require('./accountLinks');
+        const { sub: live } = await getHouseholdSubscription(customerIdOf(order));
+        // .lean() below is not available on the doc getHouseholdSubscription
         // returns, so take the same shape by hand.
         sub = live ? { _id: live._id, tier: live.tier, user: live.user, status: live.status } : null;
     }

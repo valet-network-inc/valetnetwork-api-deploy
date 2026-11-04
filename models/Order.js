@@ -221,6 +221,14 @@ const OrderSchema = new mongoose.Schema({
     listPriceCents: {
         type: Number,
     },
+    // Set when a linked partner, not this order's customer, did something to
+    // it (brought it back, extended it, tipped, cancelled the return). Audit
+    // trail only: the order still belongs to — and bills — its customer.
+    // See services/accountLinks.js.
+    actedBy: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'User',
+    },
     // Away mode (2026-08-14): a multi-day park-and-hold. Keys are collected
     // once at the start (standard collect OTP), held for the whole window,
     // and returned at asp_time — which for away orders is the customer's

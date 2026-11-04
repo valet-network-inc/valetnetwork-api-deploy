@@ -9,6 +9,10 @@ const Event = require('../models/Event');
 const subscriptionService = require('../services/subscriptionService');
 const giftBalance = require('../services/giftBalance');
 const orderPricing = require('../services/orderPricing');
+// Linked accounts: who else may see and act on a customer's orders, and the
+// one place customer-room order events fan out to both of them.
+const accountLinks = require('../services/accountLinks');
+const { emitToHousehold } = accountLinks;
 const axios = require('axios');
 const stripeModule = require('stripe');
 const stripe = process.env.STRIPE_API_KEY ? stripeModule(process.env.STRIPE_API_KEY) : null;
@@ -790,11 +794,43 @@ exports.createOrder = async (req, res) => {
             }
         }
 
+        // One park at a time across a linked pair (services/accountLinks.js).
+        // `subscription` is the household's plan, so it may be the partner's;
+        // when some OTHER car is riding it right now — the partner's covered
+        // park, or a car we are holding under it — this park is an ordinary
+        // paid one: list price below, AND an end time and no custody (no
+        // `indefinite`, so curbCustody.classify never manages it). Covering it
+        // would be two cars on one plan, and holding it indefinitely would be
+        // the same thing with a price on it. New parks only: a retrieval never
+        // reaches this, and bringing a car back is what frees the plan. The
+        // quote asks the same question (`partner_park_live`), so the price on
+        // the button is the price charged. The holder's auto street-cleaning
+        // moves are booked by services/subscriptionScheduler.js, not here, and
+        // are never blocked by it.
+        let planBusy = false;
+        if (subscription && !awayMode && (orderType || 'parking') === 'parking') {
+            // Asked about THIS park's time: when it starts, how long, and
+            // whether the plan would hold it with no end (see the rule).
+            planBusy = await accountLinks.householdCoveredParkLive(subscription, customer, {
+                at: pickUpTime,
+                durationMinutes: duration,
+                indefinite: subscriptionService.parkIsIndefinite(subscription, {
+                    lat: customerLocation && customerLocation.lat,
+                    lng: customerLocation && customerLocation.lng,
+                }),
+            });
+            if (planBusy) {
+                coverage = { covered: false, reason: 'partner_park_live' };
+                console.log('Subscription coverage decision:', coverage.reason);
+            }
+        }
+
         // Away orders are priced per-move/per-day and are never covered by a
         // subscription (the weekly-cap math is meaningless across a
         // multi-week hold).
         if (
             subscription &&
+            !planBusy &&
             !finalIsFreeService &&
             !carWatch &&
             !awayMode &&
@@ -826,9 +862,10 @@ exports.createOrder = async (req, res) => {
 
         // A park on the flat plans has no end time, whether or not the plan
         // paid for this particular one. Coverage is once a day; being looked
-        // after is the whole month.
+        // after is the whole month. Not while another car is riding the plan
+        // (`planBusy` above): being looked after is the plan's, one car at a time.
         let indefinitePark = false;
-        if (subscription && (orderType || 'parking') === 'parking' && !awayMode) {
+        if (subscription && !planBusy && (orderType || 'parking') === 'parking' && !awayMode) {
             indefinitePark = subscriptionService.parkIsIndefinite(subscription, {
                 lat: customerLocation && customerLocation.lat,
                 lng: customerLocation && customerLocation.lng,
@@ -1026,9 +1063,10 @@ exports.createOrder = async (req, res) => {
         }
 
         if (coverage.covered) {
-            // Emit socket events and return response
+            // Emit socket events and return response. The booker's room and,
+            // when linked, their partner's — both home screens show this park.
             req.io.emit('newOrder', order);
-            req.io.to(customer).emit('orderUpdated', order);
+            await emitToHousehold(req.io, customer, 'orderUpdated', order);
 
             return res.status(201).json({
                 success: true,
@@ -1039,9 +1077,10 @@ exports.createOrder = async (req, res) => {
         }
 
         if (finalIsFreeService) {
-            // Emit socket events and return response for free service
+            // Emit socket events and return response for free service (to the
+            // booker's household, as above)
             req.io.emit('newOrder', order);
-            req.io.to(customer).emit('orderUpdated', order);
+            await emitToHousehold(req.io, customer, 'orderUpdated', order);
 
             return res.status(201).json({
                 success: true,
@@ -1309,7 +1348,7 @@ exports.acceptOrder = async (req, res) => {
         // same payload to the only two parties that act on it, and the clients
         // ignore updates for orders that are not their own. Keeping it meant
         // handing every listener the full order document.
-        req.io.to(order.customer).emit('orderUpdated', order);
+        await emitToHousehold(req.io, order.customer, 'orderUpdated', order);
         req.io.to(valetId).emit('orderUpdated', order);
 
         res.status(200).json({
@@ -1326,6 +1365,52 @@ exports.acceptOrder = async (req, res) => {
     }
 };
 
+/**
+ * "Is the caller the linked partner of whoever booked this order?" — the one
+ * question every widened ownership gate below asks. `userId` comes straight
+ * off an unauthenticated body on those routes, so anything that is not a real
+ * id answers no (the gate's own 403) instead of throwing a CastError into a 500.
+ */
+const isPartnerOfBooker = async (callerId, bookerId) => {
+    try {
+        if (!require('mongoose').isValidObjectId(String(callerId || ''))) return false;
+        return await accountLinks.isLinkedPair(callerId, bookerId);
+    } catch (err) {
+        console.error('isPartnerOfBooker failed:', err.message);
+        return false;
+    }
+};
+
+/**
+ * Mark the orders in a customer's read that somebody else booked.
+ *
+ * A linked pair (services/accountLinks.js) see each other's parks, so the two
+ * customer reads below answer with the partner's orders too. Each of those
+ * carries `bookedBy` — the partner summary, and nothing more of them — which
+ * is how both clients know to print "[First name]'s park" under it and whose
+ * card it is on. The caller's own orders carry no `bookedBy` and go out
+ * exactly as they always have.
+ *
+ * Only the partner's documents are flattened — through `orderForPartner`,
+ * which reads them with `toJSON()` so the old-dialect status translation
+ * shipped builds depend on still runs, and drops the one field about the
+ * booker's card (`paymentDetails.clientSecret`) that nobody else should hold.
+ */
+const markBookedBy = async (orders, userId, partnerId) => {
+    const own = String(userId);
+    const bookerOf = (o) => String((o.customer && o.customer._id) || o.customer);
+    if (!partnerId || !orders.some((o) => bookerOf(o) !== own)) return orders;
+
+    const partner = await User.findById(partnerId).select(accountLinks.SUMMARY_FIELDS).lean();
+    const bookedBy = accountLinks.partnerSummary(partner);
+    if (!bookedBy) return orders;
+
+    return orders.map((o) => {
+        if (bookerOf(o) === own) return o;
+        return { ...accountLinks.orderForPartner(o), bookedBy };
+    });
+};
+
 exports.hasActiveOrder = async (req, res) => {
     const { userId, isValet } = req.query;
 
@@ -1333,9 +1418,6 @@ exports.hasActiveOrder = async (req, res) => {
         // Valet's "active" set is `valetActiveOrderQuery` — see the comment on
         // it. A valet can hold several of these at once.
         const valetSide = isValet === 'true';
-        const query = valetSide
-            ? valetActiveOrderQuery(userId)
-            : customerActiveOrderQuery(userId);
 
         // Valets get the whole set; customers are still held to one order at a
         // time by `createOrder`, so that side keeps its single-document read.
@@ -1347,14 +1429,29 @@ exports.hasActiveOrder = async (req, res) => {
         // A running job comes before a car that is only parked: on the
         // $250/$300 plans the park stays 'parked' for as long as the valet
         // holds the keys, and a key delivery or a return booked meanwhile is
-        // the job the user is watching. A bare findOne answered with whichever
-        // came first, so "Watch live" opened the parked car.
-        const activeOrders = valetSide
-            ? await Order.find(query).sort({ acceptedAt: 1, createdAt: 1 })
-            : [
-                  (await Order.findOne({ ...query, status: { $in: ['pending', 'accepted', 'in_progress'] } }).sort({ createdAt: -1 })) ||
-                      (await Order.findOne(query)),
-              ].filter(Boolean);
+        // the job the user is watching.
+        //
+        // A linked customer's household is two accounts, each held to one
+        // order at a time, so their side is up to two reads of the SAME
+        // `customerActiveOrderQuery` (the helper itself is not widened: the
+        // one-order rule and the doorman link share it). Own first, so a
+        // shipped build that shows one ticket shows the caller's own.
+        // Unlinked, this is exactly the read it always was.
+        let activeOrders;
+        if (valetSide) {
+            activeOrders = await Order.find(valetActiveOrderQuery(userId)).sort({ acceptedAt: 1, createdAt: 1 });
+        } else {
+            const household = await accountLinks.householdIds(userId);
+            const found = [];
+            for (const id of household) {
+                const q = customerActiveOrderQuery(id);
+                const order =
+                    (await Order.findOne({ ...q, status: { $in: ['pending', 'accepted', 'in_progress'] } }).sort({ createdAt: -1 })) ||
+                    (await Order.findOne(q));
+                if (order) found.push(order);
+            }
+            activeOrders = await markBookedBy(found, userId, household[1] || null);
+        }
 
         res.status(200).json({
             success: true,
@@ -1424,9 +1521,13 @@ exports.updateValetLocation = async (req, res) => {
             );
         }
 
-        // Emit to both customer and valet rooms
+        // Emit to both customer and valet rooms. The customer's goes to their
+        // linked partner too: this is the dot on the map that says the valet
+        // is coming, and either of them may be the one waiting at the curb.
+        // The hottest emit in the file (every live job, every ~30 s), so it
+        // costs one indexed AccountLink read a ping — fanned out on purpose.
         if (order.customer) {
-            req.io.to(order.customer.toString()).emit('orderUpdated', {
+            await emitToHousehold(req.io, order.customer, 'orderUpdated', {
                 type: 'LOCATION_UPDATE',
                 order,
             });
@@ -2031,7 +2132,9 @@ exports.updateOrder = async (req, res) => {
         const customerRoom = roomId(order.customer);
         const valetRoom = roomId(order.valet);
         if (customerRoom) {
-            req.io.to(customerRoom).emit('orderUpdated', orderWithType);
+            // The booker's room and their linked partner's. The partner's copy
+            // has the populated customer cut down to a partner summary.
+            await emitToHousehold(req.io, customerRoom, 'orderUpdated', orderWithType);
         }
         if (valetRoom) {
             req.io.to(valetRoom).emit('orderUpdated', orderWithType);
@@ -2081,14 +2184,31 @@ exports.getOrdersByUser = async (req, res) => {
 
     try {
         const valetSide = isValet === 'true';
-        const query = valetSide ? { valet: userId } : { customer: userId };
+
+        // A linked customer sees every park either of them booked, live and
+        // past, in one list — the partner's marked with `bookedBy` (see
+        // markBookedBy). The partner's carry their live code on purpose: either
+        // of them may be the one standing at the car when it comes back.
+        // Unlinked, `householdIds` is just [userId] and this is the same read.
+        // The valet side is untouched.
+        let household = [];
+        let query;
+        if (valetSide) {
+            query = { valet: userId };
+        } else {
+            household = await accountLinks.householdIds(userId);
+            query = { customer: { $in: household } };
+        }
 
         const orders = await Order.find(query).sort({ pickUpTime: -1 }).exec();
+        const partnerId = household[1] || null;
 
         res.status(200).json({
             success: true,
             message: 'Orders fetched successfully',
-            orders: valetSide ? orders.map(withoutOtpCode) : orders,
+            orders: valetSide
+                ? orders.map(withoutOtpCode)
+                : await markBookedBy(orders, userId, partnerId),
         });
     } catch (err) {
         console.error(err);
@@ -2137,7 +2257,18 @@ exports.createRetrievalOrder = async (req, res) => {
             });
         }
 
-        if (originalOrder.customer.toString() !== customer) {
+        // Ownership gate, widened for the linked partner: either of a linked
+        // pair may bring back a park the other one booked. The retrieval is
+        // still made FOR THE BOOKER — their order, their card, their name on
+        // the valet's job card — with `actedBy` recording who asked for it.
+        // `customer` in the body is the caller's own id (the clients never
+        // impersonate), so from here on the booker is `parkOwner`.
+        const parkOwner = originalOrder.customer.toString();
+        const requester = customer ? String(customer) : '';
+        const byPartner =
+            requester !== parkOwner &&
+            (await isPartnerOfBooker(requester, parkOwner));
+        if (requester !== parkOwner && !byPartner) {
             return res.status(403).json({
                 success: false,
                 message: 'Unauthorized: Order belongs to different customer',
@@ -2175,7 +2306,14 @@ exports.createRetrievalOrder = async (req, res) => {
         // park-and-retrieve customer flow, or with the front desk for
         // Enterprise) — so requiring them specifically would be wrong and
         // would block the customer when their original valet is offline.
-        const customerDoc = await User.findById(customer).select('isDoorman handoffCodes');
+        // The booker's account, not the caller's: a partner asking for the car
+        // does not turn the booker's park into (or out of) an Enterprise one.
+        const customerDoc = await User.findById(parkOwner).select('isDoorman handoffCodes');
+        // Handoff codes follow whoever meets the valet: the one asking.
+        const requesterCodes =
+            String(customer) === String(parkOwner)
+                ? !!(customerDoc && customerDoc.handoffCodes)
+                : !!((await User.findById(customer).select('handoffCodes').lean()) || {}).handoffCodes;
         const isEnterpriseRequester = !!customerDoc?.isDoorman;
 
         // Retrieval legs don't take subscription coverage of their own —
@@ -2239,7 +2377,10 @@ exports.createRetrievalOrder = async (req, res) => {
                   }
                 : originalOrder.customerLocation;
         const retrievalOrderData = {
-            customer,
+            // Always the booker's (see the gate above). A partner bringing the
+            // car back makes a retrieval of the booker's park, on their terms.
+            customer: parkOwner,
+            ...(byPartner ? { actedBy: requester } : {}),
             customerLocation: customerLocation || defaultRetrievalLocation,
             ...(cleanPoint(keysLocation) ? { keysLocation: cleanPoint(keysLocation) } : {}),
             parkingType: 'retrieval',
@@ -2251,7 +2392,11 @@ exports.createRetrievalOrder = async (req, res) => {
             paymentMethod: paymentMethod || originalOrder.paymentMethod,
             totalAmount,
             paymentStatus: 'paid',
-            paymentIntentId,
+            // Money follows the park: a cancel refunds against this, so it can
+            // only ever be an intent on the booker's own card. A partner has no
+            // business attaching one (and no client sends one for a linked
+            // retrieval, which is always prepaid or free).
+            paymentIntentId: byPartner ? undefined : paymentIntentId,
             linkedOrderId: originalOrderId,
             eventCode,
             isFreeService: finalIsFreeService,
@@ -2268,7 +2413,7 @@ exports.createRetrievalOrder = async (req, res) => {
                 ? { vehicle: originalOrder.vehicle }
                 : {}),
             // The customer's setting now, not the park's: they may have changed it since.
-            handoffCode: !!(customerDoc && customerDoc.handoffCodes),
+            handoffCode: requesterCodes,
             otp: {
                 code: otpCode,
                 createdAt: otpCreatedAt,
@@ -2284,7 +2429,7 @@ exports.createRetrievalOrder = async (req, res) => {
         // no trip to the customer to collect anything first. Stamped here
         // because retrievalBornInCustody has to answer off the document.
         try {
-            retrievalOrderData.bornInCustody = await curbCustody.weHoldTheKeys(customer);
+            retrievalOrderData.bornInCustody = await curbCustody.weHoldTheKeys(parkOwner);
         } catch (custodyErr) {
             // Fails toward the two-beat flow: an extra trip costs one fee, while
             // wrongly skipping the key pickup sends a valet to a car they cannot
@@ -2364,8 +2509,9 @@ exports.createRetrievalOrder = async (req, res) => {
         // Emit socket events - use newOrder to trigger ValetHomeScreen update
         req.io.emit('newOrder', retrievalOrder);
 
-        // Also emit to customer as orderUpdated for tracking
-        req.io.to(customer).emit('orderUpdated', retrievalOrder);
+        // Also emit to customer as orderUpdated for tracking — to the booker
+        // and, when linked, their partner (who may be the one who asked).
+        await emitToHousehold(req.io, parkOwner, 'orderUpdated', retrievalOrder);
 
         // For non-Enterprise: target the original valet specifically. For
         // Enterprise: skip targeted notifications — the broadcast `newOrder`
@@ -2490,7 +2636,7 @@ exports.addVehicleInfo = async (req, res) => {
         // same payload to the only two parties that act on it, and the clients
         // ignore updates for orders that are not their own. Keeping it meant
         // handing every listener the full order document.
-        req.io.to(order.customer.toString()).emit('orderUpdated', {
+        await emitToHousehold(req.io, order.customer, 'orderUpdated', {
             ...order.toObject(),
             type: 'VEHICLE_ADDED',
         });
@@ -2859,9 +3005,12 @@ const applyOtpVerification = async (order, submittedOtp, io, opts = {}) => {
             const orderForValet = { ...orderData, otp: { ...orderData.otp } };
             delete orderForValet.otp.code;
 
-            io
-                .to(updatedOrder.customer.toString())
-                .emit('orderUpdated', { ...orderData, type: 'RETURN_KEY_OTP_GENERATED' });
+            // "Only the customer" includes their linked partner: either of
+            // them may be the one standing at the car saying it.
+            await emitToHousehold(io, updatedOrder.customer, 'orderUpdated', {
+                ...orderData,
+                type: 'RETURN_KEY_OTP_GENERATED',
+            });
             if (updatedOrder.valet) {
                 io
                     .to(updatedOrder.valet.toString())
@@ -3046,7 +3195,7 @@ exports.updateCarLocation = async (req, res) => {
         // ignore updates for orders that are not their own. Keeping it meant
         // handing every listener the full order document.
         if (order.customer) {
-            req.io.to(order.customer.toString()).emit('orderUpdated', {
+            await emitToHousehold(req.io, order.customer, 'orderUpdated', {
                 ...orderData,
                 type: 'PARKING_LOCATION_UPDATE',
             });
@@ -3171,7 +3320,8 @@ exports.calculateConversationDistances = async (req, res) => {
 // the per-order coverage decision inside createOrder. The pre-v2 behavior —
 // a blanket req.hasSubscription that zeroed EVERY order for a subscriber —
 // is retired; entitlements are now per-tier and per-usage, decided by
-// subscriptionService.evaluateParkCoverage.
+// subscriptionService.evaluateParkCoverage. Since accounts can be linked
+// (2026-09-23) "the customer's" plan means their household's — see below.
 exports.validateSubscriptionForOrder = async (req, res, next) => {
     const { customer } = req.body;
 
@@ -3193,7 +3343,33 @@ exports.validateSubscriptionForOrder = async (req, res, next) => {
         }
 
         req.user = user;
-        req.subscription = await subscriptionService.getActiveSubscription(customer);
+
+        // Whose booking this is. A new park is the caller's own. A retrieval
+        // is made for whoever BOOKED the park — a linked partner bringing the
+        // other one's car back gets a retrieval of the booker's park, on the
+        // booker's terms (createRetrievalOrder) — so the plan that answers for
+        // it is looked up for the booker too. A stranger's id is left alone
+        // here; createRetrievalOrder refuses them.
+        let bookerId = String(customer);
+        if (req.body.originalOrderId) {
+            const park = await Order.findById(req.body.originalOrderId)
+                .select('customer')
+                .lean()
+                .catch(() => null);
+            const owner = park && park.customer ? String(park.customer) : null;
+            if (owner && owner !== bookerId && (await accountLinks.isLinkedPair(bookerId, owner))) {
+                bookerId = owner;
+            }
+        }
+
+        // The HOUSEHOLD's plan: the booker's own, else the one their linked
+        // partner holds. It is stamped on a covered park as-is, so the pair's
+        // parks count against one weekly move cap and one free park a day
+        // (aspMovesUsedThisWeek / freeParksUsedToday count by plan id, not by
+        // customer). Whether it may cover THIS park — one park at a time
+        // across the pair — is createOrder's question, at its coverage point.
+        const { sub } = await accountLinks.getHouseholdSubscription(bookerId);
+        req.subscription = sub;
         next();
     } catch (err) {
         console.error('Subscription validation error:', err);
@@ -3250,7 +3426,9 @@ exports.generateReturnKeyOtp = async (req, res) => {
         // same payload to the only two parties that act on it, and the clients
         // ignore updates for orders that are not their own. Keeping it meant
         // handing every listener the full order document.
-        req.io.to(order.customer.toString()).emit('orderUpdated', {
+        // The booker's room and their linked partner's; `customer` is
+        // populated here, and the partner's copy carries only its summary.
+        await emitToHousehold(req.io, order.customer, 'orderUpdated', {
             ...orderData,
             type: 'RETURN_KEY_OTP_GENERATED',
         });
@@ -3550,7 +3728,7 @@ const runAspSweep = async (io, now = new Date()) => {
                         // Emit socket events
                         if (io) {
                             io.emit('newOrder', retrievalOrder);
-                            io.to(order.customer._id.toString()).emit('orderUpdated', retrievalOrder);
+                            await emitToHousehold(io, order.customer._id, 'orderUpdated', retrievalOrder);
 
                             // Notify valet about automatic retrieval order
                             io.to(order.valet._id.toString()).emit('newRetrievalRequest', {
@@ -3856,7 +4034,7 @@ exports.setAwaySchedule = async (req, res) => {
         }
 
         if (req.io) {
-            req.io.to(String(order.customer)).emit('orderUpdated', {
+            await emitToHousehold(req.io, order.customer, 'orderUpdated', {
                 type: 'ORDER_UPDATE',
                 order,
             });
@@ -3918,8 +4096,14 @@ exports.cancelOrder = async (req, res) => {
             });
         }
 
-        // Authz: only the customer who created the order can cancel it.
-        if (String(order.customer) !== String(userId)) {
+        // Authz: only the customer who created the order can cancel it — or
+        // their linked partner (ownership gate, widened for the pair). The
+        // refund below still goes back to the booker's own charge; it is read
+        // off the order, never off the caller.
+        const cancelledByPartner =
+            String(order.customer) !== String(userId) &&
+            (await isPartnerOfBooker(userId, order.customer));
+        if (String(order.customer) !== String(userId) && !cancelledByPartner) {
             return res.status(403).json({
                 success: false,
                 message: 'You can only cancel your own orders',
@@ -3998,6 +4182,8 @@ exports.cancelOrder = async (req, res) => {
 
         // Mark cancelled
         order.status = 'cancelled';
+        // Audit only: the booker's partner called it off.
+        if (cancelledByPartner) order.actedBy = userId;
         await order.save();
 
         await curbCustody.closeSafely({ orderId: order._id, reason: 'cancelled' });
@@ -4014,8 +4200,9 @@ exports.cancelOrder = async (req, res) => {
         const cancelledPayload = { type: 'ORDER_CANCELLED', order };
         // Global emit — any valet with this order in their pending list drops it
         req.io.emit('orderUpdated', cancelledPayload);
-        // Direct emit to customer's room so their UI clears the active order
-        req.io.to(String(order.customer)).emit('orderUpdated', cancelledPayload);
+        // Direct emit to customer's room (and their linked partner's) so their
+        // UI clears the active order
+        await emitToHousehold(req.io, order.customer, 'orderUpdated', cancelledPayload);
         // Direct emit to assigned valet's room (if any)
         if (order.valet) {
             req.io.to(String(order.valet)).emit('orderUpdated', cancelledPayload);
@@ -4024,20 +4211,24 @@ exports.cancelOrder = async (req, res) => {
         // the app clears the retrieval and has nothing to show until the next
         // poll lands, which reads as "my car disappeared".
         if (restoredParkingOrder) {
-            req.io
-                .to(String(order.customer))
-                .emit('orderUpdated', {
-                    type: 'RETRIEVAL_CANCELLED_PARK_RESTORED',
-                    order: restoredParkingOrder,
-                });
+            await emitToHousehold(req.io, order.customer, 'orderUpdated', {
+                type: 'RETRIEVAL_CANCELLED_PARK_RESTORED',
+                order: restoredParkingOrder,
+            });
         }
 
+        // The partner who cancelled gets the park as a partner may see it:
+        // the refund went to the booker's card, and its Stripe id is theirs.
+        const forCaller = (o) => (cancelledByPartner && o ? accountLinks.orderForPartner(o) : o);
         res.status(200).json({
             success: true,
             message: 'Order cancelled successfully',
-            order,
-            restoredParkingOrder,
-            refund: refundResult,
+            order: forCaller(order),
+            restoredParkingOrder: forCaller(restoredParkingOrder),
+            refund:
+                cancelledByPartner && refundResult
+                    ? { amount: refundResult.amount, status: refundResult.status, error: refundResult.error }
+                    : refundResult,
         });
     } catch (err) {
         console.error('Cancel order error:', err);
@@ -4122,9 +4313,10 @@ exports.valetCancelOrder = async (req, res) => {
         // Notify everyone — valets get the new pending broadcast, customer gets an update
         if (req.io) {
             req.io.emit('newOrder', order); // re-broadcast to valets
-            req.io
-                .to(String(order.customer))
-                .emit('orderUpdated', { type: 'VALET_RELEASED_ORDER', order });
+            await emitToHousehold(req.io, order.customer, 'orderUpdated', {
+                type: 'VALET_RELEASED_ORDER',
+                order,
+            });
         }
 
         res.status(200).json({
@@ -4262,9 +4454,9 @@ exports.autoCancelStaleOrders = async (io) => {
                 if (io) {
                     const payload = { type: 'ORDER_CANCELLED', order };
                     io.emit('orderUpdated', payload);
-                    io.to(String(order.customer)).emit('orderUpdated', payload);
+                    await emitToHousehold(io, order.customer, 'orderUpdated', payload);
                     if (restoredParkingOrder) {
-                        io.to(String(order.customer)).emit('orderUpdated', {
+                        await emitToHousehold(io, order.customer, 'orderUpdated', {
                             type: 'RETRIEVAL_CANCELLED_PARK_RESTORED',
                             order: restoredParkingOrder,
                         });
@@ -4612,8 +4804,13 @@ exports.cancelRetrievalLeg = async (req, res) => {
             return res.status(404).json({ success: false, message: 'Order not found' });
         }
 
-        // Same authz as cancelOrder: the customer on the order, by id.
-        if (String(order.customer) !== String(userId)) {
+        // Same authz as cancelOrder: the customer on the order, by id, or their
+        // linked partner (ownership gate, widened for the pair). The partial
+        // refund still goes to the booker's own charge, off the order.
+        const changedByPartner =
+            String(order.customer) !== String(userId) &&
+            (await isPartnerOfBooker(userId, order.customer));
+        if (String(order.customer) !== String(userId) && !changedByPartner) {
             return res.status(403).json({
                 success: false,
                 message: 'You can only change your own orders',
@@ -4794,11 +4991,12 @@ exports.cancelRetrievalLeg = async (req, res) => {
         if (liveRetrieval) {
             try {
                 liveRetrieval.status = 'cancelled';
+                if (changedByPartner) liveRetrieval.actedBy = userId;
                 await liveRetrieval.save();
                 if (req.io) {
                     const standDown = { type: 'ORDER_CANCELLED', order: liveRetrieval };
                     req.io.emit('orderUpdated', standDown);
-                    req.io.to(String(liveRetrieval.customer)).emit('orderUpdated', standDown);
+                    await emitToHousehold(req.io, liveRetrieval.customer, 'orderUpdated', standDown);
                     if (liveRetrieval.valet) {
                         req.io.to(String(liveRetrieval.valet)).emit('orderUpdated', standDown);
                     }
@@ -4814,13 +5012,20 @@ exports.cancelRetrievalLeg = async (req, res) => {
         // away from this order.
         const finished = await Order.findByIdAndUpdate(
             order._id,
-            { $set: { status: 'completed', retrievalRefund: refundInfo } },
+            {
+                $set: {
+                    status: 'completed',
+                    retrievalRefund: refundInfo,
+                    // Audit only: the booker's partner called the return off.
+                    ...(changedByPartner ? { actedBy: userId } : {}),
+                },
+            },
             { new: true }
         );
 
         if (req.io) {
             const payload = { ...finished.toObject(), type: 'RETRIEVAL_CANCELLED' };
-            req.io.to(String(finished.customer)).emit('orderUpdated', payload);
+            await emitToHousehold(req.io, finished.customer, 'orderUpdated', payload);
             if (finished.valet) {
                 req.io.to(String(finished.valet)).emit('orderUpdated', payload);
             }
@@ -4831,8 +5036,12 @@ exports.cancelRetrievalLeg = async (req, res) => {
             message: refundInfo.amountCents
                 ? 'Return trip cancelled and refunded.'
                 : 'Return trip cancelled.',
-            order: finished,
-            refund: refundInfo,
+            // A partner gets the park as a partner may see it; the refund
+            // went to the booker's card and its Stripe id is theirs.
+            order: changedByPartner ? accountLinks.orderForPartner(finished) : finished,
+            refund: changedByPartner
+                ? { amountCents: refundInfo.amountCents, status: refundInfo.status, refundedAt: refundInfo.refundedAt }
+                : refundInfo,
         });
     } catch (err) {
         console.error('cancelRetrievalLeg error:', err);
