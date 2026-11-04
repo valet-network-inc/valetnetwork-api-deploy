@@ -2932,7 +2932,7 @@ exports.confirmHandoff = async (req, res) => {
         if (order.handoffCode !== false) {
             return res.status(409).json({
                 success: false,
-                message: 'This customer uses handoff codes. Ask them for the code.',
+                message: 'This user uses handoff codes. Ask them for the code.',
             });
         }
         if (!order.otp || !order.otp.code || order.otp.verified) {
