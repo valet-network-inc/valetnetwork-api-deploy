@@ -326,6 +326,17 @@ const OrderSchema = new mongoose.Schema({
         },
     },
     // OTP for order completion confirmation
+    // The car we expect (the account's, or the last one a valet noted for this
+    // customer), for the valet's vehicle form to open filled. Not `vehicle`:
+    // that stays the valet's confirmed entry.
+    suggestedVehicle: {
+        color: { type: String, trim: true },
+        model: { type: String, trim: true },
+        licensePlate: { type: String, trim: true, uppercase: true },
+    },
+    // Whether this order's handoffs use codes (the customer's setting when it
+    // was made). Missing on orders from before the setting: those use codes.
+    handoffCode: { type: Boolean },
     otp: {
         code: {
             type: String,

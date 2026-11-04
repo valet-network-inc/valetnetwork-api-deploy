@@ -19,7 +19,7 @@ const curbCustody = require('../services/curbCustody');
 
 const OTP_EXPIRY_RETURN_KEY = 30 * 24 * 60 * 60 * 1000; // matches orderController
 
-const sixDigit = () => Math.floor(100000 + Math.random() * 900000).toString();
+const { newHandoffCode: sixDigit, handoffCodesOn } = require('../services/handoffCode'); // 3 digits now (Nov 2026); the old name stays
 
 /** Serialise the key state for the app. Never throws. */
 async function keyStateFor(customerId) {
@@ -132,6 +132,7 @@ exports.requestKeys = async (req, res) => {
             keyDeliveryOnly: true,
             linkedOrderId: custody.currentOrder,
             vehicle: parkOrder ? parkOrder.vehicle : undefined,
+            handoffCode: await handoffCodesOn(userId),
             status: 'pending',
             otp: {
                 code: sixDigit(),

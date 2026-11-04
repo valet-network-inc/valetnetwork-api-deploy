@@ -29,6 +29,7 @@
  *   partitioned by tier in that file's tick().
  */
 
+const { newHandoffCode, handoffCodesOn } = require('./handoffCode');
 const axios = require('axios');
 
 const CurbCustody = require('../models/CurbCustody');
@@ -286,8 +287,9 @@ async function bookMove(custody, occurrence, window, { io, notify, now, staggerM
         // The customer is holding the keys, so this move borrows them. They go
         // back at the end of it — a sweep is not consent to keep them.
         keysBorrowed: custody.keysWith === 'customer',
+        handoffCode: await handoffCodesOn(custody.customer),
         otp: {
-            code: Math.floor(100000 + Math.random() * 900000).toString(),
+            code: newHandoffCode(),
             createdAt: otpCreatedAt,
             expiresAt: new Date(otpCreatedAt.getTime() + OTP_EXPIRY_ORDER_CREATION),
             verified: false,

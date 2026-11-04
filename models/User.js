@@ -354,6 +354,9 @@ const UserSchema = new mongoose.Schema({
     // The customer's car, as they last typed it or a valet last logged it.
     // Whoever entered it last wins; `source`/`by`/`at` say who and when. See
     // services/accountVehicle.js for why this exists.
+    // Handoff codes at the key handoffs: off unless the user switches them on
+    // (Profile → Handoff codes). Copied onto each order as `handoffCode`.
+    handoffCodes: { type: Boolean, default: false },
     vehicle: {
         color: { type: String, trim: true },
         model: { type: String, trim: true },

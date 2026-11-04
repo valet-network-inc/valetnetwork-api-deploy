@@ -17,6 +17,7 @@ const {
     updateCarLocation,
     calculateConversationDistances,
     verifyOTP,
+    confirmHandoff,
     checkAspOrders,
     setAwaySchedule,
     generateReturnKeyOtp,
@@ -76,6 +77,8 @@ router.post('/checkKeyTagAvailability', checkKeyTagAvailability);
 router.get('/getTodaysParkedCars/:valetId', getTodaysParkedCars);
 router.post('/updateCarLocation', updateCarLocation);
 router.post('/verifyOTP', verifyOTP);
+// The valet's swipe in place of a code, when the customer has handoff codes off.
+router.post('/confirmHandoff', requireValet(), confirmHandoff);
 router.post('/calculateConversationDistances', calculateConversationDistances);
 router.post('/checkAspOrders', checkAspOrders);
 router.post('/setAwaySchedule', setAwaySchedule);

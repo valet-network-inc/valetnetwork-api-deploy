@@ -30,6 +30,7 @@
 // the auto-return ~75 minutes into the sweep window, matching how manual
 // bookings behave today.
 
+const { newHandoffCode, handoffCodesOn } = require('./handoffCode');
 const Order = require('../models/Order');
 const Subscription = require('../models/Subscription');
 const axios = require('axios');
@@ -187,8 +188,9 @@ async function bookOccurrence(sub, day, occurrence, { io, notify, now }) {
         coveredBySubscription: sub._id,
         listPriceCents: listPrice,
         autoBookKey: key,
+        handoffCode: await handoffCodesOn(sub.user),
         otp: {
-            code: Math.floor(100000 + Math.random() * 900000).toString(),
+            code: newHandoffCode(),
             createdAt: otpCreatedAt,
             expiresAt: new Date(otpCreatedAt.getTime() + OTP_EXPIRY_ORDER_CREATION),
             verified: false,

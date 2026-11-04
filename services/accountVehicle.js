@@ -82,4 +82,27 @@ const copyOrderCarToAccount = async (order, vehicle) => {
     }
 };
 
-module.exports = { normalizeVehicle, isComplete, looksLikeACar, orderCarBelongsToCustomer, copyOrderCarToAccount };
+/**
+ * The car to put in front of the valet on a customer's new job (Nov 2026,
+ * Rishi: "auto populating vehicle information for cars that we've already
+ * parked for before"): the account's car, else the last real-looking car a
+ * valet noted on one of their orders. A SUGGESTION only (`Order.suggestedVehicle`):
+ * `order.vehicle` stays empty until the valet confirms it, because a filled
+ * colour skips the valet's pre-pickup photo gate.
+ */
+async function suggestedVehicleFor(customerId) {
+    if (!customerId) return null;
+    const User = require('../models/User');
+    const Order = require('../models/Order');
+    const user = await User.findById(customerId).select('vehicle').lean();
+    const own = user && user.vehicle && normalizeVehicle(user.vehicle);
+    if (own && (own.licensePlate || own.model)) return own;
+    const last = await Order.findOne({ customer: customerId, 'vehicle.licensePlate': { $exists: true, $ne: '' } })
+        .sort({ createdAt: -1 })
+        .select('vehicle')
+        .lean();
+    const noted = last && last.vehicle && normalizeVehicle(last.vehicle);
+    return noted && looksLikeACar(noted) ? noted : null;
+}
+
+module.exports = { normalizeVehicle, isComplete, looksLikeACar, orderCarBelongsToCustomer, copyOrderCarToAccount, suggestedVehicleFor };

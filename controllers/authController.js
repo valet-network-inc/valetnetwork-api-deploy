@@ -174,6 +174,7 @@ exports.updateUser = async (req, res) => {
         enterpriseBusinessName,
         enterpriseAddress, // { street, suite, city, state, zip }
         vehicle, // { color, model, licensePlate } from the Your car screen
+        handoffCodes, // Profile → Handoff codes
     } = req.body;
 
     try {
@@ -192,6 +193,7 @@ exports.updateUser = async (req, res) => {
             ...(userAgreementAccepted !== undefined && { userAgreementAccepted }),
             ...(enterpriseBusinessName !== undefined && { enterpriseBusinessName }),
             ...(enterpriseAddress !== undefined && { enterpriseAddress }),
+            ...(typeof handoffCodes === 'boolean' && { handoffCodes }),
         };
 
         // The car on the account (services/accountVehicle.js). The app's Your

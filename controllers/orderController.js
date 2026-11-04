@@ -1,8 +1,9 @@
+const { newHandoffCode } = require('../services/handoffCode');
 const dotenv = require('dotenv');
 dotenv.config({ path: `.env.${process.env.NODE_ENV}` });
 const Order = require('../models/Order');
 const curbCustody = require('../services/curbCustody');
-const { copyOrderCarToAccount } = require('../services/accountVehicle');
+const { copyOrderCarToAccount, suggestedVehicleFor } = require('../services/accountVehicle');
 const User = require('../models/User');
 const Event = require('../models/Event');
 const subscriptionService = require('../services/subscriptionService');
@@ -507,7 +508,7 @@ exports.createOrder = async (req, res) => {
         // Enterprise (doorman) accounts are allowed to have multiple concurrent orders
         // because each order is for a different end-customer. Skip the active-order check for them.
         let repark = null;
-        const customerDoc = await User.findById(customer).select('isDoorman phone');
+        const customerDoc = await User.findById(customer).select('isDoorman phone handoffCodes');
         const isEnterpriseCustomer = !!customerDoc?.isDoorman;
 
         if (!isEnterpriseCustomer) {
@@ -859,8 +860,8 @@ exports.createOrder = async (req, res) => {
             console.log('Setting as pending - no payment intent provided, amount:', finalAmount);
         }
         
-        // Generate OTP for order verification (6-digit code)
-        const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+        // The handoff code (3 digits; shown only when the customer has codes on)
+        const otpCode = newHandoffCode();
         const otpCreatedAt = new Date();
         const otpExpiresAt = new Date(otpCreatedAt.getTime() + OTP_EXPIRY_ORDER_CREATION);
 
@@ -957,6 +958,7 @@ exports.createOrder = async (req, res) => {
                       },
                   }
                 : {}),
+            handoffCode: !!(customerDoc && customerDoc.handoffCodes),
             otp: {
                 code: otpCode,
                 createdAt: otpCreatedAt,
@@ -965,6 +967,11 @@ exports.createOrder = async (req, res) => {
                 type: 'order_creation',
             },
         };
+        // The car we've parked for them before, for the valet's form to open filled.
+        if (!orderData.vehicle) {
+            const suggested = await suggestedVehicleFor(customer);
+            if (suggested) orderData.suggestedVehicle = suggested;
+        }
 
         console.log('Order data to save:', orderData);
         
@@ -1613,7 +1620,7 @@ exports.updateOrder = async (req, res) => {
                     // Check if OTP is expired - regenerate if needed
                     if (new Date() > otpData.expiresAt) {
                         // Regenerate OTP
-                        const newOtpCode = Math.floor(100000 + Math.random() * 900000).toString();
+                        const newOtpCode = newHandoffCode();
                         const newOtpCreatedAt = new Date();
                         const newOtpExpiresAt = new Date(newOtpCreatedAt.getTime() + OTP_EXPIRY_ORDER_CREATION);
                         
@@ -1675,7 +1682,7 @@ exports.updateOrder = async (req, res) => {
 
             if (!hasLiveReturnKeyOtp) {
                 // Generate new OTP (6-digit code)
-                const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+                const otpCode = newHandoffCode();
                 const otpCreatedAt = new Date();
                 const otpExpiresAt = new Date(otpCreatedAt.getTime() + OTP_EXPIRY_PARKING_LOCATION);
 
@@ -2144,7 +2151,7 @@ exports.createRetrievalOrder = async (req, res) => {
         // park-and-retrieve customer flow, or with the front desk for
         // Enterprise) — so requiring them specifically would be wrong and
         // would block the customer when their original valet is offline.
-        const customerDoc = await User.findById(customer).select('isDoorman');
+        const customerDoc = await User.findById(customer).select('isDoorman handoffCodes');
         const isEnterpriseRequester = !!customerDoc?.isDoorman;
 
         // Retrieval legs don't take subscription coverage of their own —
@@ -2186,7 +2193,7 @@ exports.createRetrievalOrder = async (req, res) => {
             });
         }
 
-        const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+        const otpCode = newHandoffCode();
         const otpCreatedAt = new Date();
         const otpExpiresAt = new Date(otpCreatedAt.getTime() + OTP_EXPIRY_RETURN_KEY);
 
@@ -2235,6 +2242,8 @@ exports.createRetrievalOrder = async (req, res) => {
             ...(originalOrder.vehicle
                 ? { vehicle: originalOrder.vehicle }
                 : {}),
+            // The customer's setting now, not the park's: they may have changed it since.
+            handoffCode: !!(customerDoc && customerDoc.handoffCodes),
             otp: {
                 code: otpCode,
                 createdAt: otpCreatedAt,
@@ -2673,7 +2682,11 @@ exports.getTodaysParkedCars = async (req, res) => {
  * Returns the `{ status, body }` its caller should answer with. Shipped iOS
  * builds read that body, so its shape is not ours to change.
  */
-const applyOtpVerification = async (order, submittedOtp, io) => {
+const applyOtpVerification = async (order, submittedOtp, io, opts = {}) => {
+    // `opts.trusted`: the valet's swipe on an order without handoff codes
+    // (confirmHandoff). The code is the order's own, so expiry and the
+    // comparison are skipped; everything after them runs exactly as for a
+    // code read out at the car.
     // The code the customer is reading out belongs to the leg that owns
     // the handoff, not necessarily to the order the app addressed. See
     // `liveKeyReturnLeg`.
@@ -2702,9 +2715,9 @@ const applyOtpVerification = async (order, submittedOtp, io) => {
     }
 
     // Check if OTP is expired - regenerate if needed
-    if (new Date() > otpData.expiresAt) {
+    if (!opts.trusted && new Date() > otpData.expiresAt) {
         // Regenerate OTP
-        const newOtpCode = Math.floor(100000 + Math.random() * 900000).toString();
+        const newOtpCode = newHandoffCode();
         const newOtpCreatedAt = new Date();
         const newOtpExpiresAt = new Date(newOtpCreatedAt.getTime() + OTP_EXPIRY_RETURN_KEY);
 
@@ -2727,7 +2740,7 @@ const applyOtpVerification = async (order, submittedOtp, io) => {
 
     // Verify OTP code. Trimmed: a code read out loud and typed back in
     // arrives with whatever the keypad left on it.
-    if (otpData.code !== String(submittedOtp).trim()) {
+    if (!opts.trusted && otpData.code !== String(submittedOtp).trim()) {
         return {
             status: 400,
             body: {
@@ -2793,7 +2806,7 @@ const applyOtpVerification = async (order, submittedOtp, io) => {
         !retrievalBornInCustody(order);
 
     if (isRetrievalKeyPickup) {
-        const nextCode = Math.floor(100000 + Math.random() * 900000).toString();
+        const nextCode = newHandoffCode();
         const nextCreatedAt = new Date();
         const nextExpiresAt = new Date(nextCreatedAt.getTime() + OTP_EXPIRY_RETURN_KEY);
 
@@ -2897,6 +2910,42 @@ exports.verifyOTP = async (req, res) => {
     }
 };
 
+/**
+ * POST /api/order/confirmHandoff { orderId } — the valet's swipe in place of a
+ * code, for a customer without handoff codes. Only the valet on the job, and
+ * only on an order made with codes off; the beat it confirms is whichever the
+ * order's live code is for, through the same `applyOtpVerification` path.
+ */
+exports.confirmHandoff = async (req, res) => {
+    const { orderId } = req.body || {};
+    try {
+        if (!orderId) {
+            return res.status(400).json({ success: false, message: 'orderId is required' });
+        }
+        const order = await Order.findById(orderId);
+        if (!order) {
+            return res.status(404).json({ success: false, message: 'Order not found' });
+        }
+        if (!order.valet || String(order.valet) !== String(req.callerUserId)) {
+            return res.status(403).json({ success: false, message: 'This is not your job.' });
+        }
+        if (order.handoffCode !== false) {
+            return res.status(409).json({
+                success: false,
+                message: 'This customer uses handoff codes. Ask them for the code.',
+            });
+        }
+        if (!order.otp || !order.otp.code || order.otp.verified) {
+            return res.status(409).json({ success: false, message: 'There is no handoff to confirm right now.' });
+        }
+        const { status, body } = await applyOtpVerification(order, order.otp.code, req.io, { trusted: true });
+        res.status(status).json(body);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ success: false, message: 'Failed to confirm the handoff' });
+    }
+};
+
 exports.updateCarLocation = async (req, res) => {
     const { orderId, parkingLocation } = req.body;
 
@@ -2934,7 +2983,7 @@ exports.updateCarLocation = async (req, res) => {
         let otpExpiresAt = existingOtp && existingOtp.expiresAt;
         if (!hasLiveReturnKeyOtp) {
             // Generate new OTP (6-digit code)
-            const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+            const otpCode = newHandoffCode();
             const otpCreatedAt = new Date();
             otpExpiresAt = new Date(otpCreatedAt.getTime() + OTP_EXPIRY_PARKING_LOCATION);
             changes.otp = {
@@ -3146,7 +3195,7 @@ exports.generateReturnKeyOtp = async (req, res) => {
         }
 
         // Generate OTP for key return (6-digit code)
-        const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+        const otpCode = newHandoffCode();
         const otpCreatedAt = new Date();
         const otpExpiresAt = new Date(otpCreatedAt.getTime() + OTP_EXPIRY_RETURN_KEY);
 
@@ -3347,7 +3396,7 @@ const runAspSweep = async (io, now = new Date()) => {
                     // so it always gets minted.
                     {
                         // Generate OTP for the retrieval order
-                        const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+                        const otpCode = newHandoffCode();
                         const otpCreatedAt = new Date();
                         const otpExpiresAt = new Date(otpCreatedAt.getTime() + OTP_EXPIRY_RETURN_KEY);
 
