@@ -1,5 +1,7 @@
 const express = require('express');
 const router = express.Router();
+const requireSelf = require('../middleware/requireSelf');
+const { suggestedVehicleFor } = require('../services/accountVehicle');
 const {
     loginUser,
     updateUser,
@@ -24,5 +26,18 @@ router.get('/getUserById/:userId', getUserById);
 router.post('/updateLocation', updateLocation);
 router.delete('/deleteAccount/:userId', deleteAccount);
 router.post('/checkUserType', checkUserType);
+
+// Profile → Your car, for an account that never typed its car: the car on the
+// account, else the last real-looking car a valet noted for this user. Read
+// only; saving it is the usual updateUser { vehicle }.
+router.get('/vehicle/:userId', requireSelf((req) => req.params.userId), async (req, res) => {
+    try {
+        const vehicle = await suggestedVehicleFor(req.callerUserId);
+        return res.status(200).json({ success: true, vehicle: vehicle || null });
+    } catch (err) {
+        console.error('vehicle lookup failed:', err.message);
+        return res.status(500).json({ success: false, message: 'Could not load your car.' });
+    }
+});
 
 module.exports = router;

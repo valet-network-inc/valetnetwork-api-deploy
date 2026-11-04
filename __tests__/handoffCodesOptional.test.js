@@ -98,6 +98,14 @@ describe('codes', () => {
         const keen = await makeUser({ handoffCodes: true });
         expect(await handoffCodesOn(keen._id)).toBe(true);
     });
+
+    test('read as a plain false on an account made before the setting, the way loginUser returns it', async () => {
+        // The app shows Profile → Handoff codes only when the server sends a
+        // boolean, so an older API (codes always on) never shows a wrong "off".
+        await User.collection.insertOne({ phone: '5592999999', firstName: 'Old', email: 'old@example.com' });
+        const user = await User.findOneAndUpdate({ phone: '5592999999' }, { $set: { verified: false } }, { new: true });
+        expect(JSON.parse(JSON.stringify(user)).handoffCodes).toBe(false);
+    });
 });
 
 describe("the valet's swipe", () => {
