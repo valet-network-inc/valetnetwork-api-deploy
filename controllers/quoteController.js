@@ -101,6 +101,11 @@ function describe(reason, ctx) {
 
     switch (reason) {
         // --- covered -------------------------------------------------------
+        case 'daily_free_retrieval':
+            return {
+                label: `Free with ${plan}`,
+                detail: "This is today's free retrieval. Tap Bring it back — nothing to pay.",
+            };
         case 'daily_free_park':
             return {
                 label: `Free with ${plan}`,
@@ -228,7 +233,19 @@ function describe(reason, ctx) {
         case 'retrieval_not_covered':
             return {
                 label: `${price} to bring it back`,
-                detail: `Plans pay for parking, so a trip to bring your car back on its own is ${price}. Tap Pay.`,
+                detail: `Street-cleaning plans pay for moves, so a trip to bring your car back on its own is ${price}. Tap Pay.`,
+            };
+        case 'daily_free_retrieval_used':
+            return {
+                label: `Not covered — today's free retrieval is used`,
+                detail: `${plan.charAt(0).toUpperCase()}${plan.slice(1)} brings a car back free once a day, and today's is used. This one is ${price}. Tap Pay.`,
+            };
+        case 'retrieval_not_at_home_address':
+            return {
+                label: `Not covered — about ${blocksAway(ctx.distanceMeters)} blocks from ${homeSpot}`,
+                detail: `The free retrieval brings the car to ${homeSpot}, and this is about ${blocksAway(
+                    ctx.distanceMeters
+                )} blocks away. This one is ${price}, or move the pin to ${homeSpot}.`,
             };
         default:
             // Unreachable unless evaluateParkCoverage grows a reason code. Say
@@ -381,7 +398,23 @@ exports.quoteOrder = async (req, res) => {
             } else if (!sub) {
                 reason = 'no_active_subscription';
             } else {
-                reason = 'retrieval_not_covered';
+                // The day's first one is on the flat plans (Nov 4 2026), the
+                // same rule createOrder applies, judged on the day it happens.
+                const at = new Date(pickUpTime);
+                const rc = await subscriptionService.evaluateRetrievalCoverage(
+                    sub,
+                    { lat, lng, listPriceCents },
+                    Number.isFinite(at.getTime()) ? at : new Date()
+                );
+                covered = !!rc.covered;
+                reason = rc.reason;
+                if (covered) priceCents = 0;
+                if (reason === 'retrieval_not_at_home_address') {
+                    distanceMeters = subscriptionService.haversineMeters(
+                        { lat, lng },
+                        { lat: sub.homeAddress.lat, lng: sub.homeAddress.lng }
+                    );
+                }
             }
         } else if (!sub) {
             // Checked before the add-on gates below so a per-use customer is

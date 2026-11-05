@@ -117,9 +117,9 @@ describe('booking', () => {
         expect(q.body).toMatchObject({ plan: false, pickUpCents: 1300, dropOffCents: 0, cardRequired: false, card: { label: 'Visa ending 4242' } });
         const paid = await request(app).post('/api/schedule').set(auth).send({ ...body, kind: 'pick-up' });
         expect(paid.status).toBe(201);
-        expect(paid.body.move.detail).toBe('Collected from 200 W 20th St · $13');
+        expect(paid.body.move.detail).toBe('Valet meets you at 200 W 20th St · $13');
         const back = await request(app).post('/api/schedule').set(auth).send(body);
-        expect(back.body.move.detail).toBe('Brought to 200 W 20th St · Included with your park');
+        expect(back.body.move.detail).toBe('Brought back to 200 W 20th St · Included with your park');
         await ScheduledMove.deleteMany({});
 
         await givePlan();
@@ -127,7 +127,7 @@ describe('booking', () => {
         expect(soon.status).toBe(400);
         const ok = await request(app).post('/api/schedule').set(auth).send(body);
         expect(ok.status).toBe(201);
-        expect(ok.body.move.detail).toBe('Brought to 200 W 20th St · Included');
+        expect(ok.body.move.detail).toBe('Brought back to 200 W 20th St · Included');
         const list = await request(app).get(`/api/schedule/mine/${user._id}`).set(auth);
         expect(list.body.moves).toHaveLength(1);
         const other = await User.create({ verified: true, phone: '+12125550100', firebaseUid: 'eve' });

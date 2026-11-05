@@ -50,11 +50,11 @@ const kindOf = (mimeType) => (VIDEO_MIME_TYPES.includes(String(mimeType || '').t
 const SIGNED_URL_MINUTES = 60 * 24 * 7;
 
 const TYPE_LABELS = {
-    pre_pickup: 'Photo before pickup',
+    pre_pickup: 'Photo before parking',
     post_park: 'Photo after parking',
 };
 const VIDEO_LABELS = {
-    pre_pickup: 'Video before pickup',
+    pre_pickup: 'Video before parking',
     post_park: 'Video after parking',
 };
 const labelOf = (photo) =>

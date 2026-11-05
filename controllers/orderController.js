@@ -864,6 +864,28 @@ exports.createOrder = async (req, res) => {
             console.log('Subscription coverage decision:', coverage.reason);
         }
 
+        // "Bring my car back" for a car the customer parked themselves: the
+        // day's first is on the flat plans (Rishi, Nov 4 2026; the rule is
+        // subscriptionService.evaluateRetrievalCoverage, which the quote asks
+        // too). A park's own return leg (originalOrderId) is paid with the park
+        // and never goes through createOrder.
+        if (subscription && !finalIsFreeService && orderType === 'retrieval' && !req.body.originalOrderId) {
+            coverage = await subscriptionService.evaluateRetrievalCoverage(
+                subscription,
+                {
+                    lat: customerLocation && customerLocation.lat,
+                    lng: customerLocation && customerLocation.lng,
+                    // Server-priced, like a park's: never the client's totalAmount.
+                    listPriceCents: (await require('../services/orderPricing').loadPricing().catch(() => null))?.retrievalCents || 500,
+                },
+                (() => {
+                    const at = new Date(pickUpTime);
+                    return Number.isFinite(at.getTime()) ? at : new Date();
+                })()
+            );
+            console.log('Retrieval coverage decision:', coverage.reason);
+        }
+
         // A park on the flat plans has no end time, whether or not the plan
         // paid for this particular one. Coverage is once a day; being looked
         // after is the whole month. Not while another car is riding the plan

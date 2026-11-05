@@ -117,6 +117,49 @@ async function freeParksUsedToday(sub, now = new Date()) {
     });
 }
 
+// Retrievals of the day this plan paid for: "Bring my car back" for a car
+// the customer parked themselves (a standalone retrieval; a park's own return
+// leg is paid with the park and never counted here).
+async function freeRetrievalsUsedToday(sub, now = new Date()) {
+    const dayStart = nyStartOfDay(now);
+    const dayEnd = nyStartOfDay(new Date(dayStart.getTime() + 36 * 60 * 60 * 1000));
+    return Order.countDocuments({
+        coveredBySubscription: sub._id,
+        orderType: 'retrieval',
+        status: { $ne: 'cancelled' },
+        pickUpTime: { $gte: dayStart, $lt: dayEnd },
+    });
+}
+
+/**
+ * Does the plan pay for this "Bring my car back"? (Rishi, Nov 4 2026: "fix the
+ * bring it back bug where a subscriber is charged for their first bring my car
+ * back".) The flat plans promise "one free park and retrieval a day": the
+ * first standalone retrieval of a day is free, one per car on the plan, and on
+ * Permanent valet it is the car brought to the fixed address (the same circle
+ * the free park uses). Street cleaning is bought by the move, so a retrieval
+ * there is paid. `lat`/`lng` is where the car is being brought.
+ */
+async function evaluateRetrievalCoverage(sub, { lat, lng, listPriceCents }, now = new Date()) {
+    if (!isEntitled(sub, now)) return { covered: false, reason: 'no_active_subscription' };
+    if (tierRank(sub.tier) < tierRank('home_garage')) return { covered: false, reason: 'retrieval_not_covered' };
+    const used = await freeRetrievalsUsedToday(sub, now);
+    if (used >= carsOnPlan(sub)) return { covered: false, reason: 'daily_free_retrieval_used' };
+    if (sub.tier === 'home_garage') {
+        const home = sub.homeAddress;
+        if (!home || typeof home.lat !== 'number' || typeof home.lng !== 'number') {
+            return { covered: false, reason: 'no_home_address_on_file' };
+        }
+        if (typeof lat !== 'number' || typeof lng !== 'number') {
+            return { covered: false, reason: 'order_location_missing' };
+        }
+        if (haversineMeters({ lat, lng }, { lat: home.lat, lng: home.lng }) > HOME_RADIUS_METERS) {
+            return { covered: false, reason: 'retrieval_not_at_home_address' };
+        }
+    }
+    return { covered: true, listPriceCents, reason: 'daily_free_retrieval' };
+}
+
 // Server-side per-use price of a park order, for coverage stamps. Never trust
 // the client's totalAmount for this — it feeds valet pay and the value
 // indicator.
@@ -414,6 +457,8 @@ module.exports = {
     aspMovesUsedThisWeek,
     freeParksUsedToday,
     evaluateParkCoverage,
+    freeRetrievalsUsedToday,
+    evaluateRetrievalCoverage,
     parkIsIndefinite,
     nextAspMove,
     buildStatusPayload,

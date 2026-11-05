@@ -177,7 +177,8 @@ function shortStreet(address) {
 function view(move, sub, pickUpPriceCents = null) {
     const included = !!sub;
     const street = shortStreet(move.address);
-    const verb = move.kind === 'drop-off' ? `Brought to ${street}` : `Collected from ${street}`;
+    // Parking and retrieval, the words users read (Nov 4 2026); the kinds stay.
+    const verb = move.kind === 'drop-off' ? `Brought back to ${street}` : `Valet meets you at ${street}`;
     // Without a plan a pick-up is charged when it's booked; the drop-off
     // brings back a car whose return is already paid for.
     const priceCents = included || move.kind === 'drop-off' ? 0 : pickUpPriceCents;
@@ -237,7 +238,7 @@ async function create(userId, input, now = new Date()) {
     // Without a plan each pick-up is charged when it's booked, so a card has
     // to be on file first.
     if (!sub && !(await savedCard(userId))) {
-        return { status: 402, code: 'CARD_REQUIRED', error: 'Add a card first. Each pick-up is charged to it when it’s booked.' };
+        return { status: 402, code: 'CARD_REQUIRED', error: 'Add a card first. Each parking is charged to it when it’s booked.' };
     }
     const { value, error } = validate(input);
     if (error) return { status: 400, error };

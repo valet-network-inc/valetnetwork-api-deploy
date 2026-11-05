@@ -411,11 +411,74 @@ describe('POST /api/subscription/quote', () => {
         expect(booked.body.order.totalAmount).toBe(quoted.body.priceCents);
     });
 
-    it('a standalone retrieval is never covered, whatever the plan', async () => {
-        const user = await makeCustomer();
-        await makeSub(user, { tier: 'valet_anywhere', amountCents: 30000 });
-        const res = await quote({ userId: user._id.toString(), orderType: 'retrieval' });
+    // Rishi, Nov 4 2026: "fix the bring it back bug where a subscriber is
+    // charged for their first bring my car back". The flat plans bring a car
+    // back free once a day (one per car on the plan); Permanent valet to the
+    // fixed address only; street cleaning is bought by the move.
+    const retrievalQuote = (user, overrides = {}) => ({
+        userId: user._id.toString(),
+        orderType: 'retrieval',
+        lat: HOME.lat,
+        lng: HOME.lng,
+        ...overrides,
+    });
+    const retrievalBody = (overrides = {}) => ({
+        customerLocation: HOME,
+        parkingType: 'retrieval',
+        duration: 0,
+        pickUpTime: new Date().toISOString(),
+        totalAmount: 500,
+        orderType: 'retrieval',
+        serviceType: 'standard',
+        ...overrides,
+    });
 
+    it("a subscriber's first standalone retrieval of the day is free", async () => {
+        const user = await makeCustomer();
+        await makeSub(user);
+        const res = await quote(retrievalQuote(user));
+
+        expect(res.body.covered).toBe(true);
+        expect(res.body.reason).toBe('daily_free_retrieval');
+        expect(res.body.priceCents).toBe(0);
+        expect(res.body.label).toBe('Free with your plan');
+    });
+
+    it('booking it charges nothing and stamps the plan; the second of the day is $5', async () => {
+        const user = await makeCustomer();
+        const sub = await makeSub(user);
+        const first = await createOrderVia(user, retrievalBody(), sub);
+        expect(first.body.order.totalAmount).toBe(0);
+        expect(first.body.order.paymentStatus).toBe('paid');
+        expect(String(first.body.order.coveredBySubscription)).toBe(String(sub._id));
+
+        const second = await quote(retrievalQuote(user));
+        expect(second.body.covered).toBe(false);
+        expect(second.body.reason).toBe('daily_free_retrieval_used');
+        expect(second.body.priceCents).toBe(500);
+    });
+
+    it('a second car on the plan brings a second car back free the same day', async () => {
+        const user = await makeCustomer();
+        const sub = await makeSub(user, { extraCars: 1 });
+        await createOrderVia(user, retrievalBody(), sub);
+        const res = await quote(retrievalQuote(user));
+        expect(res.body.covered).toBe(true);
+    });
+
+    it('on Permanent valet it is free to the fixed address only', async () => {
+        const user = await makeCustomer();
+        await makeSub(user);
+        const res = await quote(retrievalQuote(user, { lat: HOME.lat + 0.02, lng: HOME.lng }));
+        expect(res.body.covered).toBe(false);
+        expect(res.body.reason).toBe('retrieval_not_at_home_address');
+        expect(res.body.priceCents).toBe(500);
+    });
+
+    it('a street-cleaning plan still pays for a retrieval', async () => {
+        const user = await makeCustomer();
+        await makeSub(user, { tier: 'street_cleaning', amountCents: 10000, movesPerWeek: 2 });
+        const res = await quote(retrievalQuote(user));
         expect(res.body.covered).toBe(false);
         expect(res.body.reason).toBe('retrieval_not_covered');
         expect(res.body.priceCents).toBe(500);
