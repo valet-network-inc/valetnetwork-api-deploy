@@ -9,7 +9,7 @@
 const User = require('../models/User');
 const Subscription = require('../models/Subscription');
 const {
-    suggestFromOrders,
+    autoAdopt,
     isActive,
     nextMove,
     monthView,
@@ -53,13 +53,19 @@ async function buildPayload(user) {
     const hasSchedule = !!(schedule && (schedule.days || []).length);
 
     if (!hasSchedule) {
+        // No "Look right?" any more (his Nov 5 call): the last move or street
+        // park sets the calendar on its own, and the payload says so.
+        if (await autoAdopt(user._id)) {
+            const fresh = await User.findById(user._id);
+            if (fresh && fresh.cleaningSchedule && (fresh.cleaningSchedule.days || []).length) return buildPayload(fresh);
+        }
         return {
             hasSchedule: false,
             schedule: null,
             active: false,
             next: null,
             upcoming: [],
-            suggestion: await suggestFromOrders(user._id),
+            suggestion: null,
         };
     }
 
@@ -219,6 +225,8 @@ exports.clearSchedule = async (req, res) => {
         const user = await User.findById(req.params.userId);
         if (!user) return bad(res, 'User not found', 404);
         user.cleaningSchedule = undefined;
+        // Cleared on purpose: the next load must not set it straight back.
+        user.cleaningScheduleSuggestionDismissedAt = user.cleaningScheduleSuggestionDismissedAt || new Date();
         await user.save();
         return res.status(200).json({ success: true, ...(await buildPayload(user)) });
     } catch (err) {

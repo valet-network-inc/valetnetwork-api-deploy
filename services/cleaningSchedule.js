@@ -555,3 +555,52 @@ async function adoptFromTrip(order) {
 }
 
 module.exports.adoptFromTrip = adoptFromTrip;
+
+/**
+ * His Nov 5 2026 call: never ask "Look right?" — "auto set it for them", after
+ * a street-cleaning move and after a parking alike. With no calendar set, the
+ * last finished street park or move sets it (the same rule as when a trip
+ * ends, adoptFromTrip); failing that, the guess from past moves is saved
+ * instead of offered. Not on a plan (the plan sets it), and never once the
+ * user waved the guess away or cleared the calendar themselves.
+ */
+async function autoAdopt(userId) {
+    try {
+        const user = await User.findById(userId).select('cleaningSchedule cleaningScheduleSuggestionDismissedAt');
+        if (!user) return false;
+        if (user.cleaningSchedule && (user.cleaningSchedule.days || []).length) return false;
+        if (user.cleaningScheduleSuggestionDismissedAt) return false;
+        const { getActiveSubscription } = require('./subscriptionService');
+        if (await getActiveSubscription(userId)) return false;
+
+        const last = await Order.findOne({
+            customer: userId,
+            status: 'completed',
+            awayMode: { $ne: true },
+            $or: [
+                { orderType: 'parking', parkingType: 'street', 'parkingLocation.streetCleaning.0': { $exists: true } },
+                { aspMode: true, orderType: { $ne: 'retrieval' } },
+            ],
+        }).sort({ updatedAt: -1, createdAt: -1 });
+        if (last && (await adoptFromTrip(last))) return true;
+
+        const s = await suggestFromOrders(userId);
+        if (!s || !s.address || !(s.days || []).length) return false;
+        user.cleaningSchedule = {
+            address: s.address,
+            days: s.days,
+            reminderLeadMin: s.reminderLeadMin ?? 60,
+            status: 'active',
+            pausedUntil: null,
+            source: 'from_orders',
+            updatedAt: new Date(),
+        };
+        user.cleaningScheduleSuggestionDismissedAt = new Date();
+        await user.save();
+        return true;
+    } catch (err) {
+        console.error('autoAdopt failed:', err.message);
+        return false;
+    }
+}
+module.exports.autoAdopt = autoAdopt;
