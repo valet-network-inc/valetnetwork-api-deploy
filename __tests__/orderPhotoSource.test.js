@@ -218,3 +218,70 @@ describe('photo provenance', () => {
         expect(bySource).toEqual(['camera', 'library']);
     });
 });
+
+describe('a short video instead of a photo (Nov 4 2026)', () => {
+    const uploadFile = async (orderId, valetId, file, fields = {}) => {
+        const req = {
+            params: { orderId: String(orderId) },
+            body: { type: 'post_park', valetId: String(valetId), ...fields },
+            file,
+        };
+        const res = mockRes();
+        await orderPhotoController.uploadPhoto(req, res);
+        return res;
+    };
+
+    test('a .mov is accepted, stored as a video, and listed with its kind', async () => {
+        const customer = await makeUser();
+        const valet = await makeUser({ isValet: true });
+        const order = await makeOrder(customer._id, valet._id);
+
+        const res = await uploadFile(order._id, valet._id, {
+            buffer: Buffer.from('fake-mov-bytes'),
+            mimetype: 'video/quicktime',
+            size: 30 * 1024 * 1024, // well past the photo limit, inside the video one
+            originalname: 'walkaround.mov',
+        });
+        expect(res.statusCode).toBe(200);
+        expect(res.body.photo).toMatchObject({ type: 'post_park', kind: 'video', mimeType: 'video/quicktime' });
+
+        const stored = await OrderPhoto.findOne({ order: order._id }).lean();
+        expect(stored.storagePath).toMatch(/\.mov$/);
+
+        const listRes = mockRes();
+        await orderPhotoController.listPhotos({ params: { orderId: String(order._id) }, query: {} }, listRes);
+        expect(listRes.body.photos[0]).toMatchObject({ kind: 'video', type: 'post_park' });
+    });
+
+    test('a photo stays a photo, and an oversized video or an unknown file is refused', async () => {
+        const customer = await makeUser();
+        const valet = await makeUser({ isValet: true });
+        const order = await makeOrder(customer._id, valet._id);
+
+        const photo = await uploadFile(order._id, valet._id, {
+            buffer: Buffer.from('fake-jpeg-bytes'),
+            mimetype: 'image/jpeg',
+            size: 15,
+            originalname: 'photo.jpg',
+        });
+        expect(photo.body.photo.kind).toBe('photo');
+
+        const huge = await uploadFile(order._id, valet._id, {
+            buffer: Buffer.from('x'),
+            mimetype: 'video/mp4',
+            size: 90 * 1024 * 1024,
+            originalname: 'long.mp4',
+        });
+        expect(huge.statusCode).toBe(400);
+        expect(huge.body.message).toMatch(/Video too large/);
+
+        const odd = await uploadFile(order._id, valet._id, {
+            buffer: Buffer.from('x'),
+            mimetype: 'application/pdf',
+            size: 10,
+            originalname: 'doc.pdf',
+        });
+        expect(odd.statusCode).toBe(400);
+        expect(odd.body.message).toMatch(/MOV, MP4/);
+    });
+});

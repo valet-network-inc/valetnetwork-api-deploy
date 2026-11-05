@@ -1,10 +1,13 @@
 /**
  * orderPhotoController
  *
- * Receives valet-captured handoff photos for an order. Two moments per
- * parking order: `pre_pickup` (before OTP key transfer) and `post_park`
- * (before notifying parking complete). The mobile app gates those
- * actions until a photo of the right type has been recorded.
+ * Receives valet-captured handoff photos — or a short video instead (Nov 4
+ * 2026) — for an order. Two moments per parking order: `pre_pickup` (before
+ * OTP key transfer) and `post_park` (before notifying parking complete). The
+ * mobile app gates those actions until a photo or video of the right type
+ * has been recorded. A video is stored, listed, linked and announced exactly
+ * like a photo; `kind` ('photo' | 'video', from the file type) tells the
+ * clients which to draw.
  *
  * Flow:
  *   1. Valet snaps a photo on their phone.
@@ -31,9 +34,16 @@ const User = require('../models/User');
 const firebaseStorage = require('../services/firebaseStorage');
 const { sendPushNotification } = require('./notificationController');
 
-const ACCEPTED_MIME_TYPES = ['image/jpeg', 'image/jpg', 'image/png', 'image/heic'];
+const IMAGE_MIME_TYPES = ['image/jpeg', 'image/jpg', 'image/png', 'image/heic'];
+// An iPhone records .mov (video/quicktime); a picked or exported clip may be .mp4.
+const VIDEO_MIME_TYPES = ['video/quicktime', 'video/mp4'];
+const ACCEPTED_MIME_TYPES = [...IMAGE_MIME_TYPES, ...VIDEO_MIME_TYPES];
 const VALID_TYPES = ['pre_pickup', 'post_park'];
 const MAX_BYTES = 12 * 1024 * 1024;   // 12 MB — modern iPhone shots fit
+// A walk-around of up to 20 s at the app's medium quality is ~10–30 MB.
+const MAX_VIDEO_BYTES = 80 * 1024 * 1024;
+
+const kindOf = (mimeType) => (VIDEO_MIME_TYPES.includes(String(mimeType || '').toLowerCase()) ? 'video' : 'photo');
 
 // View-URL TTL — 7 days so the customer's chat link doesn't go stale
 // before they realistically open the conversation.
@@ -43,6 +53,12 @@ const TYPE_LABELS = {
     pre_pickup: 'Photo before pickup',
     post_park: 'Photo after parking',
 };
+const VIDEO_LABELS = {
+    pre_pickup: 'Video before pickup',
+    post_park: 'Video after parking',
+};
+const labelOf = (photo) =>
+    (kindOf(photo.mimeType) === 'video' ? VIDEO_LABELS : TYPE_LABELS)[photo.type] || 'Photo';
 
 // The chat link. Until Oct 30 2026 the photo message's text was
 // "Photo after parking — tap to view" with the signed URL only in
@@ -63,7 +79,7 @@ const photoMessageText = (label, link) => (link ? `${label}: ${link}` : `${label
  */
 const announcePhotoToCustomer = async ({ photo, order, viewUrl, valetId }) => {
     const conversationId = order?.conversationId;
-    const label = TYPE_LABELS[photo.type] || 'Photo';
+    const label = labelOf(photo);
     const link = photoLink(photo);
     const updates = {};
 
@@ -84,6 +100,7 @@ const announcePhotoToCustomer = async ({ photo, order, viewUrl, valetId }) => {
                     senderId: valetId,
                     messageType: 'photo',
                     photoType: photo.type,
+                    mediaKind: kindOf(photo.mimeType),
                     photoId: String(photo._id),
                     photoUrl: viewUrl,
                     containsLink: true,
@@ -110,7 +127,7 @@ const announcePhotoToCustomer = async ({ photo, order, viewUrl, valetId }) => {
         if (firebaseUid) {
             const result = await sendPushNotification(
                 firebaseUid,
-                'Your valet shared a photo',
+                kindOf(photo.mimeType) === 'video' ? 'Your valet shared a video' : 'Your valet shared a photo',
                 label,
                 { orderId: String(order._id), photoType: photo.type }
             );
@@ -138,8 +155,9 @@ const announcePhotoToCustomer = async ({ photo, order, viewUrl, valetId }) => {
  * Build the Firebase Storage destination for a photo upload.
  */
 const buildStoragePath = (orderId, type, mimeType, originalFilename) => {
-    const ext = path.extname(originalFilename || '').toLowerCase()
-        || (mimeType === 'image/png' ? '.png' : '.jpg');
+    const fallbackExt =
+        mimeType === 'image/png' ? '.png' : mimeType === 'video/quicktime' ? '.mov' : mimeType === 'video/mp4' ? '.mp4' : '.jpg';
+    const ext = path.extname(originalFilename || '').toLowerCase() || fallbackExt;
     const random = crypto.randomBytes(6).toString('hex');
     return `order-photos/${orderId}/${type}/${Date.now()}-${random}${ext}`;
 };
@@ -184,13 +202,15 @@ exports.uploadPhoto = async (req, res) => {
         if (!ACCEPTED_MIME_TYPES.includes((file.mimetype || '').toLowerCase())) {
             return res.status(400).json({
                 success: false,
-                message: 'Unsupported file type. Accepted: JPEG, PNG, HEIC.',
+                message: 'Unsupported file type. Accepted: JPEG, PNG, HEIC, MOV, MP4.',
             });
         }
-        if ((file.size || 0) > MAX_BYTES) {
+        const isVideo = kindOf(file.mimetype) === 'video';
+        const maxBytes = isVideo ? MAX_VIDEO_BYTES : MAX_BYTES;
+        if ((file.size || 0) > maxBytes) {
             return res.status(400).json({
                 success: false,
-                message: `Photo too large. Max ${Math.round(MAX_BYTES / 1024 / 1024)} MB.`,
+                message: `${isVideo ? 'Video' : 'Photo'} too large. Max ${Math.round(maxBytes / 1024 / 1024)} MB.`,
             });
         }
 
@@ -251,6 +271,8 @@ exports.uploadPhoto = async (req, res) => {
             photo: {
                 id: photo._id,
                 type: photo.type,
+                kind: kindOf(photo.mimeType),
+                mimeType: photo.mimeType,
                 source: photo.source,
                 viewUrl,
                 capturedAt: photo.capturedAt,
@@ -299,8 +321,13 @@ exports.listPhotos = async (req, res) => {
             photos.map(async (p) => ({
                 id: p._id,
                 type: p.type,
+                kind: kindOf(p.mimeType),
+                mimeType: p.mimeType,
                 source: p.source || 'camera',
                 viewUrl: await firebaseStorage.getSignedUrl(p.storagePath, SIGNED_URL_MINUTES),
+                // The share link never goes stale: it hands out a fresh signed URL
+                // on every open until the photo expires. Older photos have none.
+                link: photoLink(p),
                 capturedAt: p.capturedAt,
                 capturedAtLocation: p.capturedAtLocation,
                 expiresAt: p.expiresAt,

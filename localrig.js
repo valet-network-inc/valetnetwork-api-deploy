@@ -18,6 +18,8 @@ const { MongoMemoryServer } = require('mongodb-memory-server');
   process.env.MONGO_URI = uri;
   process.env.MONGODB_URI = uri;
   process.env.PORT = '8099';
+  // Photo and video share links (/api/photo/<token>) point back at the rig.
+  process.env.PUBLIC_BACKEND_URL = 'http://localhost:8099';
   process.env.NODE_ENV = 'development';
 
   // Nothing periodic. A sweep or an auto-cancel firing mid-screenshot would
@@ -41,12 +43,58 @@ const { MongoMemoryServer } = require('mongodb-memory-server');
   process.env.ADMIN_API_KEY = 'localrig';
 
   // Firebase is not configured here, and getSignedUrl throws without it — which
-  // 500s the parking-note GET and makes the valet screens untestable. Stub it:
-  // the rig never stores a real photo, and no screenshot depends on one loading.
+  // 500s the parking-note GET and makes the valet screens untestable. Stand in
+  // for it on disk: uploads land in a temp folder and come back from a small
+  // file server on :8096 (with byte ranges, which Safari needs to play a
+  // video), so handoff photos and videos can be seen on the test phone.
+  const fs = require('fs');
+  const os = require('os');
+  const pathMod = require('path');
+  const RIG_FILES = pathMod.join(os.tmpdir(), 'vn-rig-files');
+  fs.mkdirSync(RIG_FILES, { recursive: true });
+  const rigFile = (p) => pathMod.join(RIG_FILES, String(p).replace(/\.\./g, ''));
   const storage = require('./services/firebaseStorage');
-  storage.getSignedUrl = async (path) => `https://rig.local/${path}`;
-  storage.uploadFile = async (buf, path) => ({ bucket: 'rig-bucket', path });
-  storage.deleteFile = async () => true;
+  storage.getSignedUrl = async (p) => `http://localhost:8096/${String(p).split('/').map(encodeURIComponent).join('/')}`;
+  storage.uploadFile = async (buf, p) => {
+      fs.mkdirSync(pathMod.dirname(rigFile(p)), { recursive: true });
+      fs.writeFileSync(rigFile(p), buf);
+      return { bucket: 'rig-bucket', path: p };
+  };
+  storage.deleteFile = async (p) => {
+      try {
+          fs.unlinkSync(rigFile(p));
+      } catch (e) {}
+      return true;
+  };
+  const TYPES = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.heic': 'image/heic', '.mov': 'video/quicktime', '.mp4': 'video/mp4' };
+  require('http')
+      .createServer((req, res) => {
+          const file = rigFile(decodeURIComponent(String(req.url || '').split('?')[0]).replace(/^\/+/, ''));
+          let stat;
+          try {
+              stat = fs.statSync(file);
+          } catch (e) {
+              res.writeHead(404).end();
+              return;
+          }
+          const type = TYPES[pathMod.extname(file).toLowerCase()] || 'application/octet-stream';
+          const range = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || '');
+          if (range) {
+              const start = range[1] ? Number(range[1]) : 0;
+              const end = range[2] ? Math.min(Number(range[2]), stat.size - 1) : stat.size - 1;
+              res.writeHead(206, {
+                  'Content-Type': type,
+                  'Content-Length': end - start + 1,
+                  'Content-Range': `bytes ${start}-${end}/${stat.size}`,
+                  'Accept-Ranges': 'bytes',
+              });
+              fs.createReadStream(file, { start, end }).pipe(res);
+              return;
+          }
+          res.writeHead(200, { 'Content-Type': type, 'Content-Length': stat.size, 'Accept-Ranges': 'bytes' });
+          fs.createReadStream(file).pipe(res);
+      })
+      .listen(8096);
 
   // No Firebase here, so no ID tokens either. The app's rig sign-in (a dev
   // build pointed at localhost) sends "Bearer rig-<digits>" and its loginUser
@@ -65,7 +113,43 @@ const { MongoMemoryServer } = require('mongodb-memory-server');
 
   // The app's chats live in Firestore. The rig Metro points the app at this
   // stand-in instead, so rig chats never touch the live Firestore.
-  require('./rigfirestore').start(8098);
+  const rigFs = require('./rigfirestore');
+  rigFs.start(8098);
+
+  // The API's own Firestore writes (the handoff photo and video messages, the
+  // payment notes) go to the same stand-in, so a rig chat shows what a live
+  // one would. Without this they failed: there is no default Firebase app here.
+  const fsCall = (body) => {
+    const r = rigFs.handle(body);
+    if (r.status) throw new Error(r.json.error);
+    return r.json;
+  };
+  const docRef = (path) => ({
+    id: path.split('/').pop(),
+    path,
+    collection: (name) => colRef(`${path}/${name}`),
+    get: async () => {
+      const r = fsCall({ op: 'get', path });
+      return { exists: r.exists, id: path.split('/').pop(), data: () => r.data || undefined };
+    },
+    set: async (data, opts) => fsCall({ op: 'set', path, data, merge: !!(opts && opts.merge) }),
+    update: async (data) => fsCall({ op: 'update', path, data }),
+    delete: async () => fsCall({ op: 'delete', path }),
+  });
+  const colRef = (path) => ({
+    doc: (id) => docRef(`${path}/${id || require('crypto').randomBytes(10).toString('hex')}`),
+    add: async (data) => docRef(`${path}/${fsCall({ op: 'add', path, data }).id}`),
+  });
+  const rigFirestore = () => ({ collection: (name) => colRef(name), doc: (path) => docRef(path) });
+  rigFirestore.FieldValue = {
+    serverTimestamp: () => ({ __fv: 'serverTimestamp' }),
+    increment: (n) => ({ __fv: 'increment', n }),
+    arrayUnion: (...items) => ({ __fv: 'arrayUnion', items }),
+    arrayRemove: (...items) => ({ __fv: 'arrayRemove', items }),
+    delete: () => ({ __fv: 'delete' }),
+  };
+  rigFirestore.Timestamp = { now: () => ({ __ts: Date.now() }), fromDate: (d) => ({ __ts: new Date(d).getTime() }) };
+  Object.defineProperty(admin, 'firestore', { value: rigFirestore, configurable: true, writable: true });
 
   require('./server.js');
 

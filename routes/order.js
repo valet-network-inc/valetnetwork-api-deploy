@@ -100,9 +100,15 @@ router.get('/:orderId/tips', tipController.getOrderTips);
 // --- Order handoff photos (pre-pickup + post-park, gates the
 //     valet-side actions until photo is captured). Mobile UI lands
 //     in build 11; backend foundation is ready.
+// Handoff photos, or a short video instead (Nov 4 2026): the controller
+// holds a photo to 12 MB and a video to 80 MB.
+const handoffMediaUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 80 * 1024 * 1024 },
+});
 router.post(
     '/:orderId/photos',
-    photoUpload.single('file'),
+    handoffMediaUpload.single('file'),
     orderPhotoController.uploadPhoto
 );
 router.get('/:orderId/photos', orderPhotoController.listPhotos);
