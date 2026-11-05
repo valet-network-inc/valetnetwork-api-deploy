@@ -355,7 +355,7 @@ const UserSchema = new mongoose.Schema({
         pausedUntil: { type: Date, default: null },
         source: {
             type: String,
-            enum: ['manual', 'from_orders', 'subscription'],
+            enum: ['manual', 'from_orders', 'subscription', 'from_trip'],
             default: 'manual',
         },
         updatedAt: { type: Date },

@@ -456,3 +456,98 @@ async function adoptFromSubscription(userId, aspSchedule, { reminderLeadMin } = 
 }
 
 module.exports.adoptFromSubscription = adoptFromSubscription;
+
+/**
+ * Turn the street-cleaning calendar on at the spot a trip just ended on (his
+ * Nov 4 2026 note: "after a regular parking or a street cleaning move is
+ * done, turn on the calendar for them, and set it to whatever the last parked
+ * spot was").
+ *
+ *   - A parking on the street: the curb we left the car on, its sign's days.
+ *   - A street-cleaning move (its automatic return, or the move itself): the
+ *     user's own spot, where the car came back to. Its days come from the
+ *     sign there when we have parked on that block before, else from the move
+ *     itself (it was booked for the sweep).
+ *
+ * Plans keep their own schedule (the plan's moves run off it), and an away
+ * trip or a retrieval leaves the car somewhere else, so neither changes it.
+ * Never throws: a calendar must not fail a completion.
+ */
+async function adoptFromTrip(order) {
+    try {
+        if (!order || order.keyDeliveryOnly || order.awayMode) return false;
+        const userId = order.customer?._id || order.customer;
+        if (!userId) return false;
+
+        const { toSweepWindows } = require('./sweepWindows');
+        const daysOf = (streetCleaning) =>
+            toSweepWindows(streetCleaning)
+                .windows.filter((w, i, all) => all.findIndex((x) => x.weekday === w.weekday) === i)
+                .map((w) => ({ weekday: w.weekday, hour: w.hour, minute: w.minute }));
+
+        let address = null;
+        let days = [];
+        const point = (loc) =>
+            loc && typeof loc.lat === 'number' && typeof loc.lng === 'number' && loc.streetAddress
+                ? { streetAddress: loc.streetAddress, lat: loc.lat, lng: loc.lng }
+                : null;
+
+        const moveLeg = order.orderType === 'retrieval' && order.aspMode && order.linkedOrderId;
+        const move = moveLeg
+            ? await Order.findById(order.linkedOrderId).select('customerLocation pickUpTime awayMode aspMode').lean()
+            : order.orderType !== 'retrieval' && order.aspMode
+              ? order
+              : null;
+
+        if (move) {
+            if (move.awayMode) return false;
+            address = point(move.customerLocation);
+            if (!address) return false;
+            // The sign on that block, from the last time we parked there.
+            const nearby = await Order.find({
+                customer: userId,
+                'parkingLocation.lat': { $type: 'number' },
+                'parkingLocation.streetCleaning.0': { $exists: true },
+            })
+                .select('parkingLocation')
+                .sort({ updatedAt: -1 })
+                .limit(25)
+                .lean();
+            const { haversineMeters } = require('./sweepWindows');
+            const sameBlock = nearby.find((o) => haversineMeters(o.parkingLocation, address) <= 60);
+            days = sameBlock ? daysOf(sameBlock.parkingLocation.streetCleaning) : [];
+            if (!days.length && move.pickUpTime) {
+                const { weekday, hour, minute } = nycParts(new Date(move.pickUpTime));
+                days = [{ weekday, hour, minute }];
+            }
+        } else if (order.orderType === 'parking' && order.parkingType === 'street') {
+            address = point(order.parkingLocation);
+            days = address ? daysOf(order.parkingLocation.streetCleaning) : [];
+        }
+        if (!address || !days.length) return false;
+
+        const { getActiveSubscription } = require('./subscriptionService');
+        if (await getActiveSubscription(userId)) return false;
+
+        const user = await User.findById(userId).select('cleaningSchedule cleaningScheduleSuggestionDismissedAt');
+        if (!user) return false;
+        user.cleaningSchedule = {
+            address,
+            days: days.sort((a, b) => a.weekday - b.weekday),
+            reminderLeadMin: user.cleaningSchedule?.reminderLeadMin ?? 60,
+            status: 'active',
+            pausedUntil: null,
+            source: 'from_trip',
+            updatedAt: new Date(),
+        };
+        // Set, so the "Look right?" guess never comes back over it.
+        user.cleaningScheduleSuggestionDismissedAt = user.cleaningScheduleSuggestionDismissedAt || new Date();
+        await user.save();
+        return true;
+    } catch (err) {
+        console.error('adoptFromTrip failed:', err.message);
+        return false;
+    }
+}
+
+module.exports.adoptFromTrip = adoptFromTrip;

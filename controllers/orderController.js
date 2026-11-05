@@ -8,6 +8,7 @@ const User = require('../models/User');
 const Event = require('../models/Event');
 const subscriptionService = require('../services/subscriptionService');
 const giftBalance = require('../services/giftBalance');
+const cleaningSchedule = require('../services/cleaningSchedule');
 const orderPricing = require('../services/orderPricing');
 // Linked accounts: who else may see and act on a customer's orders, and the
 // one place customer-room order events fan out to both of them.
@@ -2131,6 +2132,13 @@ exports.updateOrder = async (req, res) => {
             }
         }
 
+        // A parking or a street-cleaning move that ends turns the user's
+        // street-cleaning calendar on at that spot (his Nov 4 2026 note).
+        // Before the emit, so the phone that hears ORDER_COMPLETED reads it on.
+        if (updates.status === 'completed') {
+            await cleaningSchedule.adoptFromTrip(order);
+        }
+
         const updateType =
             updates.status === 'completed'
                 ? 'ORDER_COMPLETED'
@@ -3678,6 +3686,11 @@ const runAspSweep = async (io, now = new Date()) => {
                             // parent park, same customer and same valet, so it
                             // belongs in the parent's thread.
                             conversationId: order.conversationId,
+                            // Codes off stays off for the return (Nov 4: the leg
+                            // left it unset, which reads as codes on, so a
+                            // codes-off user was asked for a code and the
+                            // valet's confirm was refused).
+                            ...(typeof order.handoffCode === 'boolean' ? { handoffCode: order.handoffCode } : {}),
                             valet: order.valet._id, // Assign same valet
                             // The leg is born accepted, so it never passes
                             // through `acceptOrder` and nothing else ever
