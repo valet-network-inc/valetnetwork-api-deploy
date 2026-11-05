@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const requireSelf = require('../middleware/requireSelf');
+const { requireCurrentApp } = require('../services/appGate');
 const {
     getPlans,
     createSubscription,
@@ -28,7 +29,7 @@ router.post('/promo', checkPromo);
 // Both public: they price a plan, and say nothing about anyone's account.
 router.post('/price', quotePrice);
 router.get('/neighborhood-prices', getNeighborhoodPrices);
-router.post('/create', createSubscription);
+router.post('/create', requireCurrentApp, createSubscription);
 router.get('/status/:userId', getSubscriptionStatus);
 
 // Cancel and change both take the userId out of the BODY and act on whatever

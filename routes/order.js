@@ -35,12 +35,13 @@ const orderPhotoController = require('../controllers/orderPhotoController');
 const parkingNoteController = require('../controllers/parkingNoteController');
 const extensionController = require('../controllers/extensionController');
 const multer = require('multer');
+const { requireCurrentApp } = require('../services/appGate');
 const photoUpload = multer({
     storage: multer.memoryStorage(),
     limits: { fileSize: 12 * 1024 * 1024 },     // 12 MB
 });
 
-router.post('/createOrder', validateSubscriptionForOrder, createOrder);
+router.post('/createOrder', requireCurrentApp, validateSubscriptionForOrder, createOrder);
 router.post('/createRetrievalOrder', validateSubscriptionForOrder, createRetrievalOrder);
 // The open job board. It published every pending order — each customer's
 // ObjectId, their pickup address, their licence plate — to anyone who asked,
@@ -135,7 +136,7 @@ router.post('/:orderId/cancel-retrieval', cancelRetrievalLeg);
 // --- Duration extensions: customer or doorman extends an active parking
 //     order. Two-phase: create PaymentIntent, then confirm after the
 //     mobile PaymentSheet succeeds. Pricing $5 first hr, +$1 each after.
-router.post('/:orderId/extend', extensionController.createExtensionIntent);
+router.post('/:orderId/extend', requireCurrentApp, extensionController.createExtensionIntent);
 router.post('/:orderId/extend/confirm', extensionController.confirmExtension);
 
 // --- Key-return handoff (park-and-hold / enterprise). Insurance gate:
