@@ -169,8 +169,9 @@ const LIVE_STATUSES = ['pending', 'accepted', 'in-progress', 'in_progress', 'par
  * order in flight per account, and a retrieval of their own covered park must
  * stay covered.
  *
- * One function on purpose. When a plan takes more than one car this becomes
- * one-park-per-car, and it should only have to change here.
+ * One function on purpose. A plan with an extra car on it (Nov 4 2026,
+ * Subscription.extraCars, $150/mo each) covers that many parks at once: the
+ * plan is busy only once the household's other parks fill every car on it.
  *
  * Answers WHOSE park it is — that account's id as a string — or null. The
  * quote has to name them ("Sam's park is using the plan"), and it may only do
@@ -186,15 +187,19 @@ async function coveredParkLiveBy(sub, excludingUserId = null, park = {}) {
     const nowMs = Date.now();
     const asked = parkWindow(park, nowMs);
 
+    const { carsOnPlan } = require('./subscriptionService');
+    const cars = carsOnPlan(sub);
+
     // Held with no end: overlaps any park from now on.
-    const held = await CurbCustody.findOne({
+    const held = await CurbCustody.find({
         subscription: sub._id,
         customer: notBooker,
         closedAt: { $exists: false },
     })
         .select('customer')
         .lean();
-    if (held) return idOf(held.customer);
+    const busy = held.map((h) => idOf(h.customer));
+    if (busy.length >= cars) return busy[0];
 
     const others = (await householdIds(sub.user)).filter((m) => m !== exclude);
     const riding = await Order.find({
@@ -218,11 +223,11 @@ async function coveredParkLiveBy(sub, excludingUserId = null, park = {}) {
         .select('customer status pickUpTime duration indefinite')
         .lean();
 
-    const hit = riding.find((o) => {
+    for (const o of riding) {
         const w = orderWindow(o, nowMs);
-        return w.start < asked.end && w.end > asked.start;
-    });
-    return hit ? idOf(hit.customer) : null;
+        if (w.start < asked.end && w.end > asked.start) busy.push(idOf(o.customer));
+    }
+    return busy.length >= cars ? busy[0] : null;
 }
 
 const MINUTE_MS = 60 * 1000;

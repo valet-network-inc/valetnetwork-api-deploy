@@ -32,7 +32,20 @@ const { PLANS, OFF_SALE_MESSAGE } = require('../services/subscriptionPlans');
 const {
     isEntitled,
     buildStatusPayload,
+    getActiveSubscription,
+    EXTRA_CAR_TIERS,
+    MAX_EXTRA_CARS,
+    extraCarAmountCents,
 } = require('../services/subscriptionService');
+const { ensureExtraCarPriceId } = require('../services/subscriptionPrices');
+
+// The plan's own Stripe item, not the extra-car one (Nov 4 2026): a plan with
+// a car added carries two items, and a plan change or an address move must
+// reprice the plan, never the car.
+const planItemOf = (stripeSub) => {
+    const items = (stripeSub && stripeSub.items && stripeSub.items.data) || [];
+    return items.find((i) => !(i.metadata && i.metadata.vn === 'extra_car')) || items[0];
+};
 const {
     findPromo,
     planMismatch,
@@ -137,6 +150,8 @@ const PARTNER_HIDDEN_FIELDS = [
     'promoCode',
     'trial',
     'valueIndicator',
+    // Only the holder adds a car (Nov 4 2026); the partner still sees how many.
+    'canAddCar',
 ];
 
 /**
@@ -1047,6 +1062,134 @@ async function periodUsageCents(sub) {
 // paying only for what they actually used, priced at per-use rates, and the
 // rest of the period's payment goes back to their card. ($300 plan, 5 daily
 // park-and-retrievals used, cancel → $65 kept, $235 refunded.)
+/* ----------------------------------------------------------------------------
+ * A second (or third) car on the plan
+ *
+ * Rishi, Nov 4 2026: "if an account is on a plan, and another account is added
+ * to the plan, an additional car on the plan is another $150/mo." Only the
+ * holder changes the plan. The extra cars bill as one more Stripe item on the
+ * plan's subscription (quantity = extra cars, metadata vn: 'extra_car'),
+ * prorated: adding one charges the rest of this period now (and refuses on a
+ * declined card), taking one off credits the next bill. Coverage counts them
+ * through subscriptionService.carsOnPlan.
+ * ------------------------------------------------------------------------- */
+
+/** The caller's own plan, or a 403 (a linked partner's plan) / 404 sent. */
+async function holderPlanOrRefuse(userId, res) {
+    const sub = await getActiveSubscription(userId);
+    if (sub) return sub;
+    let household = null;
+    try {
+        household = await require('../services/accountLinks').getHouseholdSubscription(userId);
+    } catch (_) {
+        household = null;
+    }
+    res.status(household ? 403 : 404).json({
+        success: false,
+        code: household ? 'not_plan_holder' : 'no_plan',
+        message: household
+            ? 'Only the person who holds the plan can add or take off a car.'
+            : 'There is no plan on this account.',
+    });
+    return null;
+}
+
+// POST /api/subscription/extra-car  { userId }
+exports.addExtraCar = async (req, res) => {
+    try {
+        const { userId } = req.body || {};
+        const sub = await holderPlanOrRefuse(userId, res);
+        if (!sub) return undefined;
+        if (!EXTRA_CAR_TIERS.has(sub.tier)) {
+            return res.status(400).json({
+                success: false,
+                code: 'per_move_plan',
+                message: 'A second car goes on Permanent valet. Street cleaning is bought by the move.',
+            });
+        }
+        const current = sub.extraCars || 0;
+        if (current >= MAX_EXTRA_CARS) {
+            return res.status(400).json({
+                success: false,
+                code: 'max_cars',
+                message: `This plan already covers ${1 + MAX_EXTRA_CARS} cars.`,
+            });
+        }
+        if (!sub.stripeSubscriptionId) {
+            return res.status(409).json({
+                success: false,
+                code: 'not_billed_here',
+                message: "This plan isn't billed in the app. Message us and we'll add the car.",
+            });
+        }
+        if (!stripe()) return res.status(503).json({ success: false, message: 'Payment service unavailable' });
+
+        const amountCents = await extraCarAmountCents(sub);
+        const next = current + 1;
+        if (sub.extraCarStripeItemId) {
+            await stripe().subscriptionItems.update(sub.extraCarStripeItemId, {
+                quantity: next,
+                proration_behavior: 'always_invoice',
+                payment_behavior: 'error_if_incomplete',
+            });
+        } else {
+            const priceId = await ensureExtraCarPriceId(sub.interval === 'week' ? 'week' : 'month', amountCents);
+            const item = await stripe().subscriptionItems.create({
+                subscription: sub.stripeSubscriptionId,
+                price: priceId,
+                quantity: 1,
+                proration_behavior: 'always_invoice',
+                payment_behavior: 'error_if_incomplete',
+                metadata: { vn: 'extra_car' },
+            });
+            sub.extraCarStripeItemId = item.id;
+        }
+        sub.extraCars = next;
+        sub.extraCarAmountCents = amountCents;
+        await sub.save();
+        return res.status(200).json({ success: true, subscription: await buildStatusPayload(sub) });
+    } catch (err) {
+        const declined = !!err && (err.type === 'StripeCardError' || err.code === 'card_declined');
+        console.error('addExtraCar error:', err && err.message);
+        return res.status(declined ? 402 : 500).json({
+            success: false,
+            code: declined ? 'card_declined' : 'error',
+            message: declined ? 'Your card was declined, so the car was not added.' : 'Could not add the car. Try again.',
+        });
+    }
+};
+
+// POST /api/subscription/extra-car/remove  { userId }
+exports.removeExtraCar = async (req, res) => {
+    try {
+        const { userId } = req.body || {};
+        const sub = await holderPlanOrRefuse(userId, res);
+        if (!sub) return undefined;
+        const current = sub.extraCars || 0;
+        if (current < 1) {
+            return res.status(400).json({ success: false, code: 'no_extra_car', message: 'There is no extra car on this plan.' });
+        }
+        if (sub.extraCarStripeItemId) {
+            if (!stripe()) return res.status(503).json({ success: false, message: 'Payment service unavailable' });
+            if (current === 1) {
+                await stripe().subscriptionItems.del(sub.extraCarStripeItemId, { proration_behavior: 'create_prorations' });
+            } else {
+                await stripe().subscriptionItems.update(sub.extraCarStripeItemId, {
+                    quantity: current - 1,
+                    proration_behavior: 'create_prorations',
+                });
+            }
+        }
+        sub.extraCars = current - 1;
+        if (!sub.extraCars) sub.extraCarStripeItemId = undefined;
+        await sub.save();
+        return res.status(200).json({ success: true, subscription: await buildStatusPayload(sub) });
+    } catch (err) {
+        console.error('removeExtraCar error:', err && err.message);
+        return res.status(500).json({ success: false, message: 'Could not take the car off. Try again.' });
+    }
+};
+
 exports.cancelSubscription = async (req, res) => {
     const { userId } = req.body;
     try {
@@ -1293,6 +1436,15 @@ exports.changePlan = async (req, res) => {
         }
         const priceGuard = checkExpectedAmount(table, purchase, expectedAmountCents, { action: 'switch plans' });
         if (priceGuard) return res.status(priceGuard.status).json(priceGuard.body);
+        // An extra car (Nov 4 2026) only rides the flat plans, and Stripe
+        // keeps every item of a subscription on one billing interval.
+        if ((sub.extraCars || 0) > 0 && (!EXTRA_CAR_TIERS.has(targetTier) || (interval && interval !== sub.interval))) {
+            return res.status(400).json({
+                success: false,
+                code: 'extra_car_on_plan',
+                message: 'Take the extra car off the plan first, then switch.',
+            });
+        }
         // Schedule can't exceed the new plan's weekly moves.
         if ((sub.aspSchedule?.days?.length || 0) > purchase.movesPerWeek) {
             return res.status(400).json({
@@ -1302,7 +1454,7 @@ exports.changePlan = async (req, res) => {
         }
 
         const stripeSub = await stripe().subscriptions.retrieve(sub.stripeSubscriptionId);
-        const itemId = stripeSub.items.data[0].id;
+        const itemId = planItemOf(stripeSub).id;
         const updated = await stripe().subscriptions.update(sub.stripeSubscriptionId, {
             items: [{ id: itemId, price: purchase.priceId, quantity: purchase.quantity }],
             proration_behavior: 'always_invoice',
@@ -1554,7 +1706,7 @@ exports.updateSchedule = async (req, res) => {
                     const priceId = await resolveStripePrice(move.quote);
                     if (sub.stripeSubscriptionId) {
                         const stripeSub = await stripe().subscriptions.retrieve(sub.stripeSubscriptionId);
-                        const itemId = stripeSub.items.data[0].id;
+                        const itemId = planItemOf(stripeSub).id;
                         await stripe().subscriptions.update(sub.stripeSubscriptionId, {
                             items: [{ id: itemId, price: priceId, quantity: 1 }],
                             proration_behavior: 'none',

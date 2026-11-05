@@ -1,5 +1,18 @@
 const mongoose = require('mongoose');
 
+// A car on the account (Profile → Your cars). See services/accountVehicle.js.
+const CarSchema = new mongoose.Schema(
+    {
+        color: { type: String, trim: true },
+        model: { type: String, trim: true },
+        licensePlate: { type: String, trim: true, uppercase: true },
+        source: { type: String, enum: ['customer', 'valet', 'operator', 'partner'] },
+        by: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+        at: { type: Date },
+    },
+    { _id: false }
+);
+
 const UserSchema = new mongoose.Schema({
     phone: {
         type: String,
@@ -372,18 +385,18 @@ const UserSchema = new mongoose.Schema({
     // (loginUser, updateUser's reply); the valet's prefill asks for it
     // (services/accountVehicle.js); linking copies it into an empty profile.
     vehicle: {
-        type: new mongoose.Schema(
-            {
-                color: { type: String, trim: true },
-                model: { type: String, trim: true },
-                licensePlate: { type: String, trim: true, uppercase: true },
-                source: { type: String, enum: ['customer', 'valet', 'operator'] },
-                by: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-                at: { type: Date },
-            },
-            { _id: false }
-        ),
+        type: CarSchema,
         select: false,
+    },
+    // Every car on the account, first = the one we expect next (Nov 4 2026:
+    // "add multiple cars in the your car section"). `vehicle` above mirrors
+    // the first for apps from before the list. select:false for the same
+    // reasons. 'partner': copied from a linked partner's confirmed park
+    // (services/accountVehicle.js shareConfirmedCar).
+    vehicles: {
+        type: [CarSchema],
+        select: false,
+        default: undefined,
     },
 
     // --- The handoff link the customer gives their doorman ----------------

@@ -351,15 +351,18 @@ function vehicleView(vehicle) {
     return out.color || out.model || out.licensePlate ? out : null;
 }
 
-const hasPlate = (user) =>
-    !!(user && user.vehicle && typeof user.vehicle.licensePlate === 'string' && user.vehicle.licensePlate.trim());
+const { carsOf } = require('../services/accountVehicle');
+const hasPlate = (user) => carsOf(user).length > 0;
 
 /**
  * Car details are copied once, never overwritten (brief §1).
  *
- * If exactly one of the two has a car saved under Profile → Your car, it is
- * copied into the other's empty slot; both or neither, nothing happens. "Has a
- * car" means a plate — the app will not save a car without one.
+ * If exactly one of the two has cars saved under Profile → Your cars, they
+ * are copied into the other's empty list (Rishi, Nov 4 2026: "linked accounts
+ * initially default to whatever car is already in the your car section"); both
+ * or neither, nothing happens. "Has a car" means a plate — the app will not
+ * save a car without one. A car either of them parks later reaches the other
+ * once the park ends on that car (services/accountVehicle.js shareConfirmedCar).
  *
  * The write is conditional on the receiving account STILL having no plate, so
  * a car saved on the other phone in the same second is never overwritten by
@@ -369,22 +372,19 @@ const hasPlate = (user) =>
 async function copyCarIfOneSided(a, b) {
     if (hasPlate(a) === hasPlate(b)) return;
     const [from, to] = hasPlate(a) ? [a, b] : [b, a];
+    // Copied from the partner's own entries (services/accountVehicle.js).
+    const list = carsOf(from).map((v) => ({
+        color: v.color || '',
+        model: v.model || '',
+        licensePlate: v.licensePlate,
+        source: 'customer',
+        at: new Date(),
+    }));
     await User.updateOne(
         // `$in: [null, '']` matches a missing plate, a null one and an empty
-        // one — every way a car can be "not saved".
-        { _id: to._id, 'vehicle.licensePlate': { $in: [null, ''] } },
-        {
-            $set: {
-                vehicle: {
-                    color: from.vehicle.color || '',
-                    model: from.vehicle.model || '',
-                    licensePlate: from.vehicle.licensePlate,
-                    // Copied from the partner's own entry (services/accountVehicle.js).
-                    source: 'customer',
-                    at: new Date(),
-                },
-            },
-        }
+        // one — every way a car can be "not saved"; and no list either.
+        { _id: to._id, 'vehicle.licensePlate': { $in: [null, ''] }, 'vehicles.0': { $exists: false } },
+        { $set: { vehicles: list, vehicle: list[0] } }
     );
 }
 
@@ -541,7 +541,7 @@ exports.authorize = async (req, res) => {
         // The link is made. The car copy is a courtesy on top of it, so a
         // failure there is logged and the link stands.
         try {
-            const before = await peopleById([me, inviteeId], '+vehicle');
+            const before = await peopleById([me, inviteeId], '+vehicle +vehicles');
             await copyCarIfOneSided(before.get(me), before.get(inviteeId));
         } catch (err) {
             console.error('account link: car copy failed —', err.message);
@@ -549,7 +549,7 @@ exports.authorize = async (req, res) => {
 
         // Read back after the copy so each side is told what is actually on
         // its own profile now, whichever way the copy went (or didn't).
-        const people = await peopleById([me, inviteeId], '+vehicle');
+        const people = await peopleById([me, inviteeId], '+vehicle +vehicles');
         const inviter = people.get(me);
         const invitee = people.get(inviteeId);
 

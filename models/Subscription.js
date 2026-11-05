@@ -40,6 +40,23 @@ const SubscriptionSchema = new mongoose.Schema(
             type: Number,
             required: true,
         },
+        // More than one car on the plan (Nov 4 2026, Rishi: "if an account is on
+        // a plan, and another account is added to the plan, an additional car on
+        // the plan is another $150/mo"). The plan covers 1 + extraCars cars at a
+        // time; they bill as one more Stripe item (metadata vn: 'extra_car', its
+        // id in extraCarStripeItemId) at extraCarAmountCents each.
+        extraCars: {
+            type: Number,
+            min: 0,
+            max: 2,
+            default: 0,
+        },
+        extraCarAmountCents: {
+            type: Number,
+        },
+        extraCarStripeItemId: {
+            type: String,
+        },
         // street_cleaning only: how many covered moves per week was bought
         // (Stripe quantity). Also caps the weekly covered-move count.
         movesPerWeek: {

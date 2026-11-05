@@ -13,6 +13,8 @@ const {
     quotePrice,
     getNeighborhoodPrices,
     movePreview,
+    addExtraCar,
+    removeExtraCar,
 } = require('../controllers/subscriptionController');
 
 // Subscriptions v2 (Stripe Billing). The pre-v2 doorman-referral routes
@@ -43,6 +45,9 @@ router.get('/status/:userId', getSubscriptionStatus);
 // else's plan.
 router.post('/cancel', requireSelf((req) => req.body?.userId), cancelSubscription);
 router.post('/change', requireSelf((req) => req.body?.userId), changePlan);
+// A second car on the plan, $150/mo (Nov 4 2026). The holder only.
+router.post('/extra-car', requireSelf((req) => req.body?.userId), addExtraCar);
+router.post('/extra-car/remove', requireSelf((req) => req.body?.userId), removeExtraCar);
 
 // What moving the fixed address would cost: it reads the caller's own price.
 router.post('/move-preview', requireSelf((req) => req.body?.userId), movePreview);

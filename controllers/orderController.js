@@ -3,7 +3,7 @@ const dotenv = require('dotenv');
 dotenv.config({ path: `.env.${process.env.NODE_ENV}` });
 const Order = require('../models/Order');
 const curbCustody = require('../services/curbCustody');
-const { copyOrderCarToAccount, suggestedVehicleFor } = require('../services/accountVehicle');
+const { copyOrderCarToAccount, suggestedVehicleFor, normalizeVehicle } = require('../services/accountVehicle');
 const User = require('../models/User');
 const Event = require('../models/Event');
 const subscriptionService = require('../services/subscriptionService');
@@ -214,6 +214,10 @@ const CLIENT_WRITABLE_ORDER_FIELDS = new Set([
     'parkingLocation',
     'review',
     'vehicle',
+    // The car the user expects us to find, set from their live trip before the
+    // valet has noted one (Nov 4 2026). Not `vehicle`: a colour there skips the
+    // valet's "Add the car" step and its pre-pickup photo.
+    'suggestedVehicle',
     'notes',
     'parkingNotes',
     'customerLocation',
@@ -1615,6 +1619,13 @@ exports.updateOrder = async (req, res) => {
                     'order:',
                     orderId
                 );
+            }
+            // The car the user named from their live trip: the three strings,
+            // cleaned, with a plate, or nothing.
+            if (updates.suggestedVehicle !== undefined) {
+                const v = normalizeVehicle(updates.suggestedVehicle);
+                if (v && v.licensePlate) updates.suggestedVehicle = v;
+                else delete updates.suggestedVehicle;
             }
         }
 

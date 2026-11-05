@@ -645,4 +645,37 @@ OrderSchema.set('toJSON', {
 OrderSchema.index({ autoBookKey: 1 }, { unique: true, sparse: true });
 OrderSchema.index({ customer: 1, status: 1 });
 OrderSchema.index({ coveredBySubscription: 1, createdAt: -1 }, { sparse: true });
+// The end of a park: a car the customer's side named and the valet confirmed
+// goes on a linked partner's list too (Rishi, Nov 4 2026; the rule is
+// services/accountVehicle.js shareConfirmedCar). Orders complete on several
+// paths (the valet's last step, a retrieval closing its park, custody, admin),
+// so the hook sits here once instead of at each. It runs after the write, off
+// the request, and never throws.
+const shareCarsOf = (ids) => {
+    const list = ids.filter(Boolean).map(String);
+    if (!list.length) return;
+    setImmediate(() => {
+        const { shareConfirmedCar } = require('../services/accountVehicle');
+        for (const id of list) shareConfirmedCar(id).catch(() => {});
+    });
+};
+const setsCompleted = (u) => !!u && (u.status === 'completed' || (u.$set && u.$set.status === 'completed'));
+OrderSchema.pre('save', function markCompleted(next) {
+    this.$locals.completedNow = this.isModified('status') && this.status === 'completed';
+    next();
+});
+OrderSchema.post('save', function shareOnSave(doc) {
+    if (doc.$locals && doc.$locals.completedNow) shareCarsOf([doc._id]);
+});
+OrderSchema.post(['findOneAndUpdate', 'updateOne'], function shareOnUpdate(res) {
+    try {
+        if (!setsCompleted(this.getUpdate())) return;
+        const filter = this.getFilter() || {};
+        const id = res && res._id ? res._id : filter._id;
+        if (id && mongoose.isValidObjectId(id)) shareCarsOf([id]);
+    } catch (_) {
+        /* never in the way of the write */
+    }
+});
+
 module.exports = mongoose.model('Order', OrderSchema);

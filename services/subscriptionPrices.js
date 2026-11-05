@@ -69,9 +69,17 @@ async function homeGarageProductId(stripe) {
     return garageProductId;
 }
 
-async function mintGaragePrice(interval, amountCents) {
+// A car added to a plan (Nov 4 2026, Rishi: "an additional car on the plan is
+// another $150/mo"). Minted the same way, on the same product, so the invoice
+// reads Permanent valet with an "Additional car" line.
+function extraCarLookupKey(interval, amountCents) {
+    return `vn_extra_car_${interval === 'week' ? 'week' : 'month'}_c${amountCents}`;
+}
+
+async function mintGaragePrice(interval, amountCents, kind = 'plan') {
     const stripe = requireStripe();
-    const lookupKey = garageLookupKey(interval, amountCents);
+    const extra = kind === 'extra_car';
+    const lookupKey = extra ? extraCarLookupKey(interval, amountCents) : garageLookupKey(interval, amountCents);
     const existing = await findActivePrice(stripe, lookupKey);
     if (existing) return existing.id;
 
@@ -83,8 +91,12 @@ async function mintGaragePrice(interval, amountCents) {
             currency: 'usd',
             recurring: { interval },
             lookup_key: lookupKey,
-            nickname: `Permanent valet $${(amountCents / 100).toFixed(2)}/${interval}`,
-            metadata: { lookupKey, tier: 'home_garage', pricedByAddress: 'true' },
+            nickname: extra
+                ? `Additional car ${(amountCents / 100).toFixed(2)}/${interval}`
+                : `Permanent valet ${(amountCents / 100).toFixed(2)}/${interval}`,
+            metadata: extra
+                ? { lookupKey, tier: 'extra_car' }
+                : { lookupKey, tier: 'home_garage', pricedByAddress: 'true' },
         });
         console.log(`Minted Stripe price ${lookupKey} -> ${created.id}`);
         return created.id;
@@ -99,15 +111,15 @@ async function mintGaragePrice(interval, amountCents) {
 }
 
 /** The Stripe price for Permanent valet at this amount, minted the first time it is asked for. */
-async function ensureGaragePriceId(interval, amountCents) {
+async function ensureGaragePriceId(interval, amountCents, kind = 'plan') {
     if (interval !== 'week' && interval !== 'month') throw new Error(`Bad interval ${interval}`);
     if (!Number.isInteger(amountCents) || amountCents <= 0) throw new Error(`Bad amount ${amountCents}`);
-    const lookupKey = garageLookupKey(interval, amountCents);
+    const lookupKey = kind === 'extra_car' ? extraCarLookupKey(interval, amountCents) : garageLookupKey(interval, amountCents);
     if (priceIdCache.has(lookupKey)) return priceIdCache.get(lookupKey);
     if (!inFlight.has(lookupKey)) {
         inFlight.set(
             lookupKey,
-            mintGaragePrice(interval, amountCents)
+            mintGaragePrice(interval, amountCents, kind)
                 .then((id) => {
                     priceIdCache.set(lookupKey, id);
                     return id;
@@ -125,9 +137,14 @@ function clearPriceCache() {
     garageProductId = null;
 }
 
+/** The Stripe price for an additional car on a plan at this amount. */
+const ensureExtraCarPriceId = (interval, amountCents) => ensureGaragePriceId(interval, amountCents, 'extra_car');
+
 module.exports = {
     resolvePriceId,
     ensureGaragePriceId,
+    ensureExtraCarPriceId,
+    extraCarLookupKey,
     garageLookupKey,
     clearPriceCache,
     GARAGE_ANCHOR_LOOKUP_KEY,

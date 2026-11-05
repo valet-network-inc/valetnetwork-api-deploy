@@ -25,6 +25,24 @@ const { nyStartOfDay, nyStartOfWeek, nextNyOccurrence } = require('./nyTime');
 // cancelled via webhook and fails the status check first.
 const PERIOD_GRACE_MS = 24 * 60 * 60 * 1000;
 
+// More than one car (Nov 4 2026, Rishi: "an additional car on the plan is
+// another $150/mo"). A plan covers 1 + extraCars cars at a time: that many free
+// parks a day, that many weekly move allowances, that many parks of a linked
+// pair at once (services/accountLinks.js). On the flat plans only: street
+// cleaning is bought per move, so a second car there is more moves.
+const EXTRA_CAR_MONTHLY_CENTS = 15000;
+const MAX_EXTRA_CARS = 2;
+const EXTRA_CAR_TIERS = new Set(['home_garage', 'valet_anywhere']);
+const carsOnPlan = (sub) => 1 + Math.max(0, Math.min(MAX_EXTRA_CARS, Number(sub && sub.extraCars) || 0));
+
+/** What one more car costs on this plan: $150 a month, or the table's weekly share on a weekly plan. */
+async function extraCarAmountCents(sub) {
+    if (sub && sub.extraCarAmountCents) return sub.extraCarAmountCents;
+    if (!sub || sub.interval !== 'week') return EXTRA_CAR_MONTHLY_CENTS;
+    const { getTable, weeklyFromMonthly } = require('./neighborhoodPricing');
+    return weeklyFromMonthly(EXTRA_CAR_MONTHLY_CENTS, await getTable());
+}
+
 function isEntitled(sub, now = new Date()) {
     if (!sub || sub.status !== 'active') return false;
     if (!sub.currentPeriodEnd) return true; // just-activated, period not synced yet
@@ -121,7 +139,7 @@ async function evaluateParkCoverage(sub, { aspMode, lat, lng, listPriceCents }, 
 
     if (aspMode) {
         const used = await aspMovesUsedThisWeek(sub, now);
-        if (used >= (sub.movesPerWeek || ASP_MOVES_PER_WEEK)) {
+        if (used >= (sub.movesPerWeek || ASP_MOVES_PER_WEEK) * carsOnPlan(sub)) {
             return { covered: false, reason: 'weekly_asp_limit_reached' };
         }
         return { covered: true, listPriceCents, reason: 'asp_move_covered' };
@@ -133,7 +151,7 @@ async function evaluateParkCoverage(sub, { aspMode, lat, lng, listPriceCents }, 
     }
 
     const used = await freeParksUsedToday(sub, now);
-    if (used > 0) return { covered: false, reason: 'daily_free_park_used' };
+    if (used >= carsOnPlan(sub)) return { covered: false, reason: 'daily_free_park_used' };
 
     if (sub.tier === 'home_garage') {
         const home = sub.homeAddress;
@@ -328,8 +346,14 @@ async function buildStatusPayload(sub, now = new Date()) {
         homeAddress: sub.homeAddress,
         nextAspMove: entitled ? nextAspMove(sub, now) : null,
         aspMovesUsedThisWeek: aspUsed,
-        aspMovesPerWeek: sub.movesPerWeek || ASP_MOVES_PER_WEEK,
+        aspMovesPerWeek: (sub.movesPerWeek || ASP_MOVES_PER_WEEK) * carsOnPlan(sub),
         movesPerWeek: sub.movesPerWeek || ASP_MOVES_PER_WEEK,
+        // Cars on the plan (Nov 4 2026): how many, what an extra one costs here
+        // (per `interval`), and whether one more can go on.
+        extraCars: sub.extraCars || 0,
+        carsOnPlan: carsOnPlan(sub),
+        extraCarAmountCents: await extraCarAmountCents(sub),
+        canAddCar: EXTRA_CAR_TIERS.has(sub.tier) && (sub.extraCars || 0) < MAX_EXTRA_CARS,
         homeAddressChangedAt: sub.homeAddressChangedAt,
         managed,
         keys,
@@ -379,6 +403,11 @@ async function aspListPriceCents() {
 }
 
 module.exports = {
+    EXTRA_CAR_MONTHLY_CENTS,
+    MAX_EXTRA_CARS,
+    EXTRA_CAR_TIERS,
+    carsOnPlan,
+    extraCarAmountCents,
     PERIOD_GRACE_MS,
     isEntitled,
     getActiveSubscription,

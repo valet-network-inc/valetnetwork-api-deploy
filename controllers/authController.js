@@ -2,7 +2,7 @@ const User = require('../models/User');
 const FCMToken = require('../models/FCMToken');
 const { resolveSignupPlatform } = require('../services/signupPlatform');
 const { ensurePushChannelDoc } = require('../services/pushChannel');
-const { normalizeVehicle } = require('../services/accountVehicle');
+const { normalizeVehicle, carsOf, cleanList, sameCar, MAX_CARS } = require('../services/accountVehicle');
 const { revokeLinksForDeletedAccount } = require('./accountLinkController');
 
 // Function to generate a random 6-character code (numbers and capital letters)
@@ -150,14 +150,14 @@ async function upsertLoginUser({ phone, firebaseUid, signupPlatform }) {
             new: true,
             upsert: true,
             setDefaultsOnInsert: true,
-        }).select('+vehicle');
+        }).select('+vehicle +vehicles');
     } catch (err) {
         if (err && err.code === 11000) {
             return User.findOneAndUpdate(
                 { phone },
                 { $set: update.$set },
                 { new: true }
-            ).select('+vehicle');
+            ).select('+vehicle +vehicles');
         }
         throw err;
     }
@@ -180,7 +180,8 @@ exports.updateUser = async (req, res) => {
         userAgreementAccepted,
         enterpriseBusinessName,
         enterpriseAddress, // { street, suite, city, state, zip }
-        vehicle, // { color, model, licensePlate } from the Your car screen
+        vehicle, // { color, model, licensePlate } from the Your car screen (apps before Nov 4)
+        vehicles, // [{ color, model, licensePlate }] from Profile → Your cars (Nov 4 2026)
         handoffCodes, // Profile → Handoff codes
     } = req.body;
 
@@ -203,15 +204,33 @@ exports.updateUser = async (req, res) => {
             ...(typeof handoffCodes === 'boolean' && { handoffCodes }),
         };
 
-        // The car on the account (services/accountVehicle.js). The app's Your
-        // car screen insists on a plate, and sends all three fields blank to
-        // clear the car.
-        if (vehicle !== undefined) {
+        // The cars on the account (services/accountVehicle.js). Profile → Your
+        // cars sends the whole list (first = the car we expect next). Apps from
+        // before the list send one car: it goes first, replacing the car with
+        // the same plate; all three fields blank takes the first car off.
+        if (Array.isArray(vehicles)) {
+            const list = cleanList(vehicles);
+            if (list.length) {
+                updateData.vehicles = list;
+                updateData.vehicle = list[0];
+            } else {
+                updateData.$unset = { vehicles: 1, vehicle: 1 };
+            }
+        } else if (vehicle !== undefined) {
             const v = normalizeVehicle(vehicle);
+            const current = await User.findOne({ phone }).select('+vehicle +vehicles').lean();
+            const cars = carsOf(current);
+            let list = null;
             if (v && v.licensePlate) {
-                updateData.vehicle = { ...v, source: 'customer', at: new Date() };
+                list = [{ ...v, source: 'customer', at: new Date() }, ...cars.filter((x) => !sameCar(x, v))].slice(0, MAX_CARS);
             } else if (v && !v.color && !v.model) {
-                updateData.$unset = { vehicle: 1 };
+                list = cars.slice(1);
+            }
+            if (list && list.length) {
+                updateData.vehicles = list;
+                updateData.vehicle = list[0];
+            } else if (list) {
+                updateData.$unset = { vehicles: 1, vehicle: 1 };
             }
         }
 
@@ -225,7 +244,7 @@ exports.updateUser = async (req, res) => {
 
         const user = await User.findOneAndUpdate({ phone }, updateData, {
             new: true,
-        }).select('+vehicle');
+        }).select('+vehicle +vehicles');
 
         res.status(200).json({
             success: true,

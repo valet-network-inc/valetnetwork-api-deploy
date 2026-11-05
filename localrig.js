@@ -151,6 +151,36 @@ const { MongoMemoryServer } = require('mongodb-memory-server');
   rigFirestore.Timestamp = { now: () => ({ __ts: Date.now() }), fromDate: (d) => ({ __ts: new Date(d).getTime() }) };
   Object.defineProperty(admin, 'firestore', { value: rigFirestore, configurable: true, writable: true });
 
+  // Stripe on the rig: STRIPE_API_KEY is a placeholder, so real Stripe calls
+  // fail here as they always have. A second car on a plan (Nov 4 2026) is
+  // answered here instead (prices and subscription items only), so a rig plan
+  // (seedmanaged.js) can take an extra car without a Stripe account.
+  const stripeClient = require('./services/stripeClient');
+  const realStripe = stripeClient.get();
+  let rigItemSeq = 0;
+  stripeClient.set(
+    new Proxy(realStripe || {}, {
+      get(target, key) {
+        if (key === 'prices') {
+          return {
+            list: async ({ lookup_keys: keys = [] } = {}) => ({
+              data: keys[0] === 'vn_home_garage_monthly' ? [{ id: 'price_rig_anchor', active: true, product: 'prod_rig_garage' }] : [],
+            }),
+            create: async (p) => ({ id: `price_rig_${p.lookup_key || Date.now()}` }),
+          };
+        }
+        if (key === 'subscriptionItems') {
+          return {
+            create: async (p) => ({ id: `si_rig_${++rigItemSeq}`, ...p }),
+            update: async (id, p) => ({ id, ...p }),
+            del: async (id) => ({ id, deleted: true }),
+          };
+        }
+        return target[key];
+      },
+    })
+  );
+
   require('./server.js');
 
   const stop = async () => {
