@@ -134,6 +134,20 @@ describe('booking', () => {
         const peek = await request(app).delete(`/api/schedule/${ok.body.move._id}`).set('Authorization', 'Bearer uid:eve').send({ userId: String(other._id) });
         expect(peek.status).toBe(404);
     });
+
+    test('a scheduled park keeps the car’s own spot (Nov 5)', async () => {
+        const auth = { Authorization: 'Bearer uid:sam' };
+        await User.updateOne({ _id: user._id }, { $set: { stripeCustomerId: 'cus_sam' } });
+        stripeWithCard();
+        const CAR = { streetAddress: '210 W 20th St, New York, NY 10011', lat: 40.7431, lng: -73.9989 };
+        const res = await request(app).post('/api/schedule').set(auth).send({
+            userId: String(user._id), kind: 'pick-up', repeat: 'once',
+            at: new Date(Date.now() + 3 * 3600e3).toISOString(), address: HOME, carLocation: CAR,
+        });
+        expect(res.status).toBe(201);
+        expect(res.body.move.carLocation).toMatchObject(CAR);
+        expect((await ScheduledMove.findById(res.body.move._id)).carLocation).toMatchObject(CAR);
+    });
 });
 
 describe('the job, without a plan', () => {
@@ -165,6 +179,16 @@ describe('the job, without a plan', () => {
         expect(await Payment.countDocuments({ order: orderId, status: 'succeeded' })).toBe(1);
         // A repeating move goes on to the next weekday.
         expect((await ScheduledMove.findById(move._id)).nextAt.toISOString()).toBe('2026-10-14T23:00:00.000Z');
+    });
+
+    test('the car’s own spot rides along to the park order (Nov 5)', async () => {
+        stripeWithCard();
+        const { move, calls, http } = await bookOne();
+        const CAR = { streetAddress: '210 W 20th St, New York, NY 10011', lat: 40.7431, lng: -73.9989 };
+        await ScheduledMove.updateOne({ _id: move._id }, { $set: { carLocation: CAR } });
+        await moves.tick({ now: at('2026-10-13T22:15:00Z'), http });
+        expect(calls[0].body.carLocation).toMatchObject(CAR);
+        expect(calls[0].body.customerLocation).toMatchObject({ lat: HOME.lat, lng: HOME.lng });
     });
 
     test('a declined card cancels that run, and the schedule carries on', async () => {

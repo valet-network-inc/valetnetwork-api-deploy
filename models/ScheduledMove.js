@@ -15,6 +15,12 @@ const ScheduledMoveSchema = new mongoose.Schema(
             lat: { type: Number, required: true },
             lng: { type: Number, required: true },
         },
+        // Where the car stands when it isn't at the keys (Park my car's car map, Nov 5).
+        carLocation: {
+            streetAddress: { type: String },
+            lat: { type: Number },
+            lng: { type: Number },
+        },
         active: { type: Boolean, default: true },
         nextAt: { type: Date, index: true },
         skipped: [{ type: String }], // occurrence keys cancelled one at a time

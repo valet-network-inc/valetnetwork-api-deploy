@@ -197,6 +197,7 @@ function view(move, sub, pickUpPriceCents = null) {
         days: move.days || [],
         time: move.time,
         address: move.address,
+        ...(move.carLocation?.lat != null ? { carLocation: move.carLocation } : {}),
         included,
         priceCents,
         detail,
@@ -224,6 +225,14 @@ function validate(input, { partial = false } = {}) {
         if (typeof a.lat !== 'number' || typeof a.lng !== 'number' || !a.streetAddress) return { error: 'Pick an address.' };
         out.address = { streetAddress: String(a.streetAddress), lat: a.lat, lng: a.lng };
     }
+    // Optional: the car's spot when it isn't at the keys; null clears it.
+    if (input.carLocation !== undefined) {
+        const c = input.carLocation;
+        out.carLocation =
+            c && typeof c.lat === 'number' && typeof c.lng === 'number'
+                ? { streetAddress: String(c.streetAddress || ''), lat: c.lat, lng: c.lng }
+                : null;
+    }
     if (!partial || input.at !== undefined) {
         const at = new Date(input.at);
         if (!Number.isFinite(at.getTime())) return { error: 'Pick a day and time.' };
@@ -245,7 +254,15 @@ async function create(userId, input, now = new Date()) {
     if (value.at.getTime() - now.getTime() < MIN_NOTICE_MS) {
         return { status: 400, error: 'Pick a time at least 45 minutes from now.' };
     }
-    const move = new ScheduledMove({ user: userId, kind: value.kind, repeat: value.repeat, days: value.days, time: timeOf(value.at), address: value.address });
+    const move = new ScheduledMove({
+        user: userId,
+        kind: value.kind,
+        repeat: value.repeat,
+        days: value.days,
+        time: timeOf(value.at),
+        address: value.address,
+        ...(value.carLocation ? { carLocation: value.carLocation } : {}),
+    });
     // The first run is the time they picked; repeats follow its wall-clock time.
     move.nextAt = value.repeat === 'once' || runsOn(move, nyClock(value.at).weekday) ? value.at : occurrenceAfter(move, value.at);
     await move.save();
@@ -272,11 +289,13 @@ async function update(userId, id, input, now = new Date()) {
             repeat: 'once',
             at: value.at || move.nextAt,
             address: value.address || move.address,
+            carLocation: value.carLocation !== undefined ? value.carLocation : move.carLocation?.lat != null ? move.carLocation : undefined,
         }, now);
         return one;
     }
     if (value.kind) move.kind = value.kind;
     if (value.address) move.address = value.address;
+    if (value.carLocation !== undefined) move.carLocation = value.carLocation || undefined;
     if (value.repeat) {
         move.repeat = value.repeat;
         move.days = value.days;
@@ -411,6 +430,8 @@ async function runOne(move, http) {
             res = await http.post(`${base()}/api/order/createOrder`, {
                 customer: userId,
                 customerLocation: move.address,
+                // The car's own spot, when it isn't at the keys.
+                ...(move.carLocation?.lat != null ? { carLocation: move.carLocation } : {}),
                 parkingType: 'street',
                 pickUpTime: move.nextAt,
                 // Required on the Order. A plan's park has no end time; the app
