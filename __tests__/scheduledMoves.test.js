@@ -119,7 +119,7 @@ describe('booking', () => {
         expect(paid.status).toBe(201);
         expect(paid.body.move.detail).toBe('Valet meets you at 200 W 20th St · $13');
         const back = await request(app).post('/api/schedule').set(auth).send(body);
-        expect(back.body.move.detail).toBe('Brought back to 200 W 20th St · Included with your park');
+        expect(back.body.move.detail).toBe('Brought back to 200 W 20th St');
         await ScheduledMove.deleteMany({});
 
         await givePlan();
@@ -127,7 +127,7 @@ describe('booking', () => {
         expect(soon.status).toBe(400);
         const ok = await request(app).post('/api/schedule').set(auth).send(body);
         expect(ok.status).toBe(201);
-        expect(ok.body.move.detail).toBe('Brought back to 200 W 20th St · Included');
+        expect(ok.body.move.detail).toBe('Brought back to 200 W 20th St');
         const list = await request(app).get(`/api/schedule/mine/${user._id}`).set(auth);
         expect(list.body.moves).toHaveLength(1);
         const other = await User.create({ verified: true, phone: '+12125550100', firebaseUid: 'eve' });

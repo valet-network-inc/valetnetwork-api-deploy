@@ -182,13 +182,13 @@ function view(move, sub, pickUpPriceCents = null) {
     // Without a plan a pick-up is charged when it's booked; the drop-off
     // brings back a car whose return is already paid for.
     const priceCents = included || move.kind === 'drop-off' ? 0 : pickUpPriceCents;
-    const detail = included
-        ? `${verb} · Included`
-        : move.kind === 'drop-off'
-        ? `${verb} · Included with your park`
-        : typeof priceCents === 'number'
-        ? `${verb} · ${dollars(priceCents)}`
-        : verb;
+    // No "Included" (Rishi, Nov 4 2026: "remove 'Included' in the coming up
+    // section"): a covered or already-paid run says only where; a run that
+    // will be charged still says its price.
+    const detail =
+        !included && move.kind !== 'drop-off' && typeof priceCents === 'number'
+            ? `${verb} · ${dollars(priceCents)}`
+            : verb;
     return {
         _id: String(move._id),
         kind: move.kind,
