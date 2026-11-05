@@ -521,7 +521,9 @@ async function adoptFromTrip(order) {
             const sameBlock = nearby.find((o) => haversineMeters(o.parkingLocation, address) <= 60);
             days = sameBlock ? daysOf(sameBlock.parkingLocation.streetCleaning) : [];
             if (!days.length && move.pickUpTime) {
-                const { weekday, hour, minute } = nycParts(new Date(move.pickUpTime));
+                const { weekday, hour: h, minute: m } = nycParts(new Date(move.pickUpTime));
+                // On the half hour, like every sign and the guess from past moves.
+                const { hour, minute } = roundToHalfHour(h, m);
                 days = [{ weekday, hour, minute }];
             }
         } else if (order.orderType === 'parking' && order.parkingType === 'street') {
