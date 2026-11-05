@@ -655,6 +655,8 @@ const shareCarsOf = (ids) => {
     const list = ids.filter(Boolean).map(String);
     if (!list.length) return;
     setImmediate(() => {
+        // A script that saved and disconnected (seedrig.js): nothing to share into.
+        if (mongoose.connection.readyState !== 1) return;
         const { shareConfirmedCar } = require('../services/accountVehicle');
         for (const id of list) shareConfirmedCar(id).catch(() => {});
     });
