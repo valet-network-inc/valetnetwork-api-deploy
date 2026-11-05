@@ -109,10 +109,14 @@ async function suggestFromOrders(userId) {
 
     // Street-cleaning bookings only, and never the auto-created return leg —
     // that fires at the END of the sweep and would teach us the wrong time.
+    // Only moves that went ahead: a cancelled or never-paid booking is not
+    // "your last street-cleaning move" (Nov 5 2026).
     const aspOrders = await Order.find({
         customer: userId,
         aspMode: true,
         orderType: { $ne: 'retrieval' },
+        status: { $ne: 'cancelled' },
+        $or: [{ paymentStatus: 'paid' }, { isFreeService: true }, { coveredBySubscription: { $ne: null } }],
     })
         .select('customerLocation pickUpTime createdAt awayMode')
         .sort({ pickUpTime: -1 })

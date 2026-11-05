@@ -31,6 +31,30 @@ router.post('/createPaymentIntent', createPaymentIntent);
 // assert intent.metadata.orderId === orderId and intent.amount_received >=
 // order.totalAmount — the way extensionController.confirmExtension does.
 router.get('/getPaymentStatus', getPaymentStatus);
+
+// The app's "Pay with" row (Nov 5 2026): the user's saved cards, their
+// default and any credit, and a way to change the default. Their own only.
+const requireSelf = require('../middleware/requireSelf');
+const paymentMethods = require('../services/paymentMethods');
+const self = requireSelf((req) => req.params?.userId || req.body?.userId || req.query?.userId);
+router.get('/methods/:userId', self, async (req, res) => {
+    try {
+        res.json({ success: true, ...(await paymentMethods.list(req.callerUserId)) });
+    } catch (err) {
+        console.error('payment methods: list failed:', err.message);
+        res.status(500).json({ success: false, message: 'Could not load your payment methods.' });
+    }
+});
+router.post('/methods/default', self, async (req, res) => {
+    try {
+        const out = await paymentMethods.setDefault(req.callerUserId, String(req.body?.paymentMethodId || ''));
+        if (out.error) return res.status(out.status).json({ success: false, message: out.error });
+        res.json({ success: true, ...out });
+    } catch (err) {
+        console.error('payment methods: default failed:', err.message);
+        res.status(500).json({ success: false, message: 'Could not change your card.' });
+    }
+});
 router.post('/createGuestPaymentLink', createGuestPaymentLink);
 router.post('/webhook', handleStripeWebhook);
 router.post('/webhook/test', handleStripeWebhook); // Test endpoint without raw body requirement

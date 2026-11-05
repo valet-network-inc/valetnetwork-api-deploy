@@ -1792,6 +1792,9 @@ exports.getPrefill = async (req, res) => {
             aspMode: true,
             orderType: 'parking',
             autoBookKey: { $exists: false }, // manual bookings only
+            // A move that went ahead, not one cancelled or never paid (Nov 5 2026).
+            status: { $ne: 'cancelled' },
+            $or: [{ paymentStatus: 'paid' }, { isFreeService: true }, { coveredBySubscription: { $ne: null } }],
         }).sort({ createdAt: -1 });
 
         if (!lastAsp) {

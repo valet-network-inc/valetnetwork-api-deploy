@@ -158,17 +158,332 @@ const { MongoMemoryServer } = require('mongodb-memory-server');
   const stripeClient = require('./services/stripeClient');
   const realStripe = stripeClient.get();
   let rigItemSeq = 0;
+  // Payments on the rig (Nov 5 2026), so the app's Pay with row and its
+  // Apple Pay / saved-card / new-card paths can be walked without a Stripe
+  // account: customers, cards and intents live in memory, and :8095/pay
+  // marks an intent paid by sending the real webhook a 'rig'-signed event.
+  // Plans, refunds, promo coupons and gift balances too (Nov 5 2026), so a
+  // plan can be bought, a code applied, a parking cancelled with its refund,
+  // and a tip or added time charged to the saved card, all on the rig.
+  const rigStripe = {
+    seq: 0,
+    customers: new Map(),
+    pms: new Map(),
+    intents: new Map(),
+    subs: new Map(),
+    invoices: new Map(),
+    coupons: new Map(),
+    prices: new Map(),
+  };
+  // Shaped like Stripe's (prefix, one underscore, no more): the app's Stripe SDK
+  // traps in a debug build on a client secret that isn't `pi_x_secret_y`.
+  const rigId = (p) => `${p}_rig${(++rigStripe.seq).toString(36)}`;
+  const rigNow = () => Math.floor(Date.now() / 1000);
+  const rigMissing = (kind, id) => {
+    const e = new Error(`No such ${kind}: '${id}'`);
+    e.type = 'StripeInvalidRequestError';
+    e.statusCode = 404;
+    e.code = 'resource_missing';
+    return e;
+  };
+  // Stripe's webhook, as Stripe would send it: signed 'rig', to the API's own endpoint.
+  const rigHook = (type, object) =>
+    new Promise((resolve) => {
+      const body = JSON.stringify({ id: rigId('evt'), type, data: { object } });
+      const r = require('http').request(
+        { host: '127.0.0.1', port: Number(process.env.PORT || 8099), path: '/api/payment/webhook', method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body), 'stripe-signature': 'rig' } },
+        (hr) => {
+          let t = '';
+          hr.on('data', (c) => (t += c));
+          hr.on('end', () => resolve({ type, status: hr.statusCode, body: t.slice(0, 200) }));
+        }
+      );
+      r.on('error', (e) => resolve({ type, status: 0, body: e.message }));
+      r.end(body);
+    });
+  const rigIntent = (kind, params) => {
+    const id = rigId(kind === 'setup' ? 'seti' : 'pi');
+    const it = { id, object: kind === 'setup' ? 'setup_intent' : 'payment_intent', client_secret: `${id}_secret_rig`, status: 'requires_payment_method', created: rigNow(), ...params, amount_received: 0 };
+    rigStripe.intents.set(id, it);
+    // A charge made without the user there (a tip, a partner's added time, a
+    // booked run): a saved card goes through at once, as Stripe's does, and
+    // the webhook follows.
+    if (kind === 'payment' && params && params.confirm && params.payment_method) {
+      it.status = 'succeeded';
+      it.amount_received = it.amount;
+      setTimeout(() => rigHook('payment_intent.succeeded', it), 50);
+    }
+    return it;
+  };
+  // The plan catalog (scripts/ensureSubscriptionCatalog.js mints these on
+  // Stripe), read from the script so the rig's prices stay the same.
+  {
+    const src = require('fs').readFileSync(require('path').join(__dirname, 'scripts/ensureSubscriptionCatalog.js'), 'utf8');
+    const re = /lookupKey:\s*'([^']+)',\s*amount:\s*(\d+),\s*interval:\s*'(\w+)'/g;
+    let m;
+    while ((m = re.exec(src))) {
+      const price = { id: `price_rig${m[1].replace(/_/g, '')}`, object: 'price', active: true, product: 'prod_rig_catalog', lookup_key: m[1], unit_amount: Number(m[2]), currency: 'usd', recurring: { interval: m[3] } };
+      rigStripe.prices.set(price.id, price);
+    }
+  }
+  const rigPeriodEnd = (from, interval, count = 1) => {
+    const d = new Date(from * 1000);
+    if (interval === 'week') d.setDate(d.getDate() + 7 * count);
+    else if (interval === 'day') d.setDate(d.getDate() + count);
+    else if (interval === 'year') d.setFullYear(d.getFullYear() + count);
+    else d.setMonth(d.getMonth() + count);
+    return Math.floor(d.getTime() / 1000);
+  };
+  const RIG_STRIPE = {
+    customers: {
+      create: async (p = {}) => {
+        const c = { id: rigId('cus'), object: 'customer', balance: 0, invoice_settings: { default_payment_method: null }, metadata: p.metadata || {}, name: p.name };
+        rigStripe.customers.set(c.id, c);
+        return c;
+      },
+      retrieve: async (id) => rigStripe.customers.get(id) || { id, object: 'customer', balance: 0, invoice_settings: { default_payment_method: null } },
+      update: async (id, p = {}) => {
+        const c = rigStripe.customers.get(id) || { id, balance: 0, invoice_settings: {} };
+        if (p.invoice_settings) c.invoice_settings = { ...c.invoice_settings, ...p.invoice_settings };
+        rigStripe.customers.set(id, c);
+        return c;
+      },
+      // Gift cards: a credit is a negative balance, as on Stripe.
+      createBalanceTransaction: async (id, p = {}) => {
+        const c = rigStripe.customers.get(id) || { id, object: 'customer', balance: 0, invoice_settings: { default_payment_method: null } };
+        c.balance = (Number(c.balance) || 0) + (Number(p.amount) || 0);
+        rigStripe.customers.set(id, c);
+        return { id: rigId('cbtxn'), object: 'customer_balance_transaction', amount: p.amount, currency: 'usd', customer: id, ending_balance: c.balance, description: p.description };
+      },
+    },
+    ephemeralKeys: { create: async () => ({ secret: 'ek_rig' }) },
+    paymentMethods: {
+      list: async ({ customer } = {}) => ({ data: [...rigStripe.pms.values()].filter((pm) => pm.customer === customer).reverse() }),
+      retrieve: async (id) => rigStripe.pms.get(id) || null,
+      attach: async (id, { customer }) => {
+        const pm = rigStripe.pms.get(id);
+        if (pm) pm.customer = customer;
+        return pm;
+      },
+    },
+    paymentIntents: {
+      create: async (p = {}) => rigIntent('payment', p),
+      retrieve: async (id) => rigStripe.intents.get(id) || null,
+      update: async (id, p = {}) => Object.assign(rigStripe.intents.get(id) || { id }, p),
+      cancel: async (id) => Object.assign(rigStripe.intents.get(id) || { id }, { status: 'canceled' }),
+    },
+    setupIntents: {
+      create: async (p = {}) => rigIntent('setup', p),
+      retrieve: async (id) => rigStripe.intents.get(id) || null,
+    },
+    refunds: {
+      create: async (p = {}) => {
+        const pi = p.payment_intent ? rigStripe.intents.get(p.payment_intent) : null;
+        const amount = p.amount != null ? p.amount : pi ? pi.amount_received || pi.amount || 0 : 0;
+        if (pi) pi.amount_refunded = (pi.amount_refunded || 0) + amount;
+        return { id: rigId('re'), object: 'refund', status: 'succeeded', amount, currency: 'usd', payment_intent: p.payment_intent || null, charge: p.charge || null, metadata: p.metadata || {} };
+      },
+    },
+    // Plan prices: the old garage anchor, plus every price minted on the rig.
+    prices: {
+      list: async ({ lookup_keys: keys = [] } = {}) => ({
+        data: [...rigStripe.prices.values()].filter((x) => keys.includes(x.lookup_key)),
+      }),
+      create: async (p = {}) => {
+        const price = { id: `price_rig_${p.lookup_key || rigStripe.seq++}`, object: 'price', active: true, ...p };
+        rigStripe.prices.set(price.id, price);
+        return price;
+      },
+      retrieve: async (id) => {
+        const price = rigStripe.prices.get(id);
+        if (!price) throw rigMissing('price', id);
+        return price;
+      },
+    },
+    coupons: {
+      create: async (p = {}) => {
+        const c = { object: 'coupon', valid: true, ...p, id: p.id || rigId('co') };
+        rigStripe.coupons.set(c.id, c);
+        return c;
+      },
+      retrieve: async (id) => {
+        const c = rigStripe.coupons.get(id);
+        if (!c) throw rigMissing('coupon', id);
+        return c;
+      },
+    },
+    // A plan: created incomplete with its first invoice open (or trialing, or
+    // paid at once when a code takes it to $0), made active by :8095/pay.
+    subscriptions: {
+      create: async (p = {}) => {
+        const now = rigNow();
+        const items = (p.items || []).map((it) => {
+          const price = rigStripe.prices.get(it.price) || { id: it.price, unit_amount: 0, recurring: { interval: 'month' } };
+          return { id: rigId('si'), object: 'subscription_item', price, quantity: it.quantity || 1 };
+        });
+        let amount = items.reduce((sum, it) => sum + (Number(it.price.unit_amount) || 0) * it.quantity, 0);
+        for (const d of p.discounts || []) {
+          const c = d && d.coupon ? rigStripe.coupons.get(d.coupon) : null;
+          if (c && c.percent_off) amount = Math.round(amount * (1 - c.percent_off / 100));
+          else if (c && c.amount_off) amount = Math.max(0, amount - c.amount_off);
+        }
+        const recurring = (items[0] && items[0].price.recurring) || { interval: 'month' };
+        const trialEnd = p.trial_period_days ? now + p.trial_period_days * 86400 : null;
+        const id = rigId('sub');
+        const sub = {
+          id,
+          object: 'subscription',
+          customer: p.customer,
+          status: trialEnd ? 'trialing' : amount > 0 ? 'incomplete' : 'active',
+          items: { object: 'list', data: items },
+          metadata: p.metadata || {},
+          created: now,
+          current_period_start: now,
+          current_period_end: trialEnd || rigPeriodEnd(now, recurring.interval, recurring.interval_count || 1),
+          trial_end: trialEnd,
+          cancel_at_period_end: false,
+          default_payment_method: null,
+          pending_setup_intent: null,
+          discounts: p.discounts || [],
+        };
+        const inv = {
+          id: rigId('in'),
+          object: 'invoice',
+          subscription: id,
+          customer: p.customer,
+          created: now,
+          amount_due: trialEnd ? 0 : amount,
+          amount_paid: 0,
+          status: trialEnd || amount === 0 ? 'paid' : 'open',
+          payment_intent: null,
+          charge: null,
+          lines: { data: [{ subscription: id, amount }] },
+        };
+        if (!trialEnd && amount > 0) {
+          inv.payment_intent = rigIntent('payment', { amount, currency: 'usd', customer: p.customer, invoice: inv.id, metadata: {}, setup_future_usage: 'off_session' });
+        }
+        rigStripe.invoices.set(inv.id, inv);
+        sub.latest_invoice = inv;
+        rigStripe.subs.set(id, sub);
+        return sub;
+      },
+      retrieve: async (id) => {
+        const sub = rigStripe.subs.get(id);
+        if (!sub) throw rigMissing('subscription', id);
+        return sub;
+      },
+      update: async (id, p = {}) => {
+        const sub = rigStripe.subs.get(id);
+        if (!sub) throw rigMissing('subscription', id);
+        const { items, proration_behavior, expand, ...rest } = p;
+        Object.assign(sub, rest);
+        for (const it of items || []) {
+          const at = it.id ? sub.items.data.findIndex((x) => x.id === it.id) : -1;
+          if (it.deleted) {
+            if (at >= 0) sub.items.data.splice(at, 1);
+            continue;
+          }
+          const price = it.price ? rigStripe.prices.get(it.price) || { id: it.price, unit_amount: 0, recurring: { interval: 'month' } } : null;
+          if (at >= 0) {
+            if (price) sub.items.data[at].price = price;
+            if (it.quantity) sub.items.data[at].quantity = it.quantity;
+          } else if (price) {
+            sub.items.data.push({ id: rigId('si'), object: 'subscription_item', price, quantity: it.quantity || 1 });
+          }
+        }
+        return sub;
+      },
+      cancel: async (id) => {
+        const sub = rigStripe.subs.get(id);
+        if (!sub) throw rigMissing('subscription', id);
+        sub.status = 'canceled';
+        sub.canceled_at = rigNow();
+        sub.ended_at = sub.canceled_at;
+        return sub;
+      },
+    },
+    invoices: {
+      retrieve: async (id) => {
+        const inv = rigStripe.invoices.get(id);
+        if (!inv) throw rigMissing('invoice', id);
+        return inv;
+      },
+      list: async ({ subscription, customer, status, limit = 10 } = {}) => ({
+        object: 'list',
+        has_more: false,
+        data: [...rigStripe.invoices.values()]
+          .filter((inv) => (!subscription || inv.subscription === subscription) && (!customer || inv.customer === customer) && (!status || inv.status === status))
+          .sort((a, b) => b.created - a.created)
+          .slice(0, limit),
+      }),
+    },
+    webhooks: {
+      // The rig's own events only; anything else is refused as before.
+      constructEvent: (body, sig) => {
+        if (sig !== 'rig') throw new Error('rig: only rig-signed events');
+        return JSON.parse(Buffer.isBuffer(body) ? body.toString('utf8') : typeof body === 'string' ? body : JSON.stringify(body));
+      },
+    },
+  };
+  // Controllers build their own client from the 'stripe' package at load
+  // (paymentController, orderController, extensionController), so the rig
+  // swaps the package itself, before server.js loads them.
+  {
+    const RealStripe = require('stripe');
+    const rigFactory = function rigStripeFactory(...args) {
+      const real = RealStripe(...args);
+      return new Proxy(real, { get: (t, k) => RIG_STRIPE[k] || t[k] });
+    };
+    Object.assign(rigFactory, RealStripe);
+    require.cache[require.resolve('stripe')].exports = rigFactory;
+  }
+  require('http')
+    .createServer((req, res) => {
+      let raw = '';
+      req.on('data', (c) => (raw += c));
+      req.on('end', async () => {
+        try {
+          if (req.method === 'GET' && req.url.startsWith('/intent?')) {
+            const secret = new URL(req.url, 'http://rig').searchParams.get('clientSecret');
+            const found = [...rigStripe.intents.values()].find((x) => x.client_secret === secret);
+            return res
+              .writeHead(found ? 200 : 404, { 'Content-Type': 'application/json' })
+              .end(JSON.stringify(found ? { id: found.id, status: found.status, amount: found.amount } : { error: 'No such intent on the rig' }));
+          }
+          if (req.method !== 'POST' || req.url !== '/pay') return res.writeHead(404).end();
+          const { clientSecret, paymentMethod } = JSON.parse(raw || '{}');
+          const it = [...rigStripe.intents.values()].find((x) => x.client_secret === clientSecret);
+          if (!it) return res.writeHead(404, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: 'No such intent on the rig' }));
+          // The card it was paid with: kept on the customer, as Stripe does with setup_future_usage.
+          const pm = { id: paymentMethod?.id && String(paymentMethod.id).startsWith('pm_') ? paymentMethod.id : rigId('pm'), object: 'payment_method', created: Math.floor(Date.now() / 1000), customer: it.customer || null, card: { brand: paymentMethod?.brand || 'visa', last4: paymentMethod?.last4 || '4242', exp_month: 12, exp_year: 2030, fingerprint: `fp_${paymentMethod?.brand || 'visa'}_${paymentMethod?.last4 || '4242'}_${paymentMethod?.wallet || ''}`, wallet: paymentMethod?.wallet ? { type: paymentMethod.wallet } : null } };
+          if (it.customer && (it.setup_future_usage || it.object === 'setup_intent')) rigStripe.pms.set(pm.id, pm);
+          it.status = 'succeeded';
+          it.payment_method = pm.id;
+          if (it.object === 'payment_intent') it.amount_received = it.amount;
+          const hooks = [await rigHook(it.object === 'setup_intent' ? 'setup_intent.succeeded' : 'payment_intent.succeeded', it)];
+          // A plan's first invoice: paid, the card becomes the plan's, and the plan runs.
+          const inv = it.invoice ? rigStripe.invoices.get(it.invoice) : null;
+          if (inv) {
+            inv.status = 'paid';
+            inv.amount_paid = it.amount;
+            const sub = rigStripe.subs.get(inv.subscription);
+            if (sub) {
+              if (sub.status === 'incomplete') sub.status = 'active';
+              sub.default_payment_method = pm.id;
+            }
+            hooks.push(await rigHook('invoice.paid', { ...inv, payment_intent: it.id }));
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ ok: true, intent: it.id, paymentMethod: pm.id, webhooks: hooks }));
+        } catch (e) {
+          res.writeHead(500, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: e.message }));
+        }
+      });
+    })
+    .listen(8095, '127.0.0.1');
   stripeClient.set(
     new Proxy(realStripe || {}, {
       get(target, key) {
-        if (key === 'prices') {
-          return {
-            list: async ({ lookup_keys: keys = [] } = {}) => ({
-              data: keys[0] === 'vn_home_garage_monthly' ? [{ id: 'price_rig_anchor', active: true, product: 'prod_rig_garage' }] : [],
-            }),
-            create: async (p) => ({ id: `price_rig_${p.lookup_key || Date.now()}` }),
-          };
-        }
+        if (RIG_STRIPE[key]) return RIG_STRIPE[key];
         if (key === 'subscriptionItems') {
           return {
             create: async (p) => ({ id: `si_rig_${++rigItemSeq}`, ...p }),
