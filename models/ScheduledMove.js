@@ -31,6 +31,9 @@ const ScheduledMoveSchema = new mongoose.Schema(
         // the booking paid with. `awaitingPayment`: booked, payment not back yet;
         // the move stays inactive (out of the job and Home) until it is.
         priced: { type: Boolean },
+        // A code (an event's) applied at booking: the first run is free, as a
+        // booking made now would be, and nothing is paid at booking.
+        eventCode: { type: String },
         prepaid: {
             paymentIntentId: { type: String },
             cents: { type: Number },

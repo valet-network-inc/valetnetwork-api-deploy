@@ -39,6 +39,7 @@ const axios = require('axios');
 const ScheduledMove = require('../models/ScheduledMove');
 const Order = require('../models/Order');
 const User = require('../models/User');
+const Event = require('../models/Event');
 const { nyClock, nyWallTimeToInstant } = require('./nyTime');
 const stripeClient = require('./stripeClient');
 const giftBalance = require('./giftBalance');
@@ -232,7 +233,8 @@ function view(move, sub, pickUpPriceCents = null, dropOffPriceCents = null) {
     // Parking and retrieval, the words users read (Nov 4 2026); the kinds stay.
     const verb = move.kind === 'drop-off' ? `Brought back to ${street}` : `Valet meets you at ${street}`;
     // Paid at booking: nothing more to pay for this run.
-    const paid = !!(move.prepaid && move.prepaid.paymentIntentId);
+    // A code pays for the next run the same way.
+    const paid = !!(move.prepaid && move.prepaid.paymentIntentId) || !!move.eventCode;
     // Otherwise a pick-up is charged when it's booked, and so is a priced
     // drop-off of a car parked on its own; an older booking's drop-off is free.
     const priceCents =
@@ -254,7 +256,7 @@ function view(move, sub, pickUpPriceCents = null, dropOffPriceCents = null) {
         priceCents,
         detail,
         // What the booking paid: cancelling gives it back.
-        ...(paid ? { paidCents: move.prepaid.cents || 0 } : {}),
+        ...(move.prepaid && move.prepaid.paymentIntentId ? { paidCents: move.prepaid.cents || 0 } : {}),
     };
 }
 
@@ -296,13 +298,45 @@ function validate(input, { partial = false } = {}) {
 }
 
 /** Book one. Returns { move } or { status, error }. */
+/**
+ * A code at booking (Rishi, Nov 6: "have a code? isn't coming up"), held to
+ * what createOrder holds it to: valid, the caller's if it names people, not a
+ * street-cleaning-only code, once per customer when it says so. { code } or
+ * { error }.
+ */
+async function checkCode(userId, raw) {
+    const ev = await Event.findOne({ code: String(raw || '').trim().toUpperCase(), isActive: true });
+    if (!ev || !ev.isValid()) return { error: 'Invalid or expired code' };
+    const allowed = ev.allowedPhones || [];
+    if (allowed.length) {
+        const user = await User.findById(userId).select('phone').lean();
+        const last10 = (v) => String(v || '').replace(/\D/g, '').slice(-10);
+        const mine = last10(user && user.phone);
+        if (!(mine.length === 10 && allowed.some((p) => last10(p) === mine))) return { error: 'This code is not valid for your account.' };
+    }
+    if (ev.scope === 'asp') return { error: 'That code covers a street-cleaning move. Book a street-cleaning move to use it.' };
+    if (ev.oncePerCustomer) {
+        const used =
+            (await Order.exists({ customer: userId, eventCode: ev.code, orderType: { $ne: 'retrieval' }, status: { $ne: 'cancelled' } })) ||
+            (await ScheduledMove.exists({ user: userId, active: true, eventCode: ev.code }));
+        if (used) return { error: "You've already used this code." };
+    }
+    return { code: ev.code };
+}
+
 async function create(userId, input, now = new Date()) {
     const sub = await managedSubscription(userId);
+    let code = null;
+    if (!sub && input.eventCode) {
+        const checked = await checkCode(userId, input.eventCode);
+        if (checked.error) return { status: 400, code: 'BAD_CODE', error: checked.error };
+        code = checked.code;
+    }
     // payNow: paid here, at booking, like a booking for now (Nov 5 2026). An
     // older client's runs are charged when they're booked, so it needs a card
-    // on file first.
-    const payNow = !sub && input.payNow === true;
-    if (!sub && !payNow && !(await savedCard(userId))) {
+    // on file first. A code pays for the first run.
+    const payNow = !sub && input.payNow === true && !code;
+    if (!sub && !payNow && !code && !(await savedCard(userId))) {
         return { status: 402, code: 'CARD_REQUIRED', error: 'Add a card first. Each parking is charged to it when it’s booked.' };
     }
     const { value, error } = validate(input);
@@ -318,7 +352,8 @@ async function create(userId, input, now = new Date()) {
         time: timeOf(value.at),
         address: value.address,
         ...(value.carLocation ? { carLocation: value.carLocation } : {}),
-        ...(payNow ? { priced: true } : {}),
+        ...(payNow || code ? { priced: true } : {}),
+        ...(code ? { eventCode: code } : {}),
     });
     // The first run is the time they picked; repeats follow its wall-clock time.
     move.nextAt = value.repeat === 'once' || runsOn(move, nyClock(value.at).weekday) ? value.at : occurrenceAfter(move, value.at);
@@ -750,6 +785,7 @@ async function runOne(move, http) {
                 carWatch: false,
                 carWatchAmount: 0,
                 aspMode: false,
+                ...(move.eventCode ? { eventCode: move.eventCode } : {}),
             });
         } catch (err) {
             const body = (err.response && err.response.data) || {};
@@ -764,6 +800,12 @@ async function runOne(move, http) {
         if (sub || !order || !order._id) {
             if (order && order._id) await Order.updateOne({ _id: order._id, status: 'pending' }, { $set: { status: 'cancelled' } });
             return { outcome: 'not_covered', orderId: order && order._id };
+        }
+        // The booking's code paid for this run (createOrder made it free): it
+        // covers this one run, so later repeats pay as usual.
+        if (move.eventCode && (order.isFreeService || order.paymentStatus === 'paid')) {
+            await ScheduledMove.updateOne({ _id: move._id }, { $unset: { eventCode: 1 } });
+            return { outcome: 'booked', orderId: order._id };
         }
         // Paid at booking: that payment is this run's. Otherwise charge now.
         return move.prepaid && move.prepaid.paymentIntentId ? usePrepaid(move, order) : payForOrder(move, order);
@@ -788,7 +830,9 @@ async function runOne(move, http) {
     // already paid for. Only a booking that showed the price pays (priced): an
     // older one was told it was included.
     let paid = null;
-    if (order && order._id && !res.data.alreadyRequested && !sub && move.priced && park.serviceType !== 'park-and-hold') {
+    // A code paid for this run: it comes back free, once.
+    if (move.eventCode && order && order._id) await ScheduledMove.updateOne({ _id: move._id }, { $unset: { eventCode: 1 } });
+    if (order && order._id && !res.data.alreadyRequested && !sub && move.priced && !move.eventCode && park.serviceType !== 'park-and-hold') {
         const cents = (move.prepaid && move.prepaid.paymentIntentId && move.prepaid.cents) || (await retrievalCents());
         await Order.updateOne({ _id: order._id }, { $set: { totalAmount: cents, isFreeService: false, paymentStatus: 'pending' } });
         const owed = { ...order, _id: order._id, totalAmount: cents, giftSpends: [] };
