@@ -496,6 +496,8 @@ async function adoptFromTrip(order) {
 
         let address = null;
         let days = [];
+        // A car whose curb has no logged sign: read it from the city's signs.
+        let lookupAt = null;
         const point = (loc) =>
             loc && typeof loc.lat === 'number' && typeof loc.lng === 'number' && loc.streetAddress
                 ? { streetAddress: loc.streetAddress, lat: loc.lat, lng: loc.lng }
@@ -549,8 +551,8 @@ async function adoptFromTrip(order) {
                 days = same ? daysOf(same.parkingLocation.streetCleaning) : [];
             }
             // The move's own time is the sweep where it started: only for a car back there.
-            if (!days.length && !backHome) return false;
-            if (!days.length && move.pickUpTime) {
+            if (!days.length && !backHome) lookupAt = carNow;
+            if (!days.length && backHome && move.pickUpTime) {
                 const { weekday, hour: h, minute: m } = nycParts(new Date(move.pickUpTime));
                 // On the half hour, like every sign and the guess from past moves.
                 const { hour, minute } = roundToHalfHour(h, m);
@@ -559,9 +561,32 @@ async function adoptFromTrip(order) {
         } else if (order.orderType === 'parking' && order.parkingType === 'street') {
             address = point(order.parkingLocation);
             days = address ? daysOf(order.parkingLocation.streetCleaning) : [];
+            if (address && !days.length) lookupAt = order.parkingLocation;
         }
-        if (!address || !days.length) return false;
+        if (!address) return false;
+        if (!days.length) {
+            // Rishi, Nov 6: the card kept 60 Pine St after a park at 189 Court
+            // St whose sign wasn't logged. The city's sign data says it, a
+            // moment after the completion has answered.
+            if (lookupAt && process.env.NODE_ENV !== 'test') {
+                const at = address;
+                setImmediate(async () => {
+                    const found = await require('./streetSigns').signAt(lookupAt);
+                    if (found.length) await writeCard(userId, at, found).catch((e) => console.error('adoptFromTrip (signs) failed:', e.message));
+                });
+            }
+            return false;
+        }
+        return writeCard(userId, address, days);
+    } catch (err) {
+        console.error('adoptFromTrip failed:', err.message);
+        return false;
+    }
+}
 
+/** The card at a spot with its sweep days (from a trip). Plans keep their own. */
+async function writeCard(userId, address, days) {
+    try {
         const { getActiveSubscription } = require('./subscriptionService');
         if (await getActiveSubscription(userId)) return false;
 
