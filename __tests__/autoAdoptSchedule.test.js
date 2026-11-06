@@ -142,3 +142,61 @@ describe('the calendar sets itself from the last trip', () => {
         expect((await load(user)).hasSchedule).toBe(false);
     });
 });
+
+// Nov 6, Louisa: her move's car stayed on Carlton Ave and the card kept the
+// street it left. The return leg's spot decides now.
+describe('after a move whose car stayed somewhere else', () => {
+    const { adoptFromTrip } = require('../services/cleaningSchedule');
+    const leg = (user, parent, parkingLocation) =>
+        Order.create({
+            customer: user._id,
+            customerLocation: WYCKOFF,
+            aspMode: true,
+            orderType: 'retrieval',
+            duration: 60,
+            totalAmount: 0,
+            paymentMethod: 'card',
+            status: 'completed',
+            paymentStatus: 'paid',
+            pickUpTime: new Date('2026-11-05T17:00:00Z'),
+            linkedOrderId: parent._id,
+            parkingLocation,
+        });
+
+    test("the card follows the car, with that block's sign", async () => {
+        const user = await makeUser();
+        const parent = await move(user);
+        const l = await leg(user, parent, {
+            ...WARREN,
+            streetCleaning: [
+                { day: 2, startTime: '11:30', endTime: '13:00' },
+                { day: 5, startTime: '11:30', endTime: '13:00' },
+            ],
+        });
+        expect(await adoptFromTrip(l)).toBe(true);
+        const saved = await User.findById(user._id).lean();
+        expect(saved.cleaningSchedule.address.streetAddress).toBe(WARREN.streetAddress);
+        expect(saved.cleaningSchedule.days.map((d) => [d.weekday, d.hour, d.minute])).toEqual([
+            [2, 11, 30],
+            [5, 11, 30],
+        ]);
+    });
+
+    test('no sign known there: the card is left as it was', async () => {
+        const user = await makeUser();
+        const parent = await move(user);
+        const l = await leg(user, parent, { ...WARREN });
+        expect(await adoptFromTrip(l)).toBe(false);
+        const saved = await User.findById(user._id).lean();
+        expect(saved.cleaningSchedule && saved.cleaningSchedule.address && saved.cleaningSchedule.address.streetAddress).toBeFalsy();
+    });
+
+    test("the car came back to its block: the card is the user's own spot", async () => {
+        const user = await makeUser();
+        const parent = await move(user);
+        const l = await leg(user, parent, { ...WYCKOFF });
+        expect(await adoptFromTrip(l)).toBe(true);
+        const saved = await User.findById(user._id).lean();
+        expect(saved.cleaningSchedule.address.streetAddress).toBe(WYCKOFF.streetAddress);
+    });
+});

@@ -472,6 +472,11 @@ module.exports.adoptFromSubscription = adoptFromSubscription;
  *     user's own spot, where the car came back to. Its days come from the
  *     sign there when we have parked on that block before, else from the move
  *     itself (it was booked for the sweep).
+ *   - Unless the return leg ended with the car somewhere else (Rishi, Nov 6:
+ *     Louisa's card kept 206 Prospect Pl while her car sat on Carlton Ave):
+ *     then the card follows the car, with that block's sign from the valet's
+ *     note or an earlier park there. Without one it stays as it was rather
+ *     than guess.
  *
  * Plans keep their own schedule (the plan's moves run off it), and an away
  * trip or a retrieval leaves the car somewhere else, so neither changes it.
@@ -507,6 +512,12 @@ async function adoptFromTrip(order) {
             if (move.awayMode) return false;
             address = point(move.customerLocation);
             if (!address) return false;
+            // Where the return leg left the car: more than a block from the
+            // move's start means it never came back, so the card follows it.
+            const { haversineMeters: metersApart } = require('./sweepWindows');
+            const carNow = moveLeg ? point(order.parkingLocation) : null;
+            const stayedAway = !!carNow && metersApart(carNow, address) > 60;
+            if (stayedAway) address = carNow;
             // The sign on that block, from the last time we parked there.
             const nearby = await Order.find({
                 customer: userId,
@@ -520,6 +531,11 @@ async function adoptFromTrip(order) {
             const { haversineMeters } = require('./sweepWindows');
             const sameBlock = nearby.find((o) => haversineMeters(o.parkingLocation, address) <= 60);
             days = sameBlock ? daysOf(sameBlock.parkingLocation.streetCleaning) : [];
+            if (stayedAway && !days.length && Array.isArray(order.parkingLocation.streetCleaning)) {
+                days = daysOf(order.parkingLocation.streetCleaning);
+            }
+            // The move's own time is the sweep on the block it left, never the new one.
+            if (stayedAway && !days.length) return false;
             if (!days.length && move.pickUpTime) {
                 const { weekday, hour: h, minute: m } = nycParts(new Date(move.pickUpTime));
                 // On the half hour, like every sign and the guess from past moves.
