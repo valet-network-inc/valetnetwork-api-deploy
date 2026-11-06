@@ -81,8 +81,12 @@ function parseSign(description) {
 
 /** The sweep days at a parked car's curb: [{ weekday, hour, minute }], or []. One retry: the city's API throws the odd 503. */
 async function signAt(loc, opts = {}) {
-    const first = await signAtOnce(loc, opts);
-    return first === null ? (await signAtOnce(loc, opts)) || [] : first;
+    for (let i = 0; i < 3; i += 1) {
+        const days = await signAtOnce(loc, opts);
+        if (days !== null) return days;
+        await new Promise((r) => setTimeout(r, 400 * (i + 1)));
+    }
+    return [];
 }
 
 async function signAtOnce(loc, { timeoutMs = 4000 } = {}) {
@@ -100,7 +104,9 @@ async function signAtOnce(loc, { timeoutMs = 4000 } = {}) {
             },
             timeout: timeoutMs,
         });
-        const rows = Array.isArray(res.data) ? res.data : [];
+        // A throttled answer comes back 200 with an error object: try again.
+        if (!Array.isArray(res.data)) return null;
+        const rows = res.data;
         const near = rows
             .filter((s) => String(s.on_street || '').toUpperCase() === street)
             .map((s) => ({ s, d: Math.hypot(Number(s.sign_x_coord) - x, Number(s.sign_y_coord) - y) }))
