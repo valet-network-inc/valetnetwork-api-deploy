@@ -503,39 +503,53 @@ async function adoptFromTrip(order) {
 
         const moveLeg = order.orderType === 'retrieval' && order.aspMode && order.linkedOrderId;
         const move = moveLeg
-            ? await Order.findById(order.linkedOrderId).select('customerLocation pickUpTime awayMode aspMode').lean()
+            ? await Order.findById(order.linkedOrderId).select('customerLocation pickUpTime awayMode aspMode parkingLocation').lean()
             : order.orderType !== 'retrieval' && order.aspMode
               ? order
               : null;
 
         if (move) {
             if (move.awayMode) return false;
-            address = point(move.customerLocation);
-            if (!address) return false;
-            // Where the return leg left the car: more than a block from the
-            // move's start means it never came back, so the card follows it.
+            const home = point(move.customerLocation);
+            if (!home) return false;
             const { haversineMeters: metersApart } = require('./sweepWindows');
-            const carNow = moveLeg ? point(order.parkingLocation) : null;
-            const stayedAway = !!carNow && metersApart(carNow, address) > 60;
-            if (stayedAway) address = carNow;
-            // The sign on that block, from the last time we parked there.
-            const nearby = await Order.find({
-                customer: userId,
-                'parkingLocation.lat': { $type: 'number' },
-                'parkingLocation.streetCleaning.0': { $exists: true },
-            })
-                .select('parkingLocation')
-                .sort({ updatedAt: -1 })
-                .limit(25)
-                .lean();
-            const { haversineMeters } = require('./sweepWindows');
-            const sameBlock = nearby.find((o) => haversineMeters(o.parkingLocation, address) <= 60);
-            days = sameBlock ? daysOf(sameBlock.parkingLocation.streetCleaning) : [];
-            if (stayedAway && !days.length && Array.isArray(order.parkingLocation.streetCleaning)) {
-                days = daysOf(order.parkingLocation.streetCleaning);
+            // Rishi, Nov 6: "if the car is on the same block, but even moved to
+            // the other side, the card needs to follow it." A side of a street
+            // is the street and its house numbers' odd or even (Queens: the
+            // number after the dash).
+            const sideOf = (loc) => {
+                const m = String((loc && loc.streetAddress) || '').match(/^\s*(\d+)(?:-(\d+))?\s+([^,]+)/);
+                return m ? `${m[3].trim().toLowerCase()}|${Number(m[2] || m[1]) % 2}` : null;
+            };
+            const sameSide = (a, b, meters) =>
+                !!a && !!b && typeof a.lat === 'number' && !!sideOf(a) && sideOf(a) === sideOf(b) && metersApart(a, b) <= meters;
+            // Where the car ended up: the return leg's spot, else the move's.
+            const carNow = (moveLeg ? point(order.parkingLocation) : null) || point(move.parkingLocation);
+            const backHome = !carNow || sameSide(carNow, home, 60);
+            address = backHome ? home : carNow;
+            const signAt = (loc) =>
+                loc && Array.isArray(loc.streetCleaning) && loc.streetCleaning.length ? daysOf(loc.streetCleaning) : [];
+            // That side's sign: logged where the car stands, where the move
+            // parked it, or the last time we parked on that side.
+            if (!backHome) {
+                days = moveLeg ? signAt(order.parkingLocation) : [];
+                if (!days.length && sameSide(move.parkingLocation, carNow, 150)) days = signAt(move.parkingLocation);
             }
-            // The move's own time is the sweep on the block it left, never the new one.
-            if (stayedAway && !days.length) return false;
+            if (!days.length) {
+                const nearby = await Order.find({
+                    customer: userId,
+                    'parkingLocation.lat': { $type: 'number' },
+                    'parkingLocation.streetCleaning.0': { $exists: true },
+                })
+                    .select('parkingLocation')
+                    .sort({ updatedAt: -1 })
+                    .limit(25)
+                    .lean();
+                const same = nearby.find((o) => sameSide(o.parkingLocation, address, 150));
+                days = same ? daysOf(same.parkingLocation.streetCleaning) : [];
+            }
+            // The move's own time is the sweep where it started: only for a car back there.
+            if (!days.length && !backHome) return false;
             if (!days.length && move.pickUpTime) {
                 const { weekday, hour: h, minute: m } = nycParts(new Date(move.pickUpTime));
                 // On the half hour, like every sign and the guess from past moves.

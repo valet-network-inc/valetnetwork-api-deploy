@@ -200,3 +200,46 @@ describe('after a move whose car stayed somewhere else', () => {
         expect(saved.cleaningSchedule.address.streetAddress).toBe(WYCKOFF.streetAddress);
     });
 });
+
+// Nov 6, Rishi: "if the car is on the same block, but even moved to the other
+// side, the card needs to follow it."
+describe('the other side of the same block', () => {
+    const { adoptFromTrip } = require('../services/cleaningSchedule');
+    const HOME = { lat: 40.6857, lng: -73.9905, streetAddress: '88 Wyckoff St, Brooklyn, NY 11201, USA' };
+    const ACROSS = { lat: 40.68581, lng: -73.9905, streetAddress: '91 Wyckoff St, Brooklyn, NY 11201, USA' };
+    const ACROSS_ON = { lat: 40.68585, lng: -73.99062, streetAddress: '95 Wyckoff St, New York, NY, 11201' };
+    test("the card follows the car across the street, with the move's logged sign", async () => {
+        const user = await makeUser();
+        const parent = await Order.create({
+            customer: user._id,
+            customerLocation: HOME,
+            aspMode: true,
+            orderType: 'parking',
+            duration: 120,
+            totalAmount: 1500,
+            paymentMethod: 'card',
+            status: 'completed',
+            paymentStatus: 'paid',
+            pickUpTime: new Date('2026-11-05T15:00:00Z'),
+            parkingLocation: { ...ACROSS, streetCleaning: [{ day: 1, startTime: '09:00', endTime: '10:30' }] },
+        });
+        const l = await Order.create({
+            customer: user._id,
+            customerLocation: HOME,
+            aspMode: true,
+            orderType: 'retrieval',
+            duration: 60,
+            totalAmount: 0,
+            paymentMethod: 'card',
+            status: 'completed',
+            paymentStatus: 'paid',
+            pickUpTime: new Date('2026-11-05T17:00:00Z'),
+            linkedOrderId: parent._id,
+            parkingLocation: { ...ACROSS_ON },
+        });
+        expect(await adoptFromTrip(l)).toBe(true);
+        const saved = await User.findById(user._id).lean();
+        expect(saved.cleaningSchedule.address.streetAddress).toBe(ACROSS_ON.streetAddress);
+        expect(saved.cleaningSchedule.days.map((d) => [d.weekday, d.hour, d.minute])).toEqual([[1, 9, 0]]);
+    });
+});
