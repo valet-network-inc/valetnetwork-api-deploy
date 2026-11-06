@@ -34,6 +34,10 @@ const ScheduledMoveSchema = new mongoose.Schema(
         // A code (an event's) applied at booking: the first run is free, as a
         // booking made now would be, and nothing is paid at booking.
         eventCode: { type: String },
+        // A parking without a plan: Park + Retrieve (park-and-hold, the
+        // default and every older booking) or Just park ('standard'), the
+        // same choice as a parking now (Rishi, Nov 6).
+        serviceType: { type: String, enum: ['park-and-hold', 'standard'] },
         prepaid: {
             paymentIntentId: { type: String },
             cents: { type: Number },

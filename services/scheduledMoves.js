@@ -106,11 +106,18 @@ async function managedSubscription(userId) {
  *  scheduled park without a plan is held overnight the same way. */
 const PARK_MINUTES = 24 * 60;
 
-/** What a scheduled pick-up costs without a plan: a park-and-hold. */
-async function pickUpCents() {
-    const q = await orderPricing.priceOrderCents({ orderType: 'parking', serviceType: 'park-and-hold', duration: PARK_MINUTES, carWatch: false, aspMode: false });
+/** What a scheduled parking costs without a plan: Park + Retrieve (a
+ *  park-and-hold) unless it is Just park ('standard'). */
+async function pickUpCents(serviceType = 'park-and-hold') {
+    const q = await orderPricing.priceOrderCents({ orderType: 'parking', serviceType, duration: PARK_MINUTES, carWatch: false, aspMode: false });
     return q.amountCents;
 }
+/** Both, for a list that may hold either kind. */
+async function pickUpPrices() {
+    const [hold, standard] = await Promise.all([pickUpCents('park-and-hold'), pickUpCents('standard')]);
+    return { hold, standard };
+}
+const serviceOf = (move) => (move && move.serviceType === 'standard' ? 'standard' : 'park-and-hold');
 
 /** What Bring my car back costs on its own, from the live price table. */
 async function retrievalCents() {
@@ -183,11 +190,13 @@ async function quote(userId) {
     const sub = await managedSubscription(userId);
     // payAtBooking: this server takes payNow (Nov 5 2026), so the clients put
     // the Pay with row on the review. An older server never says it.
-    if (sub) return { plan: true, pickUpCents: 0, dropOffCents: 0, card: null, cardRequired: false, payAtBooking: true };
-    const [cents, dropCents, card] = await Promise.all([pickUpCents(), dropOffCents(userId), savedCard(userId)]);
+    if (sub) return { plan: true, pickUpCents: 0, justParkCents: 0, dropOffCents: 0, card: null, cardRequired: false, payAtBooking: true };
+    const [cents, justCents, dropCents, card] = await Promise.all([pickUpCents(), pickUpCents('standard'), dropOffCents(userId), savedCard(userId)]);
     return {
         plan: false,
         pickUpCents: cents,
+        // Just park, for the "How should it come back?" choice (Nov 6).
+        justParkCents: justCents,
         dropOffCents: dropCents,
         card: card ? { brand: card.brand, last4: card.last4, label: `${brandName(card.brand)} ending ${card.last4}` } : null,
         cardRequired: !card,
@@ -227,7 +236,10 @@ function shortStreet(address) {
 }
 
 /** What the app and web render for a move (Home's "Coming up"). */
-function view(move, sub, pickUpPriceCents = null, dropOffPriceCents = null) {
+function view(move, sub, pickUpPrices = null, dropOffPriceCents = null) {
+    // A number (one kind) or { hold, standard } (a list of either).
+    const pickUpPriceCents =
+        pickUpPrices && typeof pickUpPrices === 'object' ? (serviceOf(move) === 'standard' ? pickUpPrices.standard : pickUpPrices.hold) : pickUpPrices;
     const included = !!sub;
     const street = shortStreet(move.address);
     // Parking and retrieval, the words users read (Nov 4 2026); the kinds stay.
@@ -246,6 +258,7 @@ function view(move, sub, pickUpPriceCents = null, dropOffPriceCents = null) {
     return {
         _id: String(move._id),
         kind: move.kind,
+        ...(move.kind === 'pick-up' ? { serviceType: serviceOf(move) } : {}),
         at: move.nextAt,
         repeat: move.repeat,
         days: move.days || [],
@@ -354,15 +367,16 @@ async function create(userId, input, now = new Date()) {
         ...(value.carLocation ? { carLocation: value.carLocation } : {}),
         ...(payNow || code ? { priced: true } : {}),
         ...(code ? { eventCode: code } : {}),
+        ...(value.kind === 'pick-up' && input.serviceType === 'standard' ? { serviceType: 'standard' } : {}),
     });
     // The first run is the time they picked; repeats follow its wall-clock time.
     move.nextAt = value.repeat === 'once' || runsOn(move, nyClock(value.at).weekday) ? value.at : occurrenceAfter(move, value.at);
     if (payNow) {
-        const cents = value.kind === 'pick-up' ? await pickUpCents() : await dropOffCents(userId);
+        const cents = value.kind === 'pick-up' ? await pickUpCents(serviceOf(move)) : await dropOffCents(userId);
         if (cents > 0) return startPayment(userId, move, cents);
     }
     await move.save();
-    return { move: view(move, sub, sub ? null : await pickUpCents(), sub ? null : await dropOffCents(userId)) };
+    return { move: view(move, sub, sub ? null : await pickUpPrices(), sub ? null : await dropOffCents(userId)) };
 }
 
 /**
@@ -375,7 +389,7 @@ async function startPayment(userId, move, cents) {
     const gift = await giftBalance.giftFor(userId);
     if (gift.cents >= cents) {
         await move.save();
-        return { move: view(move, null, await pickUpCents(), cents) };
+        return { move: view(move, null, await pickUpPrices(), cents) };
     }
     const stripe = stripeClient.get();
     if (!stripe) return { status: 503, error: 'Payments are unavailable right now. Try again soon.' };
@@ -555,6 +569,7 @@ async function update(userId, id, input, now = new Date()) {
             at: value.at || move.nextAt,
             address: value.address || move.address,
             carLocation: value.carLocation !== undefined ? value.carLocation : move.carLocation?.lat != null ? move.carLocation : undefined,
+            serviceType: move.serviceType,
         }, now);
         if (one.move && (paidFor || move.priced)) {
             await ScheduledMove.updateOne(
@@ -562,7 +577,7 @@ async function update(userId, id, input, now = new Date()) {
                 { $set: { priced: !!move.priced, ...(paidFor ? { prepaid: paidFor } : {}), ...(move.paymentMethodId ? { paymentMethodId: move.paymentMethodId } : {}) } }
             );
             const fresh = await ScheduledMove.findById(one.move._id);
-            return { move: view(fresh, sub, sub ? null : await pickUpCents(), sub ? null : await dropOffCents(userId)) };
+            return { move: view(fresh, sub, sub ? null : await pickUpPrices(), sub ? null : await dropOffCents(userId)) };
         }
         if (one.error && paidFor) await ScheduledMove.updateOne({ _id: move._id }, { $set: { prepaid: paidFor } });
         return one;
@@ -580,7 +595,7 @@ async function update(userId, id, input, now = new Date()) {
         : occurrenceAfter(move, now);
     move.lastKey = undefined;
     await move.save();
-    return { move: view(move, sub, sub ? null : await pickUpCents(), sub ? null : await dropOffCents(userId)) };
+    return { move: view(move, sub, sub ? null : await pickUpPrices(), sub ? null : await dropOffCents(userId)) };
 }
 
 /** Cancel it, or with scope 'once' just its next run. */
@@ -608,7 +623,7 @@ async function cancel(userId, id, { scope } = {}) {
 async function mine(userId) {
     const sub = await managedSubscription(userId);
     const moves = await ScheduledMove.find({ user: userId, active: true, nextAt: { $ne: null } }).sort({ nextAt: 1 }).lean();
-    const cents = !sub && moves.some((m) => m.kind === 'pick-up') ? await pickUpCents() : null;
+    const cents = !sub && moves.some((m) => m.kind === 'pick-up') ? await pickUpPrices() : null;
     const dropCents = !sub && moves.some((m) => m.kind === 'drop-off' && m.priced) ? await dropOffCents(userId) : null;
     return moves.map((m) => view(m, sub, cents, dropCents));
 }
@@ -762,9 +777,10 @@ async function runOne(move, http) {
     const userId = String(move.user);
     const sub = await managedSubscription(userId);
     if (move.kind === 'pick-up') {
-        // Without a plan this is a paid park-and-hold, quoted at the price
-        // createOrder will charge so the two agree.
-        const priceCents = sub ? 0 : await pickUpCents();
+        // Without a plan this is a paid Park + Retrieve (park-and-hold) or
+        // Just park, quoted at the price createOrder will charge so the two agree.
+        const service = serviceOf(move);
+        const priceCents = sub ? 0 : await pickUpCents(service);
         let res;
         try {
             res = await http.post(`${base()}/api/order/createOrder`, {
@@ -781,7 +797,7 @@ async function runOne(move, http) {
                 paymentMethod: 'card',
                 totalAmount: priceCents,
                 orderType: 'parking',
-                serviceType: 'park-and-hold',
+                serviceType: service,
                 carWatch: false,
                 carWatchAmount: 0,
                 aspMode: false,
