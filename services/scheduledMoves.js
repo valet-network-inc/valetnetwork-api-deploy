@@ -18,12 +18,22 @@
  *   - On a plan that includes the move (Permanent valet, Valet anywhere) a
  *     run is covered. A run the plan doesn't cover is never charged: the
  *     order is cancelled and the customer is told.
- *   - Without a plan, a pick-up is a park-and-hold at the per-use price,
- *     charged off-session to the customer's saved card when the job books it
- *     (PICKUP_LEAD before). The valet keeps the keys, so the drop-off that
- *     brings it back is already paid for. A declined card cancels that run
- *     and tells the customer; a repeating move tries again next time. A card
- *     has to be on file to schedule: POST /card saves one at $0.
+ *   - Without a plan it is paid at booking (Rishi, Nov 5 2026: "charge it at
+ *     booking because what if there's no card on file?"). POST / with payNow
+ *     books the move unseen and hands back a payment intent; the client pays
+ *     it like a booking for now (Apple Pay or a saved card) and POST /:id/paid
+ *     (or the webhook, or the job's sweep) puts the move on the schedule. A
+ *     pick-up is a park-and-hold at the per-use price. A drop-off is priced
+ *     like Bring my car back now: free when it returns a Park + Retrieve, a
+ *     paid retrieval for a car parked on its own. The next run uses what the
+ *     booking paid; anything a run doesn't use is refunded, and so is a
+ *     cancel. A repeat's later runs are charged when the job books them, to
+ *     the card the booking paid with.
+ *   - An older client books without payNow: a card has to be on file (POST
+ *     /card saves one at $0), each pick-up is charged off-session when the
+ *     job books it (PICKUP_LEAD before), and its drop-offs stay free. A
+ *     declined card cancels that run and tells the customer; a repeating
+ *     move tries again next time.
  */
 const axios = require('axios');
 const ScheduledMove = require('../models/ScheduledMove');
@@ -38,6 +48,8 @@ const PICKUP_LEAD_MS = 50 * 60 * 1000;
 const DROPOFF_LEAD_MS = 45 * 60 * 1000;
 const MIN_NOTICE_MS = 45 * 60 * 1000;
 const GIVE_UP_AFTER_MS = 15 * 60 * 1000;
+// A booking still unpaid this long after its payment started is swept.
+const UNPAID_GRACE_MS = 15 * 60 * 1000;
 const MANAGED_TIERS = ['home_garage', 'valet_anywhere'];
 const REPEATS = ['once', 'weekdays', 'daily', 'days'];
 
@@ -99,6 +111,28 @@ async function pickUpCents() {
     return q.amountCents;
 }
 
+/** What Bring my car back costs on its own, from the live price table. */
+async function retrievalCents() {
+    const q = await orderPricing.priceOrderCents({ orderType: 'retrieval' });
+    return q.amountCents;
+}
+
+/** The car we have parked for this customer, newest first. */
+function parkedCar(userId) {
+    return Order.findOne({ customer: userId, orderType: 'parking', status: 'parked' }).sort({ createdAt: -1 });
+}
+
+/**
+ * What a scheduled retrieval costs without a plan, priced like Bring my car
+ * back now (Nov 5 2026: tomorrow's said "Included with your park" while the
+ * same one now cost $5): the return a Park + Retrieve paid for is free; any
+ * other car comes back as a paid retrieval.
+ */
+async function dropOffCents(userId) {
+    const park = await parkedCar(userId).select('serviceType').lean();
+    return park && park.serviceType === 'park-and-hold' ? 0 : retrievalCents();
+}
+
 /**
  * The card a pick-up without a plan is charged to: the customer's default
  * card, else the newest one on their Stripe customer. Null when there is none.
@@ -125,20 +159,38 @@ async function savedCard(userId) {
     }
 }
 
+/** The card a run is charged to: the one its booking paid with, else the saved card. */
+async function cardFor(move) {
+    const stripe = stripeClient.get();
+    if (stripe && move.paymentMethodId) {
+        try {
+            const pm = await stripe.paymentMethods.retrieve(move.paymentMethodId);
+            const customerId = pm && pm.customer && (typeof pm.customer === 'string' ? pm.customer : pm.customer.id);
+            if (pm && pm.card && customerId) return { customerId, paymentMethodId: pm.id, brand: pm.card.brand, last4: pm.card.last4 };
+        } catch (err) {
+            console.error('scheduledMoves: booking card lookup failed:', err.message);
+        }
+    }
+    return savedCard(move.user);
+}
+
 const dollars = (cents) => `$${(cents / 100).toFixed(cents % 100 ? 2 : 0)}`;
 const brandName = (b) => (b ? b.charAt(0).toUpperCase() + b.slice(1) : 'Card');
 
 /** For the review screen: what a run costs this customer, and the card it goes on. */
 async function quote(userId) {
     const sub = await managedSubscription(userId);
-    if (sub) return { plan: true, pickUpCents: 0, dropOffCents: 0, card: null, cardRequired: false };
-    const [cents, card] = await Promise.all([pickUpCents(), savedCard(userId)]);
+    // payAtBooking: this server takes payNow (Nov 5 2026), so the clients put
+    // the Pay with row on the review. An older server never says it.
+    if (sub) return { plan: true, pickUpCents: 0, dropOffCents: 0, card: null, cardRequired: false, payAtBooking: true };
+    const [cents, dropCents, card] = await Promise.all([pickUpCents(), dropOffCents(userId), savedCard(userId)]);
     return {
         plan: false,
         pickUpCents: cents,
-        dropOffCents: 0,
+        dropOffCents: dropCents,
         card: card ? { brand: card.brand, last4: card.last4, label: `${brandName(card.brand)} ending ${card.last4}` } : null,
         cardRequired: !card,
+        payAtBooking: true,
     };
 }
 
@@ -174,21 +226,21 @@ function shortStreet(address) {
 }
 
 /** What the app and web render for a move (Home's "Coming up"). */
-function view(move, sub, pickUpPriceCents = null) {
+function view(move, sub, pickUpPriceCents = null, dropOffPriceCents = null) {
     const included = !!sub;
     const street = shortStreet(move.address);
     // Parking and retrieval, the words users read (Nov 4 2026); the kinds stay.
     const verb = move.kind === 'drop-off' ? `Brought back to ${street}` : `Valet meets you at ${street}`;
-    // Without a plan a pick-up is charged when it's booked; the drop-off
-    // brings back a car whose return is already paid for.
-    const priceCents = included || move.kind === 'drop-off' ? 0 : pickUpPriceCents;
+    // Paid at booking: nothing more to pay for this run.
+    const paid = !!(move.prepaid && move.prepaid.paymentIntentId);
+    // Otherwise a pick-up is charged when it's booked, and so is a priced
+    // drop-off of a car parked on its own; an older booking's drop-off is free.
+    const priceCents =
+        included || paid ? 0 : move.kind === 'drop-off' ? (move.priced ? dropOffPriceCents : 0) : pickUpPriceCents;
     // No "Included" (Rishi, Nov 4 2026: "remove 'Included' in the coming up
     // section"): a covered or already-paid run says only where; a run that
     // will be charged still says its price.
-    const detail =
-        !included && move.kind !== 'drop-off' && typeof priceCents === 'number'
-            ? `${verb} · ${dollars(priceCents)}`
-            : verb;
+    const detail = !included && !paid && typeof priceCents === 'number' && priceCents > 0 ? `${verb} · ${dollars(priceCents)}` : verb;
     return {
         _id: String(move._id),
         kind: move.kind,
@@ -201,6 +253,8 @@ function view(move, sub, pickUpPriceCents = null) {
         included,
         priceCents,
         detail,
+        // What the booking paid: cancelling gives it back.
+        ...(paid ? { paidCents: move.prepaid.cents || 0 } : {}),
     };
 }
 
@@ -244,9 +298,11 @@ function validate(input, { partial = false } = {}) {
 /** Book one. Returns { move } or { status, error }. */
 async function create(userId, input, now = new Date()) {
     const sub = await managedSubscription(userId);
-    // Without a plan each pick-up is charged when it's booked, so a card has
-    // to be on file first.
-    if (!sub && !(await savedCard(userId))) {
+    // payNow: paid here, at booking, like a booking for now (Nov 5 2026). An
+    // older client's runs are charged when they're booked, so it needs a card
+    // on file first.
+    const payNow = !sub && input.payNow === true;
+    if (!sub && !payNow && !(await savedCard(userId))) {
         return { status: 402, code: 'CARD_REQUIRED', error: 'Add a card first. Each parking is charged to it when it’s booked.' };
     }
     const { value, error } = validate(input);
@@ -262,11 +318,179 @@ async function create(userId, input, now = new Date()) {
         time: timeOf(value.at),
         address: value.address,
         ...(value.carLocation ? { carLocation: value.carLocation } : {}),
+        ...(payNow ? { priced: true } : {}),
     });
     // The first run is the time they picked; repeats follow its wall-clock time.
     move.nextAt = value.repeat === 'once' || runsOn(move, nyClock(value.at).weekday) ? value.at : occurrenceAfter(move, value.at);
+    if (payNow) {
+        const cents = value.kind === 'pick-up' ? await pickUpCents() : await dropOffCents(userId);
+        if (cents > 0) return startPayment(userId, move, cents);
+    }
     await move.save();
-    return { move: view(move, sub, sub ? null : await pickUpCents()) };
+    return { move: view(move, sub, sub ? null : await pickUpCents(), sub ? null : await dropOffCents(userId)) };
+}
+
+/**
+ * Take the booking's payment (payNow). The move is saved inactive, out of the
+ * job and Home, with a payment intent the client confirms the way it pays for
+ * a booking for now; it joins the schedule once that succeeds. Gift card money
+ * that covers the run is spent when the job books it instead, as before.
+ */
+async function startPayment(userId, move, cents) {
+    const gift = await giftBalance.giftFor(userId);
+    if (gift.cents >= cents) {
+        await move.save();
+        return { move: view(move, null, await pickUpCents(), cents) };
+    }
+    const stripe = stripeClient.get();
+    if (!stripe) return { status: 503, error: 'Payments are unavailable right now. Try again soon.' };
+    const user = await User.findById(userId);
+    if (!user) return { status: 404, error: 'Not found.' };
+    const { ensureStripeCustomer } = require('../controllers/subscriptionController');
+    const customerId = await ensureStripeCustomer(user);
+    move.active = false;
+    move.awaitingPayment = { cents, since: new Date() };
+    await move.save();
+    let intent;
+    let ephemeralKey;
+    try {
+        intent = await stripe.paymentIntents.create(
+            {
+                amount: cents,
+                currency: 'usd',
+                customer: customerId,
+                // Cards (Apple Pay is one), saved like a booking for now saves
+                // them: a repeat's later runs are charged to this one.
+                payment_method_types: ['card'],
+                setup_future_usage: 'off_session',
+                description: `Scheduled ${move.kind === 'drop-off' ? 'retrieval' : 'parking'}, paid at booking`,
+                // `purpose` keeps the webhook's order and guest-payment matchers
+                // away from it: it names a scheduled move, never an order.
+                metadata: { purpose: 'scheduled_prepay', scheduledMoveId: String(move._id), customerId: String(userId) },
+            },
+            { idempotencyKey: `scheduled-prepay-${move._id}` }
+        );
+        ephemeralKey = await stripe.ephemeralKeys.create({ customer: customerId }, { apiVersion: '2024-06-20' });
+    } catch (err) {
+        if (!intent) await ScheduledMove.deleteOne({ _id: move._id });
+        else await dropUnpaid(Object.assign(move, { awaitingPayment: { ...move.awaitingPayment, paymentIntentId: intent.id } }));
+        throw err;
+    }
+    await ScheduledMove.updateOne({ _id: move._id }, { $set: { 'awaitingPayment.paymentIntentId': intent.id } });
+    return {
+        move: { ...view(move, null, null, null), awaitingPayment: true },
+        payment: {
+            clientSecret: intent.client_secret,
+            paymentIntentId: intent.id,
+            amountCents: cents,
+            customerId,
+            customerEphemeralKeySecret: ephemeralKey.secret,
+        },
+    };
+}
+
+/**
+ * The booking's payment went through: the move joins the schedule, paid, with
+ * the card it paid with kept for a repeat's later runs. Returns { move },
+ * { unpaid, status } while the intent hasn't succeeded, or { refunded } when
+ * it came back too late to run (the sheet sat open past the time).
+ */
+async function settlePayment(move, now = new Date()) {
+    const id = move.awaitingPayment && move.awaitingPayment.paymentIntentId;
+    if (!id) return move.active ? { move } : { unpaid: true, status: 'none' };
+    const stripe = stripeClient.get();
+    if (!stripe) return { unpaid: true, status: 'unavailable' };
+    const pi = await stripe.paymentIntents.retrieve(id);
+    if (!pi || pi.status !== 'succeeded') return { unpaid: true, status: pi && pi.status };
+    if (!move.nextAt || move.nextAt.getTime() <= now.getTime()) {
+        await dropUnpaid(move);
+        return { refunded: true };
+    }
+    const pm = typeof pi.payment_method === 'string' ? pi.payment_method : pi.payment_method && pi.payment_method.id;
+    const done = await ScheduledMove.findOneAndUpdate(
+        { _id: move._id, 'awaitingPayment.paymentIntentId': id },
+        {
+            $set: { active: true, prepaid: { paymentIntentId: id, cents: pi.amount, paidAt: now }, ...(pm ? { paymentMethodId: pm } : {}) },
+            $unset: { awaitingPayment: 1 },
+        },
+        { new: true }
+    );
+    return { move: done || (await ScheduledMove.findById(move._id)) };
+}
+
+/** POST /:id/paid — the client's word that the booking's payment went through. */
+async function confirmPaid(userId, id, now = new Date()) {
+    const move = await ScheduledMove.findOne({ _id: id, user: userId });
+    if (!move) return { status: 404, error: 'Not found.' };
+    const r = await settlePayment(move, now);
+    if (r.refunded) return { status: 400, error: 'That time has passed, so nothing is booked. Your money is on its way back.' };
+    if (!r.move || !r.move.active) return { status: 402, error: 'That payment didn’t go through. Try again.' };
+    return { move: view(r.move, null, null, null) };
+}
+
+/** The webhook's half of confirmPaid: Stripe says a booking's payment succeeded. */
+async function paymentSucceeded(pi) {
+    const id = pi && pi.metadata && pi.metadata.scheduledMoveId;
+    if (!id) return { skipped: 'no move named' };
+    const move = await ScheduledMove.findById(id);
+    if (!move) return { skipped: 'no such move' };
+    if (move.active && move.prepaid && move.prepaid.paymentIntentId === pi.id) return { already: true };
+    const r = await settlePayment(move);
+    return r.move ? { activated: String(move._id) } : r;
+}
+
+/** A booking whose payment never finished: call off its intent (or refund it) and forget it. */
+async function dropUnpaid(move) {
+    const id = move.awaitingPayment && move.awaitingPayment.paymentIntentId;
+    const stripe = stripeClient.get();
+    if (id && stripe) {
+        try {
+            const pi = await stripe.paymentIntents.retrieve(id);
+            if (pi.status === 'succeeded') {
+                await stripe.refunds.create({ payment_intent: id, metadata: { scheduledMoveId: String(move._id) } }, { idempotencyKey: `scheduled-prepay-refund-${id}` });
+            } else if (pi.status !== 'canceled') {
+                await stripe.paymentIntents.cancel(id);
+            }
+        } catch (err) {
+            // Kept, so the job's sweep tries again.
+            console.error('scheduledMoves: could not drop unpaid booking', String(move._id), err.message);
+            return false;
+        }
+    }
+    await ScheduledMove.deleteOne({ _id: move._id, active: false });
+    return true;
+}
+
+/**
+ * Give back what a booking paid when its run doesn't use it (cancelled,
+ * skipped, covered by a plan, nothing to bring back, or not booked).
+ * Claimed off the move first, so it is never refunded twice. Returns cents.
+ */
+async function refundPrepaid(move, why) {
+    const pre = move.prepaid;
+    if (!pre || !pre.paymentIntentId) return 0;
+    const claimed = await ScheduledMove.findOneAndUpdate(
+        { _id: move._id, 'prepaid.paymentIntentId': pre.paymentIntentId },
+        { $unset: { prepaid: 1 } }
+    );
+    if (!claimed) return 0;
+    const stripe = stripeClient.get();
+    try {
+        if (!stripe) throw new Error('payments unavailable');
+        await stripe.refunds.create(
+            { payment_intent: pre.paymentIntentId, metadata: { scheduledMoveId: String(move._id), why: String(why || '') } },
+            { idempotencyKey: `scheduled-prepay-refund-${pre.paymentIntentId}` }
+        );
+        return pre.cents || 0;
+    } catch (err) {
+        // Put it back where a person (or a later pass) finds it.
+        console.error('scheduledMoves: refund failed for', pre.paymentIntentId, err.message);
+        await ScheduledMove.updateOne(
+            { _id: move._id },
+            { $set: { prepaid: { paymentIntentId: pre.paymentIntentId, cents: pre.cents, paidAt: pre.paidAt }, lastError: `refund failed: ${err.message}` } }
+        );
+        return 0;
+    }
 }
 
 /** Change it. scope 'once' moves only the next run of a repeating move. */
@@ -284,6 +508,12 @@ async function update(userId, id, input, now = new Date()) {
         move.skipped.push(keyOf(move.nextAt));
         move.nextAt = occurrenceAfter(move, move.nextAt);
         await move.save();
+        // The one-off is the run the booking paid for: the payment goes with it.
+        const paidFor = move.prepaid && move.prepaid.paymentIntentId ? { ...move.prepaid } : null;
+        if (paidFor) {
+            move.prepaid = undefined;
+            await move.save();
+        }
         const one = await create(userId, {
             kind: move.kind,
             repeat: 'once',
@@ -291,6 +521,15 @@ async function update(userId, id, input, now = new Date()) {
             address: value.address || move.address,
             carLocation: value.carLocation !== undefined ? value.carLocation : move.carLocation?.lat != null ? move.carLocation : undefined,
         }, now);
+        if (one.move && (paidFor || move.priced)) {
+            await ScheduledMove.updateOne(
+                { _id: one.move._id },
+                { $set: { priced: !!move.priced, ...(paidFor ? { prepaid: paidFor } : {}), ...(move.paymentMethodId ? { paymentMethodId: move.paymentMethodId } : {}) } }
+            );
+            const fresh = await ScheduledMove.findById(one.move._id);
+            return { move: view(fresh, sub, sub ? null : await pickUpCents(), sub ? null : await dropOffCents(userId)) };
+        }
+        if (one.error && paidFor) await ScheduledMove.updateOne({ _id: move._id }, { $set: { prepaid: paidFor } });
         return one;
     }
     if (value.kind) move.kind = value.kind;
@@ -306,11 +545,17 @@ async function update(userId, id, input, now = new Date()) {
         : occurrenceAfter(move, now);
     move.lastKey = undefined;
     await move.save();
-    return { move: view(move, sub, sub ? null : await pickUpCents()) };
+    return { move: view(move, sub, sub ? null : await pickUpCents(), sub ? null : await dropOffCents(userId)) };
 }
 
 /** Cancel it, or with scope 'once' just its next run. */
 async function cancel(userId, id, { scope } = {}) {
+    // A booking whose payment never finished (the sheet was closed): drop it.
+    const unpaid = await ScheduledMove.findOne({ _id: id, user: userId, active: false, 'awaitingPayment.since': { $ne: null } });
+    if (unpaid) {
+        await dropUnpaid(unpaid);
+        return { ok: true };
+    }
     const move = await ScheduledMove.findOne({ _id: id, user: userId, active: true });
     if (!move) return { status: 404, error: 'Not found.' };
     if (scope === 'once' && move.repeat !== 'once') {
@@ -320,14 +565,17 @@ async function cancel(userId, id, { scope } = {}) {
         move.active = false;
     }
     await move.save();
-    return { ok: true };
+    // Money follows the run: what the booking paid for it goes back.
+    const refundedCents = await refundPrepaid(move, scope === 'once' ? 'skipped' : 'cancelled');
+    return { ok: true, ...(refundedCents ? { refundedCents } : {}) };
 }
 
 async function mine(userId) {
     const sub = await managedSubscription(userId);
     const moves = await ScheduledMove.find({ user: userId, active: true, nextAt: { $ne: null } }).sort({ nextAt: 1 }).lean();
     const cents = !sub && moves.some((m) => m.kind === 'pick-up') ? await pickUpCents() : null;
-    return moves.map((m) => view(m, sub, cents));
+    const dropCents = !sub && moves.some((m) => m.kind === 'drop-off' && m.priced) ? await dropOffCents(userId) : null;
+    return moves.map((m) => view(m, sub, cents, dropCents));
 }
 
 async function push(userId, title, body, data) {
@@ -366,7 +614,7 @@ async function payForOrder(move, order) {
         await Order.updateOne({ _id: order._id }, { $set: { paymentStatus: 'paid', 'checkout.paidAt': new Date() } });
         return { outcome: 'booked', orderId: order._id, chargedCents: 0, giftCents, card: null };
     }
-    const card = await savedCard(move.user);
+    const card = await cardFor(move);
     if (!stripe || !card) {
         await unpaid();
         return { outcome: 'no_card', orderId: order._id };
@@ -382,7 +630,7 @@ async function payForOrder(move, order) {
                 payment_method: card.paymentMethodId,
                 off_session: true,
                 confirm: true,
-                description: `Scheduled pick-up (order ${order._id})`,
+                description: `Scheduled ${move.kind === 'drop-off' ? 'retrieval' : 'parking'} (order ${order._id})`,
                 metadata: { orderId: String(order._id), customerId: String(move.user), scheduledMoveId: String(move._id), type: 'scheduled_move' },
             },
             { idempotencyKey: `scheduled-pickup-${order._id}` }
@@ -415,6 +663,63 @@ async function payForOrder(move, order) {
         console.error('scheduledMoves: payment record failed for', String(order._id), err.message);
     }
     return { outcome: 'booked', orderId: order._id, chargedCents: amount, giftCents, card };
+}
+
+/** The card a payment intent was paid with, for the order's receipt. */
+async function cardOf(paymentIntentId) {
+    try {
+        const pi = await stripeClient.get().paymentIntents.retrieve(paymentIntentId, { expand: ['payment_method'] });
+        const pm = pi && pi.payment_method;
+        if (pm && pm.card) return { type: 'card', brand: pm.card.brand, last4: pm.card.last4 };
+    } catch (err) {
+        console.error('scheduledMoves: card lookup failed for', paymentIntentId, err.message);
+    }
+    return { type: 'card' };
+}
+
+/**
+ * Pay a run with what its booking paid (Nov 5 2026): no new charge. The order
+ * takes the booking's payment as its own, so a cancel refunds against it.
+ * Claimed off the move first, so it pays for one run only.
+ */
+async function usePrepaid(move, order) {
+    const pre = move.prepaid;
+    const taken = await ScheduledMove.findOneAndUpdate(
+        { _id: move._id, 'prepaid.paymentIntentId': pre.paymentIntentId },
+        { $unset: { prepaid: 1 } }
+    );
+    if (!taken) return payForOrder(move, order);
+    const paidAt = pre.paidAt || new Date();
+    const details = await cardOf(pre.paymentIntentId);
+    await Order.updateOne(
+        { _id: order._id },
+        {
+            $set: {
+                paymentStatus: 'paid',
+                paymentIntentId: pre.paymentIntentId,
+                totalAmount: pre.cents,
+                'checkout.paidAt': paidAt,
+                paymentDetails: { amount: pre.cents, currency: 'usd', paymentMethodDetails: details, paidAt },
+            },
+        }
+    );
+    try {
+        const Payment = require('../models/Payment');
+        await Payment.create({
+            order: order._id,
+            customer: move.user,
+            paymentIntentId: pre.paymentIntentId,
+            amount: pre.cents,
+            currency: 'usd',
+            status: 'succeeded',
+            paymentMethodDetails: details,
+            paidAt,
+            metadata: { scheduledMove: String(move._id), paidAtBooking: true },
+        });
+    } catch (err) {
+        console.error('scheduledMoves: payment record failed for', String(order._id), err.message);
+    }
+    return { outcome: 'booked', orderId: order._id, prepaidCents: pre.cents };
 }
 
 /** Make the order for one occurrence. Returns { outcome, orderId?, retry? }. */
@@ -460,9 +765,10 @@ async function runOne(move, http) {
             if (order && order._id) await Order.updateOne({ _id: order._id, status: 'pending' }, { $set: { status: 'cancelled' } });
             return { outcome: 'not_covered', orderId: order && order._id };
         }
-        return payForOrder(move, order);
+        // Paid at booking: that payment is this run's. Otherwise charge now.
+        return move.prepaid && move.prepaid.paymentIntentId ? usePrepaid(move, order) : payForOrder(move, order);
     }
-    const park = await Order.findOne({ customer: move.user, orderType: 'parking', status: 'parked' }).sort({ createdAt: -1 });
+    const park = await parkedCar(move.user);
     if (!park) return { outcome: 'no_car' };
     let res;
     try {
@@ -477,6 +783,18 @@ async function runOne(move, http) {
         return { outcome: 'failed', error: body.message || err.message };
     }
     const order = res.data && res.data.order;
+    // A car parked on its own comes back as a paid retrieval, like Bring my
+    // car back now (Nov 5 2026); a Park + Retrieve's return, and a plan's, are
+    // already paid for. Only a booking that showed the price pays (priced): an
+    // older one was told it was included.
+    let paid = null;
+    if (order && order._id && !res.data.alreadyRequested && !sub && move.priced && park.serviceType !== 'park-and-hold') {
+        const cents = (move.prepaid && move.prepaid.paymentIntentId && move.prepaid.cents) || (await retrievalCents());
+        await Order.updateOne({ _id: order._id }, { $set: { totalAmount: cents, isFreeService: false, paymentStatus: 'pending' } });
+        const owed = { ...order, _id: order._id, totalAmount: cents, giftSpends: [] };
+        paid = move.prepaid && move.prepaid.paymentIntentId ? await usePrepaid(move, owed) : await payForOrder(move, owed);
+        if (paid.outcome !== 'booked') return paid;
+    }
     if (order && order._id && !res.data.alreadyRequested) {
         try {
             await http.post(`${base()}/api/notification/notify-closest-valets`, { orderId: String(order._id) }, { timeout: 20000 });
@@ -484,11 +802,35 @@ async function runOne(move, http) {
             console.error('scheduledMoves: dispatch failed for', String(order._id), err.message);
         }
     }
-    return { outcome: 'booked', orderId: order && order._id };
+    return { ...(paid || {}), outcome: 'booked', orderId: order && order._id };
 }
 
 /** One pass, every minute from server.js. */
+/**
+ * Bookings whose payment never came back to us (the app closed mid-payment,
+ * the webhook went astray): put the paid ones on the schedule, drop the rest.
+ */
+async function sweepUnpaid(now) {
+    if (!stripeClient.get()) return;
+    const stale = await ScheduledMove.find({
+        active: false,
+        'awaitingPayment.since': { $ne: null, $lte: new Date(now.getTime() - UNPAID_GRACE_MS) },
+    }).limit(20);
+    for (const m of stale) {
+        try {
+            const r = await settlePayment(m, now);
+            if (r.move || r.refunded) continue;
+            // Still being paid (a bank's check, a slow card): wait, up to an hour.
+            if (['processing', 'requires_action'].includes(r.status) && now.getTime() - m.awaitingPayment.since.getTime() < 60 * 60 * 1000) continue;
+            await dropUnpaid(m);
+        } catch (err) {
+            console.error('scheduledMoves: unpaid sweep failed for', String(m._id), err.message);
+        }
+    }
+}
+
 async function tick({ now = new Date(), http = axios } = {}) {
+    await sweepUnpaid(now);
     const horizon = new Date(now.getTime() + Math.max(PICKUP_LEAD_MS, DROPOFF_LEAD_MS));
     const due = await ScheduledMove.find({ active: true, nextAt: { $ne: null, $lte: horizon } });
     const results = [];
@@ -509,34 +851,43 @@ async function tick({ now = new Date(), http = axios } = {}) {
             results.push({ id: String(claimed._id), ...r });
             continue;
         }
-        const label = claimed.kind === 'pick-up' ? 'pick-up' : 'drop-off';
+        // What the booking paid and this run didn't use goes back: a plan
+        // covered it, the return was already paid for, or nothing was booked.
+        const left = await ScheduledMove.findById(claimed._id).select('prepaid').lean();
+        const refundedCents =
+            left && left.prepaid && left.prepaid.paymentIntentId ? await refundPrepaid({ _id: claimed._id, prepaid: left.prepaid }, r.outcome) : 0;
+        const back = refundedCents ? ` The ${dollars(refundedCents)} you paid is on its way back.` : '';
+        // Parking and retrieval, the words users read (Nov 4 2026).
+        const label = claimed.kind === 'pick-up' ? 'parking' : 'retrieval';
+        const when = clock(claimed.nextAt);
+        const meets = claimed.kind === 'pick-up' ? `A valet collects your car at ${when}.` : `A valet brings your car back by ${when}.`;
         if (r.outcome === 'not_covered') {
-            await push(claimed.user, `Your ${label} wasn’t booked`, `Your ${clock(claimed.nextAt)} ${label} isn’t included in your plan today. Book it in the app.`, { type: 'SCHEDULED_MOVE_SKIPPED' });
+            await push(claimed.user, `Your ${label} wasn’t booked`, `Your ${when} ${label} isn’t included in your plan today. Book it in the app.${back}`, { type: 'SCHEDULED_MOVE_SKIPPED' });
         } else if (r.outcome === 'payment_failed' || r.outcome === 'no_card') {
             await push(
                 claimed.user,
                 `Your ${label} wasn’t booked`,
-                `We couldn’t charge your card for your ${clock(claimed.nextAt)} ${label}. Update your card in the app${claimed.repeat === 'once' ? '' : ' to keep your schedule'}.`,
+                `We couldn’t charge your card for your ${when} ${label}. Update your card in the app${claimed.repeat === 'once' ? '' : ' to keep your schedule'}.${back}`,
                 { type: 'SCHEDULED_MOVE_FAILED' }
             );
         } else if (r.outcome === 'booked' && r.chargedCents) {
             await push(
                 claimed.user,
                 `Your ${label} is booked`,
-                `A valet collects your car at ${clock(claimed.nextAt)}. ${dollars(r.chargedCents)} was charged to your ${brandName(r.card && r.card.brand)} ending ${r.card && r.card.last4}.`,
+                `${meets} ${dollars(r.chargedCents)} was charged to your ${brandName(r.card && r.card.brand)} ending ${r.card && r.card.last4}.`,
                 { type: 'SCHEDULED_MOVE_BOOKED' }
             );
         } else if (r.outcome === 'booked' && r.giftCents) {
-            await push(
-                claimed.user,
-                `Your ${label} is booked`,
-                `A valet collects your car at ${clock(claimed.nextAt)}. Your gift card paid for it.`,
-                { type: 'SCHEDULED_MOVE_BOOKED' }
-            );
+            await push(claimed.user, `Your ${label} is booked`, `${meets} Your gift card paid for it.`, { type: 'SCHEDULED_MOVE_BOOKED' });
+        } else if (r.outcome === 'booked' && refundedCents) {
+            await push(claimed.user, `Your ${label} is booked`, `${meets} It’s already paid for, so the ${dollars(refundedCents)} you paid is on its way back.`, { type: 'SCHEDULED_MOVE_BOOKED' });
+        } else if (r.outcome === 'booked' && r.prepaidCents && claimed.kind === 'pick-up') {
+            // Paid at booking: the reminder that it's on, with nothing charged now.
+            await push(claimed.user, `Your ${label} is booked`, meets, { type: 'SCHEDULED_MOVE_BOOKED' });
         } else if (r.outcome === 'no_car') {
-            await push(claimed.user, 'Nothing to bring back', `Your car isn’t parked with us, so there was nothing to bring back at ${clock(claimed.nextAt)}.`, { type: 'SCHEDULED_MOVE_SKIPPED' });
+            await push(claimed.user, 'Nothing to bring back', `Your car isn’t parked with us, so there was nothing to bring back at ${when}.${back}`, { type: 'SCHEDULED_MOVE_SKIPPED' });
         } else if (r.outcome !== 'booked') {
-            await push(claimed.user, `Your ${label} wasn’t booked`, `We couldn’t book your ${clock(claimed.nextAt)} ${label}. Book it in the app.`, { type: 'SCHEDULED_MOVE_FAILED' });
+            await push(claimed.user, `Your ${label} wasn’t booked`, `We couldn’t book your ${when} ${label}. Book it in the app.${back}`, { type: 'SCHEDULED_MOVE_FAILED' });
         }
         const next = claimed.repeat === 'once' ? null : occurrenceAfter(claimed, claimed.nextAt);
         await ScheduledMove.updateOne(
@@ -556,4 +907,23 @@ async function tick({ now = new Date(), http = axios } = {}) {
     return results;
 }
 
-module.exports = { payForOrder, occurrenceAfter, timeOf, create, update, cancel, mine, tick, view, quote, cardSetup, savedCard, pickUpCents, PICKUP_LEAD_MS, DROPOFF_LEAD_MS };
+module.exports = {
+    payForOrder,
+    occurrenceAfter,
+    timeOf,
+    create,
+    update,
+    cancel,
+    mine,
+    tick,
+    view,
+    quote,
+    cardSetup,
+    savedCard,
+    pickUpCents,
+    dropOffCents,
+    confirmPaid,
+    paymentSucceeded,
+    PICKUP_LEAD_MS,
+    DROPOFF_LEAD_MS,
+};

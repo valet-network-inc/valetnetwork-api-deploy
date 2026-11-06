@@ -25,6 +25,8 @@ router.get('/mine/:userId', self, wrap(async (req, res) => res.json({ success: t
 router.get('/quote/:userId', self, wrap(async (req, res) => res.json({ success: true, ...(await moves.quote(req.callerUserId)) })));
 router.post('/card', self, wrap(async (req, res) => send(res, await moves.cardSetup(req.callerUserId), 200)));
 router.post('/', requireCurrentApp, self, wrap(async (req, res) => send(res, await moves.create(req.callerUserId, req.body || {}), 201)));
+// Paid at booking (Nov 5 2026): the booking's payment went through.
+router.post('/:id/paid', self, wrap(async (req, res) => send(res, await moves.confirmPaid(req.callerUserId, req.params.id), 200)));
 router.patch('/:id', self, wrap(async (req, res) => send(res, await moves.update(req.callerUserId, req.params.id, req.body || {}), 200)));
 router.delete('/:id', self, wrap(async (req, res) => send(res, await moves.cancel(req.callerUserId, req.params.id, req.body || {}), 200)));
 

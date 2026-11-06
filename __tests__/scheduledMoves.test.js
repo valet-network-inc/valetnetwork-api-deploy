@@ -114,7 +114,8 @@ describe('booking', () => {
         await User.updateOne({ _id: user._id }, { $set: { stripeCustomerId: 'cus_sam' } });
         stripeWithCard();
         const q = await request(app).get(`/api/schedule/quote/${user._id}`).set(auth);
-        expect(q.body).toMatchObject({ plan: false, pickUpCents: 1300, dropOffCents: 0, cardRequired: false, card: { label: 'Visa ending 4242' } });
+        // A retrieval is priced like Bring my car back now: $5 unless it returns a Park + Retrieve.
+        expect(q.body).toMatchObject({ plan: false, pickUpCents: 1300, dropOffCents: 500, cardRequired: false, card: { label: 'Visa ending 4242' }, payAtBooking: true });
         const paid = await request(app).post('/api/schedule').set(auth).send({ ...body, kind: 'pick-up' });
         expect(paid.status).toBe(201);
         expect(paid.body.move.detail).toBe('Valet meets you at 200 W 20th St · $13');
@@ -272,5 +273,249 @@ describe('Park my car while you hold the keys', () => {
         const closed = await CurbCustody.findById(custody.insertedId);
         expect(closed.closedAt).toBeTruthy();
         expect(closed.closeReason).toBe('superseded');
+    });
+});
+
+/**
+ * Paid at booking (Rishi, Nov 5 2026: "i think you should charge it at booking
+ * because what if there's no card on file?").
+ */
+describe('paid at booking', () => {
+    const auth = { Authorization: 'Bearer uid:sam' };
+    const notifications = require('../controllers/notificationController');
+    let pushes;
+
+    /** A Stripe whose booking intents succeed when `pay(id)` says so. */
+    function stripeForBooking({ savedCard = false } = {}) {
+        const s = { intents: {}, created: [], refunds: [], cancels: [], offSession: [] };
+        let n = 0;
+        stripeClient.set({
+            customers: {
+                retrieve: async (id) => ({ id, invoice_settings: { default_payment_method: savedCard ? 'pm_visa' : null } }),
+                create: async () => ({ id: 'cus_sam' }),
+            },
+            paymentMethods: {
+                retrieve: async (id) => ({ id, customer: 'cus_sam', card: { brand: 'visa', last4: id === 'pm_apple' ? '1111' : '4242' } }),
+                list: async () => ({ data: [] }),
+            },
+            ephemeralKeys: { create: async () => ({ secret: 'ek_1' }) },
+            paymentIntents: {
+                create: async (p, o) => {
+                    if (p.off_session) {
+                        s.offSession.push(p);
+                        return { id: `pi_off_${++n}`, status: 'succeeded', amount: p.amount, currency: 'usd' };
+                    }
+                    const pi = { id: `pi_book_${++n}`, client_secret: `pi_book_${n}_secret`, status: 'requires_payment_method', amount: p.amount, currency: 'usd', metadata: p.metadata, payment_method: null };
+                    s.intents[pi.id] = pi;
+                    s.created.push({ p, o });
+                    return pi;
+                },
+                retrieve: async (id, opts) => {
+                    const pi = s.intents[id];
+                    if (opts && opts.expand && pi && pi.payment_method) return { ...pi, payment_method: { id: pi.payment_method, card: { brand: 'visa', last4: '1111' } } };
+                    return pi;
+                },
+                cancel: async (id) => {
+                    s.cancels.push(id);
+                    s.intents[id].status = 'canceled';
+                    return s.intents[id];
+                },
+            },
+            refunds: {
+                create: async (p, o) => {
+                    s.refunds.push({ p, o });
+                    return { id: `re_${s.refunds.length}` };
+                },
+            },
+        });
+        s.pay = (id, pm = 'pm_apple') => {
+            s.intents[id].status = 'succeeded';
+            s.intents[id].payment_method = pm;
+        };
+        return s;
+    }
+
+    const later = (h = 26) => new Date(Date.now() + h * 3600e3).toISOString();
+    const book = (extra = {}) =>
+        request(app)
+            .post('/api/schedule')
+            .set(auth)
+            .send({ userId: String(user._id), kind: 'pick-up', repeat: 'once', at: later(), address: HOME, payNow: true, ...extra });
+    const paidUp = (id) => request(app).post(`/api/schedule/${id}/paid`).set(auth).send({ userId: String(user._id) });
+    const mineNow = async () => (await request(app).get(`/api/schedule/mine/${user._id}`).set(auth)).body.moves;
+
+    beforeEach(async () => {
+        await User.updateOne({ _id: user._id }, { $set: { stripeCustomerId: 'cus_sam' } });
+        pushes = [];
+        jest.spyOn(notifications, 'sendPushNotification').mockImplementation(async (uid, title, body) => {
+            pushes.push({ title, body });
+        });
+    });
+    afterEach(() => jest.restoreAllMocks());
+
+    test('a parking is paid when it is booked, with no card on file, and shows on Home once paid', async () => {
+        const s = stripeForBooking();
+        const res = await book();
+        expect(res.status).toBe(201);
+        expect(res.body.payment).toMatchObject({ amountCents: 1300, customerId: 'cus_sam', customerEphemeralKeySecret: 'ek_1' });
+        const pi = s.created[0].p;
+        expect(pi).toMatchObject({ amount: 1300, customer: 'cus_sam', setup_future_usage: 'off_session' });
+        expect(pi.metadata).toMatchObject({ purpose: 'scheduled_prepay', scheduledMoveId: res.body.move._id });
+        // Unpaid: not on the schedule, not on Home.
+        expect(await mineNow()).toHaveLength(0);
+        expect((await paidUp(res.body.move._id)).status).toBe(402);
+
+        s.pay(res.body.payment.paymentIntentId);
+        const ok = await paidUp(res.body.move._id);
+        expect(ok.status).toBe(200);
+        const [shown] = await mineNow();
+        expect(shown.detail).toBe('Valet meets you at 200 W 20th St');
+        expect(shown.paidCents).toBe(1300);
+        const move = await ScheduledMove.findById(res.body.move._id).lean();
+        expect(move).toMatchObject({ active: true, priced: true, paymentMethodId: 'pm_apple', prepaid: { cents: 1300 } });
+        // The client asking twice changes nothing.
+        expect((await paidUp(res.body.move._id)).status).toBe(200);
+    });
+
+    test('the webhook puts a paid booking on the schedule too; the sheet closed drops it', async () => {
+        const s = stripeForBooking();
+        const a = await book();
+        s.pay(a.body.payment.paymentIntentId);
+        expect(await moves.paymentSucceeded(s.intents[a.body.payment.paymentIntentId])).toEqual({ activated: a.body.move._id });
+        expect(await moves.paymentSucceeded(s.intents[a.body.payment.paymentIntentId])).toEqual({ already: true });
+
+        const b = await book();
+        const gone = await request(app).delete(`/api/schedule/${b.body.move._id}`).set(auth).send({ userId: String(user._id) });
+        expect(gone.status).toBe(200);
+        expect(s.cancels).toEqual([b.body.payment.paymentIntentId]);
+        expect(await ScheduledMove.findById(b.body.move._id)).toBeNull();
+    });
+
+    test('the sweep settles a paid booking the app never confirmed, and drops an unpaid one', async () => {
+        const s = stripeForBooking();
+        const a = await book();
+        const b = await book();
+        s.pay(a.body.payment.paymentIntentId);
+        await moves.tick({ now: new Date(Date.now() + 5 * 60e3), http: { post: jest.fn() } });
+        expect((await ScheduledMove.findById(a.body.move._id)).active).toBe(false);
+        await moves.tick({ now: new Date(Date.now() + 16 * 60e3), http: { post: jest.fn() } });
+        expect((await ScheduledMove.findById(a.body.move._id)).active).toBe(true);
+        expect(await ScheduledMove.findById(b.body.move._id)).toBeNull();
+        expect(s.cancels).toEqual([b.body.payment.paymentIntentId]);
+    });
+
+    test('the run uses the booking’s payment: no second charge, and the order carries it', async () => {
+        const s = stripeForBooking();
+        // As POST /:id/paid leaves a booking (a past run time can't go through the route).
+        const move = await ScheduledMove.create({
+            user: user._id, kind: 'pick-up', repeat: 'once', time: '19:00', address: HOME, nextAt: at('2026-10-13T23:00:00Z'),
+            priced: true, paymentMethodId: 'pm_apple', prepaid: { paymentIntentId: 'pi_book_9', cents: 1300, paidAt: at('2026-10-12T12:00:00Z') },
+        });
+        s.intents.pi_book_9 = { id: 'pi_book_9', status: 'succeeded', amount: 1300, payment_method: 'pm_apple' };
+        const order = await Order.collection.insertOne({ customer: user._id, orderType: 'parking', status: 'pending', paymentStatus: 'pending', totalAmount: 1300, serviceType: 'park-and-hold', createdAt: new Date() });
+        const http = { post: jest.fn(async () => ({ data: { success: true, order: { _id: order.insertedId, totalAmount: 1300 } } })) };
+        const [r] = await moves.tick({ now: at('2026-10-13T22:15:00Z'), http });
+        expect(r).toMatchObject({ outcome: 'booked', prepaidCents: 1300 });
+        expect(s.offSession).toHaveLength(0);
+        expect(s.refunds).toHaveLength(0);
+        const paid = await Order.findById(order.insertedId).lean();
+        expect(paid).toMatchObject({ paymentStatus: 'paid', paymentIntentId: 'pi_book_9', totalAmount: 1300 });
+        expect(paid.paymentDetails.paymentMethodDetails).toMatchObject({ brand: 'visa', last4: '1111' });
+        expect(await Payment.countDocuments({ order: order.insertedId, paymentIntentId: 'pi_book_9' })).toBe(1);
+        expect(pushes).toEqual([{ title: 'Your parking is booked', body: 'A valet collects your car at 7:00 PM.' }]);
+        expect((await ScheduledMove.findById(move._id)).active).toBe(false);
+    });
+
+    test('a repeat’s next run is charged when it is booked, to the card the booking paid with', async () => {
+        const s = stripeForBooking();
+        await ScheduledMove.create({
+            user: user._id, kind: 'pick-up', repeat: 'weekdays', time: '19:00', address: HOME, nextAt: at('2026-10-14T23:00:00Z'),
+            priced: true, paymentMethodId: 'pm_apple',
+        });
+        const order = await Order.collection.insertOne({ customer: user._id, orderType: 'parking', status: 'pending', paymentStatus: 'pending', totalAmount: 1300, serviceType: 'park-and-hold', createdAt: new Date() });
+        const http = { post: jest.fn(async () => ({ data: { success: true, order: { _id: order.insertedId, totalAmount: 1300 } } })) };
+        const [r] = await moves.tick({ now: at('2026-10-14T22:15:00Z'), http });
+        expect(r.outcome).toBe('booked');
+        expect(s.offSession[0]).toMatchObject({ amount: 1300, payment_method: 'pm_apple', off_session: true });
+        expect(pushes[0]).toEqual({ title: 'Your parking is booked', body: 'A valet collects your car at 7:00 PM. $13 was charged to your Visa ending 1111.' });
+    });
+
+    test('cancelling a paid booking refunds it; so does a run a plan covers', async () => {
+        const s = stripeForBooking();
+        const res = await book();
+        s.pay(res.body.payment.paymentIntentId);
+        await paidUp(res.body.move._id);
+        const gone = await request(app).delete(`/api/schedule/${res.body.move._id}`).set(auth).send({ userId: String(user._id) });
+        expect(gone.body).toMatchObject({ ok: true, refundedCents: 1300 });
+        expect(s.refunds[0].p.payment_intent).toBe(res.body.payment.paymentIntentId);
+
+        const move = await ScheduledMove.create({
+            user: user._id, kind: 'pick-up', repeat: 'once', time: '19:00', address: HOME, nextAt: at('2026-10-15T23:00:00Z'),
+            priced: true, prepaid: { paymentIntentId: 'pi_book_7', cents: 1300 },
+        });
+        await givePlan();
+        const http = { post: jest.fn(async () => ({ data: { success: true, coveredBySubscription: true, order: { _id: new mongoose.Types.ObjectId() } } })) };
+        await moves.tick({ now: at('2026-10-15T22:15:00Z'), http });
+        expect(s.refunds.map((x) => x.p.payment_intent)).toEqual([res.body.payment.paymentIntentId, 'pi_book_7']);
+        expect(pushes.pop()).toEqual({ title: 'Your parking is booked', body: 'A valet collects your car at 7:00 PM. It’s already paid for, so the $13 you paid is on its way back.' });
+        expect((await ScheduledMove.findById(move._id)).active).toBe(false);
+    });
+
+    test('a retrieval is priced like Bring my car back now, and paid at booking', async () => {
+        const s = stripeForBooking();
+        // A car parked on its own: $5, paid now.
+        await Order.collection.insertOne({ customer: user._id, orderType: 'parking', status: 'parked', serviceType: 'standard', createdAt: new Date() });
+        expect((await request(app).get(`/api/schedule/quote/${user._id}`).set(auth)).body.dropOffCents).toBe(500);
+        const paid = await book({ kind: 'drop-off' });
+        expect(paid.body.payment.amountCents).toBe(500);
+        // A Park + Retrieve's return is already paid for: booked at once, free.
+        await Order.deleteMany({});
+        await Order.collection.insertOne({ customer: user._id, orderType: 'parking', status: 'parked', serviceType: 'park-and-hold', createdAt: new Date() });
+        expect((await request(app).get(`/api/schedule/quote/${user._id}`).set(auth)).body.dropOffCents).toBe(0);
+        const free = await book({ kind: 'drop-off' });
+        expect(free.status).toBe(201);
+        expect(free.body.payment).toBeUndefined();
+        expect(s.created).toHaveLength(1);
+        expect((await ScheduledMove.findById(free.body.move._id)).active).toBe(true);
+    });
+
+    test('the retrieval run takes the booking’s $5; an older booking’s stays free', async () => {
+        const s = stripeForBooking();
+        const park = await Order.collection.insertOne({ customer: user._id, orderType: 'parking', status: 'parked', serviceType: 'standard', createdAt: new Date() });
+        const retrieval = await Order.collection.insertOne({ customer: user._id, orderType: 'retrieval', status: 'pending', paymentStatus: 'paid', totalAmount: 0, isFreeService: true, linkedOrderId: park.insertedId, createdAt: new Date() });
+        const calls = [];
+        const http = { post: jest.fn(async (url, body) => {
+            calls.push(url.split('/api/')[1]);
+            if (url.endsWith('/createRetrievalOrder')) return { data: { success: true, order: { _id: retrieval.insertedId } } };
+            return { data: { success: true } };
+        }) };
+        await ScheduledMove.create({
+            user: user._id, kind: 'drop-off', repeat: 'once', time: '08:00', address: HOME, nextAt: at('2026-10-14T12:00:00Z'),
+            priced: true, prepaid: { paymentIntentId: 'pi_book_5', cents: 500 },
+        });
+        const [r] = await moves.tick({ now: at('2026-10-14T11:20:00Z'), http });
+        expect(r).toMatchObject({ outcome: 'booked', prepaidCents: 500 });
+        expect(calls).toEqual(['order/createRetrievalOrder', 'notification/notify-closest-valets']);
+        expect(await Order.findById(retrieval.insertedId).lean()).toMatchObject({ totalAmount: 500, isFreeService: false, paymentStatus: 'paid', paymentIntentId: 'pi_book_5' });
+        expect(s.refunds).toHaveLength(0);
+
+        // Booked by an older client, which said it was included: still free.
+        await Order.updateOne({ _id: retrieval.insertedId }, { $set: { totalAmount: 0, isFreeService: true, paymentIntentId: null } });
+        await ScheduledMove.create({ user: user._id, kind: 'drop-off', repeat: 'once', time: '08:00', address: HOME, nextAt: at('2026-10-15T12:00:00Z') });
+        await moves.tick({ now: at('2026-10-15T11:20:00Z'), http });
+        expect(await Order.findById(retrieval.insertedId).lean()).toMatchObject({ totalAmount: 0, isFreeService: true });
+        expect(s.offSession).toHaveLength(0);
+    });
+
+    test('nothing to bring back: the booking’s money goes back', async () => {
+        const s = stripeForBooking();
+        await ScheduledMove.create({
+            user: user._id, kind: 'drop-off', repeat: 'once', time: '08:00', address: HOME, nextAt: at('2026-10-14T12:00:00Z'),
+            priced: true, prepaid: { paymentIntentId: 'pi_book_3', cents: 500 },
+        });
+        const [r] = await moves.tick({ now: at('2026-10-14T11:20:00Z'), http: { post: jest.fn() } });
+        expect(r.outcome).toBe('no_car');
+        expect(s.refunds[0].p.payment_intent).toBe('pi_book_3');
+        expect(pushes).toEqual([{ title: 'Nothing to bring back', body: 'Your car isn’t parked with us, so there was nothing to bring back at 8:00 AM. The $5 you paid is on its way back.' }]);
     });
 });

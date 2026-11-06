@@ -730,6 +730,21 @@ exports.handleStripeWebhook = async (req, res) => {
                 });
             }
 
+            // A booking for later, paid at booking (Nov 5 2026). It names a
+            // scheduled move, never an order, so it must never reach the order
+            // and guest-payment matchers below.
+            if (paymentIntent.metadata && paymentIntent.metadata.purpose === 'scheduled_prepay') {
+                let result;
+                try {
+                    result = await require('../services/scheduledMoves').paymentSucceeded(paymentIntent);
+                } catch (err) {
+                    console.error('Scheduled booking payment error:', paymentIntent.id, err.message);
+                    return res.status(500).json({ success: false, message: 'Failed to apply scheduled booking payment' });
+                }
+                console.log('Scheduled booking paid:', paymentIntent.id, JSON.stringify(result));
+                return res.status(200).json({ success: true, message: 'Webhook processed successfully' });
+            }
+
             // A tip and an extension are separate charges that happen to name
             // the same order, and the order branch below rewrites
             // `paymentIntentId`, `paymentDetails` and `checkout.paidAt` with
@@ -991,6 +1006,13 @@ exports.handleStripeWebhook = async (req, res) => {
             }
 
             const paymentIntent = event.data.object;
+
+            // A booking for later that failed at booking: the app already
+            // said so, and the job's sweep drops the unpaid booking.
+            if (paymentIntent.metadata && paymentIntent.metadata.purpose === 'scheduled_prepay') {
+                console.log('Scheduled booking payment failed:', paymentIntent.id);
+                return res.status(200).json({ success: true, message: 'Webhook processed successfully' });
+            }
 
             // Same guard as the succeeded branch: a failed subscription
             // invoice PI is Billing's problem (invoice.payment_failed), not

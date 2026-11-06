@@ -22,6 +22,26 @@ const ScheduledMoveSchema = new mongoose.Schema(
             lng: { type: Number },
         },
         active: { type: Boolean, default: true },
+        // Paid at booking (Rishi, Nov 5 2026: "charge it at booking because what
+        // if there's no card on file?"). `priced`: booked by a client that showed
+        // the price and took the money, so a retrieval is charged like one for
+        // now. `prepaid`: what the booking paid, used by the next run instead of
+        // a new charge and refunded if that run doesn't need it. Later runs of a
+        // repeat are charged when they're booked to `paymentMethodId`, the card
+        // the booking paid with. `awaitingPayment`: booked, payment not back yet;
+        // the move stays inactive (out of the job and Home) until it is.
+        priced: { type: Boolean },
+        prepaid: {
+            paymentIntentId: { type: String },
+            cents: { type: Number },
+            paidAt: { type: Date },
+        },
+        paymentMethodId: { type: String },
+        awaitingPayment: {
+            paymentIntentId: { type: String },
+            cents: { type: Number },
+            since: { type: Date },
+        },
         nextAt: { type: Date, index: true },
         skipped: [{ type: String }], // occurrence keys cancelled one at a time
         lastKey: { type: String }, // the occurrence last claimed by the job
