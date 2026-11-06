@@ -42,6 +42,9 @@ const ScheduledMoveSchema = new mongoose.Schema(
         // part (Nov 6): the card paid the rest. It moves to the run's order,
         // or comes back on a cancel.
         giftPaid: { cents: { type: Number }, customerId: { type: String }, at: { type: Date } },
+        // How long a parking is for, as a parking now asks (Rishi, Nov 6: "on
+        // schedule park, you cant set parking duration"). Absent: held (24 h).
+        durationMinutes: { type: Number },
         prepaid: {
             paymentIntentId: { type: String },
             cents: { type: Number },

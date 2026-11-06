@@ -258,7 +258,7 @@ function view(move, sub, pickUpPrices = null, dropOffPriceCents = null) {
     return {
         _id: String(move._id),
         kind: move.kind,
-        ...(move.kind === 'pick-up' ? { serviceType: serviceOf(move) } : {}),
+        ...(move.kind === 'pick-up' ? { serviceType: serviceOf(move), ...(move.durationMinutes ? { durationMinutes: move.durationMinutes } : {}) } : {}),
         at: move.nextAt,
         repeat: move.repeat,
         days: move.days || [],
@@ -371,6 +371,10 @@ async function create(userId, input, now = new Date()) {
         ...(payNow || code ? { priced: true } : {}),
         ...(code ? { eventCode: code } : {}),
         ...(value.kind === 'pick-up' && input.serviceType === 'standard' ? { serviceType: 'standard' } : {}),
+        // How long it's parked for (1 to 24 hours), as a parking now asks.
+        ...(value.kind === 'pick-up' && Number(input.durationMinutes) >= 60 && Number(input.durationMinutes) <= PARK_MINUTES
+            ? { durationMinutes: Math.round(Number(input.durationMinutes)) }
+            : {}),
     });
     // The first run is the time they picked; repeats follow its wall-clock time.
     move.nextAt = value.repeat === 'once' || runsOn(move, nyClock(value.at).weekday) ? value.at : occurrenceAfter(move, value.at);
@@ -620,6 +624,7 @@ async function update(userId, id, input, now = new Date()) {
             address: value.address || move.address,
             carLocation: value.carLocation !== undefined ? value.carLocation : move.carLocation?.lat != null ? move.carLocation : undefined,
             serviceType: move.serviceType,
+            durationMinutes: move.durationMinutes,
         }, now);
         if (one.move && (paidFor || move.priced)) {
             await ScheduledMove.updateOne(
@@ -846,7 +851,7 @@ async function runOne(move, http) {
                 // Required on the Order. A plan's park has no end time; the app
                 // sends 24 hours for it (INDEFINITE_DURATION_MINUTES) and the
                 // server stamps it indefinite.
-                duration: PARK_MINUTES,
+                duration: move.durationMinutes || PARK_MINUTES,
                 paymentMethod: 'card',
                 totalAmount: priceCents,
                 orderType: 'parking',
