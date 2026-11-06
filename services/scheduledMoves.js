@@ -269,7 +269,7 @@ function view(move, sub, pickUpPrices = null, dropOffPriceCents = null) {
         priceCents,
         detail,
         // What the booking paid: cancelling gives it back.
-        ...(move.prepaid && move.prepaid.paymentIntentId ? { paidCents: move.prepaid.cents || 0 } : {}),
+        ...(move.prepaid && move.prepaid.paymentIntentId ? { paidCents: (move.prepaid.cents || 0) + ((move.giftPaid && move.giftPaid.cents) || 0) } : {}),
     };
 }
 
@@ -354,6 +354,9 @@ async function create(userId, input, now = new Date()) {
     }
     const { value, error } = validate(input);
     if (error) return { status: 400, error };
+    // A code pays for one booking; a repeat's later runs would have nothing to
+    // pay with (Nov 6).
+    if (code && value.repeat !== 'once') return { status: 400, code: 'BAD_CODE', error: 'A code works on a one-time booking. Pick Just once to use it.' };
     if (value.at.getTime() - now.getTime() < MIN_NOTICE_MS) {
         return { status: 400, error: 'Pick a time at least 45 minutes from now.' };
     }
@@ -397,6 +400,24 @@ async function startPayment(userId, move, cents) {
     if (!user) return { status: 404, error: 'Not found.' };
     const { ensureStripeCustomer } = require('../controllers/subscriptionController');
     const customerId = await ensureStripeCustomer(user);
+    // Credit that covers only part pays that part now, and the card the rest
+    // (Rishi, Nov 6: fix "credit is used only when it covers the whole price").
+    // Stripe charges a card at least 50 cents.
+    const part = Math.min(gift.cents, cents - giftBalance.MIN_CARD_CENTS);
+    if (part > 0 && gift.customerId) {
+        try {
+            await stripe.customers.createBalanceTransaction(
+                gift.customerId,
+                { amount: part, currency: 'usd', description: `Gift card spent on scheduled booking ${move._id}`, metadata: { scheduledMoveId: String(move._id), tag: 'scheduled' } },
+                { idempotencyKey: `gift-spend-scheduled-${move._id}` }
+            );
+            move.giftPaid = { cents: part, customerId: gift.customerId, at: new Date() };
+        } catch (err) {
+            console.error('scheduledMoves: credit not spent, the card pays it all:', String(move._id), err.message);
+        }
+    }
+    const giftCents = (move.giftPaid && move.giftPaid.cents) || 0;
+    cents -= giftCents;
     move.active = false;
     move.awaitingPayment = { cents, since: new Date() };
     await move.save();
@@ -421,8 +442,10 @@ async function startPayment(userId, move, cents) {
         );
         ephemeralKey = await stripe.ephemeralKeys.create({ customer: customerId }, { apiVersion: '2024-06-20' });
     } catch (err) {
-        if (!intent) await ScheduledMove.deleteOne({ _id: move._id });
-        else await dropUnpaid(Object.assign(move, { awaitingPayment: { ...move.awaitingPayment, paymentIntentId: intent.id } }));
+        if (!intent) {
+            if (giftCents) await giveBackGift(move, 'not booked');
+            await ScheduledMove.deleteOne({ _id: move._id });
+        } else await dropUnpaid(Object.assign(move, { awaitingPayment: { ...move.awaitingPayment, paymentIntentId: intent.id } }));
         throw err;
     }
     await ScheduledMove.updateOne({ _id: move._id }, { $set: { 'awaitingPayment.paymentIntentId': intent.id } });
@@ -432,6 +455,7 @@ async function startPayment(userId, move, cents) {
             clientSecret: intent.client_secret,
             paymentIntentId: intent.id,
             amountCents: cents,
+            ...(giftCents ? { creditCents: giftCents } : {}),
             customerId,
             customerEphemeralKeySecret: ephemeralKey.secret,
         },
@@ -506,8 +530,32 @@ async function dropUnpaid(move) {
             return false;
         }
     }
+    // The credit it spent comes back first; kept for the sweep if that fails.
+    if (move.giftPaid && move.giftPaid.cents && !(await giveBackGift(move, 'not paid'))) return false;
     await ScheduledMove.deleteOne({ _id: move._id, active: false });
     return true;
+}
+
+/** Give back the credit a booking spent at booking (giftPaid). Returns cents. */
+async function giveBackGift(move, why) {
+    const g = move.giftPaid;
+    if (!g || !g.cents || !g.customerId) return 0;
+    const claimed = await ScheduledMove.findOneAndUpdate({ _id: move._id, 'giftPaid.cents': g.cents }, { $unset: { giftPaid: 1 } });
+    if (!claimed) return 0;
+    try {
+        const stripe = stripeClient.get();
+        if (!stripe) throw new Error('payments unavailable');
+        await stripe.customers.createBalanceTransaction(
+            g.customerId,
+            { amount: -g.cents, currency: 'usd', description: `Gift card money back from scheduled booking ${move._id} (${why})`, metadata: { scheduledMoveId: String(move._id), why: String(why || '') } },
+            { idempotencyKey: `gift-back-scheduled-${move._id}` }
+        );
+        return g.cents;
+    } catch (err) {
+        console.error('scheduledMoves: credit back failed for', String(move._id), err.message);
+        await ScheduledMove.updateOne({ _id: move._id }, { $set: { giftPaid: { cents: g.cents, customerId: g.customerId, at: g.at }, lastError: `credit back failed: ${err.message}` } });
+        return 0;
+    }
 }
 
 /**
@@ -517,7 +565,7 @@ async function dropUnpaid(move) {
  */
 async function refundPrepaid(move, why) {
     const pre = move.prepaid;
-    if (!pre || !pre.paymentIntentId) return 0;
+    if (!pre || !pre.paymentIntentId) return giveBackGift(move, why);
     const claimed = await ScheduledMove.findOneAndUpdate(
         { _id: move._id, 'prepaid.paymentIntentId': pre.paymentIntentId },
         { $unset: { prepaid: 1 } }
@@ -530,7 +578,7 @@ async function refundPrepaid(move, why) {
             { payment_intent: pre.paymentIntentId, metadata: { scheduledMoveId: String(move._id), why: String(why || '') } },
             { idempotencyKey: `scheduled-prepay-refund-${pre.paymentIntentId}` }
         );
-        return pre.cents || 0;
+        return (pre.cents || 0) + (await giveBackGift(move, why));
     } catch (err) {
         // Put it back where a person (or a later pass) finds it.
         console.error('scheduledMoves: refund failed for', pre.paymentIntentId, err.message);
@@ -559,8 +607,10 @@ async function update(userId, id, input, now = new Date()) {
         await move.save();
         // The one-off is the run the booking paid for: the payment goes with it.
         const paidFor = move.prepaid && move.prepaid.paymentIntentId ? { ...move.prepaid } : null;
+        const creditFor = paidFor && move.giftPaid && move.giftPaid.cents ? { ...move.giftPaid } : null;
         if (paidFor) {
             move.prepaid = undefined;
+            move.giftPaid = undefined;
             await move.save();
         }
         const one = await create(userId, {
@@ -574,12 +624,12 @@ async function update(userId, id, input, now = new Date()) {
         if (one.move && (paidFor || move.priced)) {
             await ScheduledMove.updateOne(
                 { _id: one.move._id },
-                { $set: { priced: !!move.priced, ...(paidFor ? { prepaid: paidFor } : {}), ...(move.paymentMethodId ? { paymentMethodId: move.paymentMethodId } : {}) } }
+                { $set: { priced: !!move.priced, ...(paidFor ? { prepaid: paidFor } : {}), ...(creditFor ? { giftPaid: creditFor } : {}), ...(move.paymentMethodId ? { paymentMethodId: move.paymentMethodId } : {}) } }
             );
             const fresh = await ScheduledMove.findById(one.move._id);
             return { move: view(fresh, sub, sub ? null : await pickUpPrices(), sub ? null : await dropOffCents(userId)) };
         }
-        if (one.error && paidFor) await ScheduledMove.updateOne({ _id: move._id }, { $set: { prepaid: paidFor } });
+        if (one.error && paidFor) await ScheduledMove.updateOne({ _id: move._id }, { $set: { prepaid: paidFor, ...(creditFor ? { giftPaid: creditFor } : {}) } });
         return one;
     }
     if (value.kind) move.kind = value.kind;
@@ -736,18 +786,21 @@ async function usePrepaid(move, order) {
     const pre = move.prepaid;
     const taken = await ScheduledMove.findOneAndUpdate(
         { _id: move._id, 'prepaid.paymentIntentId': pre.paymentIntentId },
-        { $unset: { prepaid: 1 } }
+        { $unset: { prepaid: 1, giftPaid: 1 } }
     );
     if (!taken) return payForOrder(move, order);
     const paidAt = pre.paidAt || new Date();
     const details = await cardOf(pre.paymentIntentId);
+    // Credit spent at booking is the order's now, so a cancel gives it back there.
+    const g = taken.giftPaid && taken.giftPaid.cents ? taken.giftPaid : null;
     await Order.updateOne(
         { _id: order._id },
         {
             $set: {
                 paymentStatus: 'paid',
                 paymentIntentId: pre.paymentIntentId,
-                totalAmount: pre.cents,
+                totalAmount: pre.cents + (g ? g.cents : 0),
+                ...(g ? { giftSpends: [{ tag: 'scheduled', cents: g.cents, at: g.at || paidAt }], giftPaidCents: g.cents, giftCustomerId: g.customerId } : {}),
                 'checkout.paidAt': paidAt,
                 paymentDetails: { amount: pre.cents, currency: 'usd', paymentMethodDetails: details, paidAt },
             },
@@ -849,7 +902,8 @@ async function runOne(move, http) {
     // A code paid for this run: it comes back free, once.
     if (move.eventCode && order && order._id) await ScheduledMove.updateOne({ _id: move._id }, { $unset: { eventCode: 1 } });
     if (order && order._id && !res.data.alreadyRequested && !sub && move.priced && !move.eventCode && park.serviceType !== 'park-and-hold') {
-        const cents = (move.prepaid && move.prepaid.paymentIntentId && move.prepaid.cents) || (await retrievalCents());
+        const cents =
+            (move.prepaid && move.prepaid.paymentIntentId && move.prepaid.cents + ((move.giftPaid && move.giftPaid.cents) || 0)) || (await retrievalCents());
         await Order.updateOne({ _id: order._id }, { $set: { totalAmount: cents, isFreeService: false, paymentStatus: 'pending' } });
         const owed = { ...order, _id: order._id, totalAmount: cents, giftSpends: [] };
         paid = move.prepaid && move.prepaid.paymentIntentId ? await usePrepaid(move, owed) : await payForOrder(move, owed);

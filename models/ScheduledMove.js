@@ -38,6 +38,10 @@ const ScheduledMoveSchema = new mongoose.Schema(
         // default and every older booking) or Just park ('standard'), the
         // same choice as a parking now (Rishi, Nov 6).
         serviceType: { type: String, enum: ['park-and-hold', 'standard'] },
+        // Gift card credit spent on it at booking when the credit covers only
+        // part (Nov 6): the card paid the rest. It moves to the run's order,
+        // or comes back on a cancel.
+        giftPaid: { cents: { type: Number }, customerId: { type: String }, at: { type: Date } },
         prepaid: {
             paymentIntentId: { type: String },
             cents: { type: Number },
