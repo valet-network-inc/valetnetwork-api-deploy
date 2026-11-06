@@ -17,6 +17,7 @@
  *   node seedrig.js link         <- linked, no taps
  *   node seedrig.js unlink       <- Rishi unlinks
  *   WHO=alex node seedrig.js parked  <- any job mode, on Alex instead
+ *   WHO=codes node seedrig.js returning <- any job mode, on Codes On instead
  *   WHO=alex node seedrig.js chat Hi <- a chat message from Alex (or Rishi) on the newest job
  *   node seedrig.js pending      <- a job no valet has taken yet
  *   node seedrig.js parked       <- parked, keys walked back
@@ -251,7 +252,8 @@ async function main() {
     }
 
     // WHO=alex seeds the job on Alex Test (Rishi's link partner) instead.
-    const customer = mode === 'job-codes' ? codes : process.env.WHO === 'alex' ? partner : user;
+    // WHO=codes seeds any job mode on Codes On (2-digit codes at every handoff).
+    const customer = mode === 'job-codes' || process.env.WHO === 'codes' ? codes : process.env.WHO === 'alex' ? partner : user;
     // Alex's jobs clear only Alex's, so Rishi's park stays put and Home can
     // show both tickets. Rishi's and Codes On's clear each other, as before.
     const scope =

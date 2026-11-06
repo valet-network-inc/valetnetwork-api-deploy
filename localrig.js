@@ -439,6 +439,11 @@ const { MongoMemoryServer } = require('mongodb-memory-server');
   }
   require('http')
     .createServer((req, res) => {
+      // /park in a browser on localhost pays through here too.
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Headers', 'content-type');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      if (req.method === 'OPTIONS') return res.writeHead(204).end();
       let raw = '';
       req.on('data', (c) => (raw += c));
       req.on('end', async () => {
