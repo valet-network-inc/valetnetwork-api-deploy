@@ -34,6 +34,9 @@ const { MongoMemoryServer } = require('mongodb-memory-server');
   // WATCHDOG stays on deliberately: it is read-mostly, and its reconciler is
   // what gives a seeded managed car its custody row without extra setup.
   process.env.CURB_SWEEP_ENABLED = 'false';
+  // The simulator's dev build reports an old build number, and the "update the
+  // app" gate (services/appGate.js) would 426 every booking made from it.
+  process.env.MIN_IOS_BUILD = process.env.MIN_IOS_BUILD || '0';
 
   // Never a live key here. Nothing in the screenshot path charges anything —
   // order state is written straight into mongo by seed.js.

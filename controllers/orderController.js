@@ -1054,6 +1054,21 @@ exports.createOrder = async (req, res) => {
 
         console.log('Order data to save:', orderData);
         
+        // "Who should keep the keys?" (Nov 11 2026): on a per-use park the
+        // customer can ask the valet to keep them for the parking time. Never on
+        // a plan that holds the car (it keeps them anyway), a move or an away
+        // hold. Custody opens when the valet parks it (curbCustody classify).
+        if (
+            req.body.keysStayWithValet === true &&
+            (orderData.orderType || 'parking') === 'parking' &&
+            !aspMode &&
+            !awayMode &&
+            !orderData.coveredBySubscription &&
+            !orderData.indefinite
+        ) {
+            orderData.keysChoice = 'valet';
+        }
+
         const order = new Order(orderData);
         // A move the customer's gift card balance covers is paid for from it
         // here, with no card payment. The app and the site skip the card
@@ -1920,6 +1935,11 @@ exports.updateOrder = async (req, res) => {
                 );
                 if (custody) {
                     await curbCustody.giveKeysBack({ custody, order, verifiedVia: 'return_key' });
+                    // A per-use hold (Nov 11 2026) ends with its keys: the park
+                    // goes on as any per-use park does, keys with the customer.
+                    if (custody.tier === 'per_use') {
+                        await curbCustody.close({ custody, reason: 'keys_returned' });
+                    }
                 }
             } catch (keyErr) {
                 console.error('updateOrder: giveKeysBack failed:', keyErr.message);

@@ -1295,6 +1295,40 @@ describe('status payload', () => {
         expect(res.body.message).toMatch(/once a month/);
     });
 
+    // The plan signup's keys spot (Nov 11 2026): editing the days keeps it.
+    it('a schedule edit that names no keys spot keeps the one the plan has', async () => {
+        const user = await makeCustomer();
+        const KEYS = { streetAddress: '88 Wyckoff St, Brooklyn', lat: 40.6857, lng: -73.9905 };
+        const sub = await makeSub(user, {
+            tier: 'street_cleaning',
+            movesPerWeek: 2,
+            aspSchedule: { address: HOME, days: [{ weekday: 2, hour: 9, minute: 0 }], source: 'onboarding', keysAt: KEYS },
+        });
+        const res = mockRes();
+        await subscriptionController.updateSchedule(
+            { body: { userId: user._id.toString(), aspSchedule: { address: HOME, days: [{ weekday: 4, hour: 8, minute: 30 }] } } },
+            res
+        );
+        expect(res.statusCode).toBe(200);
+        const fresh = await Subscription.findById(sub._id).lean();
+        expect(fresh.aspSchedule.days).toEqual([{ weekday: 4, hour: 8, minute: 30 }]);
+        expect(fresh.aspSchedule.keysAt).toMatchObject(KEYS);
+    });
+
+    it('a schedule edit on a plan with no keys spot still saves', async () => {
+        const user = await makeCustomer();
+        const sub = await makeSub(user, { tier: 'street_cleaning', movesPerWeek: 2 });
+        const res = mockRes();
+        await subscriptionController.updateSchedule(
+            { body: { userId: user._id.toString(), aspSchedule: { address: HOME, days: [{ weekday: 1, hour: 9, minute: 0 }] } } },
+            res
+        );
+        expect(res.statusCode).toBe(200);
+        const fresh = await Subscription.findById(sub._id).lean();
+        expect(fresh.aspSchedule.days).toEqual([{ weekday: 1, hour: 9, minute: 0 }]);
+        expect(fresh.aspSchedule.keysAt && fresh.aspSchedule.keysAt.lat).toBeFalsy();
+    });
+
     it('street_cleaning tier never advertises a free park', async () => {
         const user = await makeCustomer();
         const sub = await makeSub(user, { tier: 'street_cleaning', amountCents: 3000 });

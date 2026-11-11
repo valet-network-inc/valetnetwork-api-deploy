@@ -172,3 +172,28 @@ describe('auto-sweep scheduler caps on the plan the customer bought', () => {
         expect(results.filter((r) => r.outcome === 'booked')).toHaveLength(1);
     });
 });
+
+// The plan signup's "Where should we get the keys?" (Nov 11 2026): a move the
+// scheduler books meets the user there, and the car stays the move's location.
+describe('auto-sweep moves meet for the keys where the plan says', () => {
+    const KEYS = { lat: 40.6857, lng: -73.9905, streetAddress: '88 Wyckoff St, Brooklyn' };
+
+    it('a plan with a keys spot books its move with keysLocation set', async () => {
+        const user = await makeCustomer();
+        await makeSub(user, { aspSchedule: { address: HOME, days: [THU_830], source: 'onboarding', keysAt: KEYS } });
+        await runTick();
+        const move = await Order.findOne({ autoBookKey: { $exists: true } }).lean();
+        expect(move).toBeTruthy();
+        expect(move.customerLocation.streetAddress).toBe(HOME.streetAddress);
+        expect(move.keysLocation).toMatchObject(KEYS);
+    });
+
+    it('a plan without one books as before: the keys are at the car', async () => {
+        const user = await makeCustomer();
+        await makeSub(user);
+        await runTick();
+        const move = await Order.findOne({ autoBookKey: { $exists: true } }).lean();
+        expect(move).toBeTruthy();
+        expect(move.keysLocation && move.keysLocation.lat).toBeFalsy();
+    });
+});

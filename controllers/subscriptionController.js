@@ -214,6 +214,10 @@ function validateAspSchedule(aspSchedule) {
     if (!a || typeof a.lat !== 'number' || typeof a.lng !== 'number' || !a.streetAddress) {
         return 'aspSchedule.address needs streetAddress, lat and lng';
     }
+    const k = aspSchedule.keysAt;
+    if (k != null && (typeof k !== 'object' || typeof k.lat !== 'number' || typeof k.lng !== 'number' || !k.streetAddress)) {
+        return 'aspSchedule.keysAt needs streetAddress, lat and lng';
+    }
     const days = aspSchedule.days;
     if (!Array.isArray(days) || days.length < 1 || days.length > 2) {
         return 'aspSchedule.days needs 1 or 2 entries';
@@ -1656,7 +1660,16 @@ exports.updateSchedule = async (req, res) => {
                     message: `Your plan covers ${cap} move${cap === 1 ? '' : 's'} a week — pick at most that many days.`,
                 });
             }
-            sub.aspSchedule = { ...aspSchedule, source: 'edited' };
+            // An edit that doesn't name a keys spot keeps the one the plan has.
+            // Copied out as a plain object first: the live nested path is reset
+            // by the assignment below, and Mongoose then reads it as undefined.
+            const had = sub.aspSchedule && sub.aspSchedule.keysAt;
+            const keysAt =
+                aspSchedule.keysAt ||
+                (had && had.lat != null && had.lng != null
+                    ? { streetAddress: had.streetAddress, lat: had.lat, lng: had.lng }
+                    : undefined);
+            sub.aspSchedule = { ...aspSchedule, ...(keysAt ? { keysAt } : {}), source: 'edited' };
             // Same record, edited from the other end.
             await adoptFromSubscription(userId, sub.aspSchedule);
         }

@@ -419,6 +419,24 @@ async function tick({ now = new Date(), io = null, notify = null } = {}) {
             for (let i = 0; i < members.length; i += 1) {
                 const { custody, due } = members[i];
                 try {
+                    // A per-use park whose valet kept the keys (Nov 11 2026, his
+                    // rule): a sweep INSIDE the parking time is ours to move; one
+                    // after it isn't, because by then the keys have gone back (or
+                    // the car has, if they asked for it). No plan, no charge.
+                    if (custody.tier === 'per_use') {
+                        const holdEnd = await holdEndOf(custody);
+                        if (holdEnd && due.at.getTime() >= holdEnd.getTime()) {
+                            results.push({ custodyId: custody._id, outcome: 'after_hold' });
+                            continue;
+                        }
+                        if (custody.keysWith !== 'valet') {
+                            results.push({ custodyId: custody._id, outcome: 'keys_back' });
+                            continue;
+                        }
+                        const moved = await remindKeyHolder(custody, due, due.window, { io });
+                        results.push({ custodyId: custody._id, ...moved });
+                        continue;
+                    }
                     const sub = await Subscription.findById(custody.subscription);
                     if (!sub) {
                         results.push({ custodyId: custody._id, outcome: 'no_subscription' });
@@ -727,7 +745,98 @@ async function watch({ now = new Date() } = {}) {
     return raised;
 }
 
+/**
+ * When a per-use hold ends, read fresh from the park that was booked (the first
+ * order in the chain; after a sweep move `currentOrder` is the move's leg). Add
+ * time moves `duration` on that order, so the stamp made at park time would give
+ * the keys back on the old hour. The row is re-stamped when the end has moved.
+ */
+async function holdEndOf(custody) {
+    const bookedId = (custody.orderChain && custody.orderChain[0]) || custody.currentOrder;
+    const booked = bookedId ? await Order.findById(bookedId).select('pickUpTime createdAt duration').lean() : null;
+    if (!booked) return custody.holdUntil ? new Date(custody.holdUntil) : null;
+    const end = curbCustody.holdUntilOf(booked);
+    if (!custody.holdUntil || new Date(custody.holdUntil).getTime() !== end.getTime()) {
+        await CurbCustody.updateOne({ _id: custody._id }, { $set: { holdUntil: end } });
+        custody.holdUntil = end;
+    }
+    return end;
+}
+
+/**
+ * The end of a per-use park whose valet kept the keys (Nov 11 2026, his rule):
+ * when its time is up the keys go back — a key delivery, the car stays parked —
+ * unless a retrieval is already bringing the car (it takes the keys with it).
+ * Runs on its own beat, outside the mover's flag: keys we hold past the time
+ * someone paid for are ours to give back whether or not the mover is on.
+ */
+async function releaseExpired({ now = new Date(), io = null } = {}) {
+    const out = [];
+    try {
+        const due = await CurbCustody.find({
+            closedAt: { $exists: false },
+            tier: 'per_use',
+            keysWith: 'valet',
+            holdUntil: { $lte: now },
+        }).limit(200);
+        const { mintKeyDelivery } = require('./keyDelivery');
+        for (const custody of due) {
+            try {
+                const req = custody.keyRequest || {};
+                if (req.requestedAt && !req.deliveredAt && !req.cancelledAt) {
+                    out.push({ custodyId: custody._id, outcome: 'already_returning' });
+                    continue;
+                }
+                // Time added since the park: not over yet.
+                const holdEnd = await holdEndOf(custody);
+                if (holdEnd && holdEnd.getTime() > now.getTime()) {
+                    out.push({ custodyId: custody._id, outcome: 'time_added' });
+                    continue;
+                }
+                // A retrieval asked for any park in this chain brings the keys with the car.
+                const chain = [...(custody.orderChain || []), custody.currentOrder].filter(Boolean);
+                const retrieving = await Order.exists({
+                    linkedOrderId: { $in: chain },
+                    orderType: 'retrieval',
+                    keyDeliveryOnly: { $ne: true },
+                    aspMode: { $ne: true },
+                    status: { $nin: ['cancelled', 'completed'] },
+                });
+                if (retrieving) {
+                    out.push({ custodyId: custody._id, outcome: 'retrieval_running' });
+                    continue;
+                }
+                const delivery = await mintKeyDelivery({ custody, userId: String(custody.customer), io });
+                // Tell them, in the words they'll see: the time they booked is up.
+                try {
+                    const User = require('../models/User');
+                    const owner = await User.findById(custody.customer).select('firebaseUid').lean();
+                    if (owner && owner.firebaseUid) {
+                        const { sendPushNotification } = require('../controllers/notificationController');
+                        await sendPushNotification(
+                            owner.firebaseUid,
+                            'Your parking time is up',
+                            'Your valet is bringing your keys back. The car stays parked where it is.',
+                            { orderId: String(delivery._id), type: 'KEY_DELIVERY_TIME_UP' }
+                        );
+                    }
+                } catch (err) {
+                    console.error('releaseExpired: customer push failed:', err.message);
+                }
+                out.push({ custodyId: custody._id, outcome: 'keys_returning', orderId: String(delivery._id) });
+            } catch (err) {
+                console.error('releaseExpired: custody', String(custody._id), err.message);
+                out.push({ custodyId: custody._id, outcome: 'error', error: err.message });
+            }
+        }
+    } catch (err) {
+        console.error('releaseExpired error:', err.message);
+    }
+    return out;
+}
+
 module.exports = {
+    releaseExpired,
     tick,
     watch,
     dueNow,

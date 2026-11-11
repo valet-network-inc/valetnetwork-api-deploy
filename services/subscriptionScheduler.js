@@ -176,6 +176,12 @@ async function bookOccurrence(sub, day, occurrence, { io, notify, now }) {
 
     const pickUpTime = new Date(occurrence.getTime() - PICKUP_HEADSTART_MS);
     const listPrice = await aspListPriceCents();
+    // The keys spot from the signup (Nov 11 2026), when it isn't the car's block.
+    const k = sub.aspSchedule && sub.aspSchedule.keysAt;
+    const keysAt =
+        k && typeof k.lat === 'number' && typeof k.lng === 'number' && (k.lat !== address.lat || k.lng !== address.lng)
+            ? { lat: k.lat, lng: k.lng, streetAddress: k.streetAddress }
+            : null;
     const otpCreatedAt = new Date();
 
     const order = new Order({
@@ -185,6 +191,7 @@ async function bookOccurrence(sub, day, occurrence, { io, notify, now }) {
             lng: address.lng,
             streetAddress: address.streetAddress,
         },
+        ...(keysAt ? { keysLocation: keysAt } : {}),
         parkingType: 'street',
         orderType: 'parking',
         duration: 90,

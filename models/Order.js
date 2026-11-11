@@ -450,6 +450,19 @@ const OrderSchema = new mongoose.Schema({
     },
 
     /**
+     * What the CUSTOMER picked at "Who should keep the keys?" (Nov 11 2026),
+     * on a per-use park. 'valet' opens a per_use custody when the car is parked
+     * (services/curbCustody classify), held for the parking time. Absent on
+     * every park booked before the question existed, and on the plans that hold
+     * the car, which keep the keys anyway. `keysStayWithValet` above stays the
+     * mirror of what custody actually did.
+     */
+    keysChoice: {
+        type: String,
+        enum: ['valet', 'customer'],
+    },
+
+    /**
      * A sweep move on a car whose keys the CUSTOMER was holding.
      *
      * We borrow them for the move and hand them straight back at the end of it,

@@ -136,6 +136,13 @@ const SubscriptionSchema = new mongoose.Schema(
                 enum: ['onboarding', 'first_booking', 'edited'],
                 default: 'onboarding',
             },
+            // Where the valet gets the keys before every move (Nov 11 2026, the
+            // plan signup's "Where should we get the keys?"). Unset = at the car.
+            keysAt: {
+                streetAddress: { type: String },
+                lat: { type: Number },
+                lng: { type: Number },
+            },
         },
         // The FIXED SPOT where the free daily park+retrieval applies for the
         // Fixed garage tier. Changeable once every 30 days.

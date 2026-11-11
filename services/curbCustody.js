@@ -110,7 +110,21 @@ async function classify(order) {
     // CurbCustody row existed — so nothing read the block, nothing moved the
     // car before the sweep, and the watchdog had no row to alarm on. An
     // unwatched car on a cleaning block is a ticket or a tow.
-    if (!order.coveredBySubscription && !order.indefinite) return null;
+    if (!order.coveredBySubscription && !order.indefinite) {
+        // A per-use park whose customer asked the valet to keep the keys
+        // (Nov 11 2026): held for the parking time they bought, no plan behind it.
+        if (
+            order.keysChoice === 'valet' &&
+            order.orderType === 'parking' &&
+            !order.aspMode &&
+            !order.awayMode
+        ) {
+            const own = order.parkingLocation;
+            if (!own || !finite(own.lat) || !finite(own.lng)) return null;
+            return { sub: null, loc: own, perUse: true };
+        }
+        return null;
+    }
     const loc = order.parkingLocation;
     if (!loc || !finite(loc.lat) || !finite(loc.lng)) return null;
 
@@ -157,10 +171,17 @@ const valetIdOf = (order) =>
  * been moved to. Idempotent: this runs on every park AND every move, and may
  * run twice for one move.
  */
+/** When a per-use park's time ends: the time it was booked for, plus the hours bought. */
+const holdUntilOf = (order) => {
+    const start = new Date(order.pickUpTime || order.createdAt || Date.now()).getTime();
+    const minutes = Number(order.duration) > 0 ? Number(order.duration) : 240;
+    return new Date(start + minutes * 60 * 1000);
+};
+
 async function arm({ order }) {
     const classified = await classify(order);
     if (!classified) return null;
-    const { sub, loc } = classified;
+    const { sub, loc, perUse } = classified;
 
     const tileKey = sweepWindows.tileKeyOf(loc);
     const now = new Date();
@@ -196,8 +217,9 @@ async function arm({ order }) {
     if (!custody) {
         custody = new CurbCustody({
             customer: customerIdOf(order),
-            subscription: sub._id,
-            tier: sub.tier,
+            subscription: sub ? sub._id : undefined,
+            tier: sub ? sub.tier : 'per_use',
+            ...(perUse ? { holdUntil: holdUntilOf(order) } : {}),
             currentOrder: order._id,
             orderChain: [order._id],
             valet: valetIdOf(order),
@@ -1050,6 +1072,7 @@ async function reconcile({ now = new Date() } = {}) {
 }
 
 module.exports = {
+    holdUntilOf,
     endForRepark,
     reparkCandidate,
     MANAGED_TIERS,

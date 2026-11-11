@@ -15,6 +15,8 @@ function serialize(doc) {
         out[f] = doc[f];
     });
     out.updatedBy = doc.updatedBy || null;
+    // "Who should keep the keys?" is honoured (Nov 11 2026): the apps show the step.
+    out.keysChoice = true;
     out.updatedAt = doc.updatedAt;
     return out;
 }

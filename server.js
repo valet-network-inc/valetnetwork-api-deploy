@@ -406,6 +406,21 @@ server.listen(PORT, () => {
         }
     }
 
+    // Background job: per-use keys whose parking time is up go back (Nov 11
+    // 2026). Outside the mover's flag on purpose: keys we hold past the time
+    // someone paid for are ours to return whether or not the mover is on.
+    try {
+        const { releaseExpired } = require('./services/curbSweepDispatcher');
+        setInterval(() => {
+            releaseExpired({ io }).catch((e) =>
+                console.error('releaseExpired interval error:', e.message)
+            );
+        }, 60 * 1000);
+        console.log('Per-use key return registered (runs every 60s)');
+    } catch (err) {
+        console.error('Failed to register per-use key return:', err.message);
+    }
+
     // Background job: the curb-sweep WATCHDOG.
     //
     // Registered OUTSIDE the mover's flag, deliberately. A ticket on a managed

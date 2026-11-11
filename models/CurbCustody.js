@@ -92,16 +92,25 @@ const CurbCustodySchema = new mongoose.Schema(
         subscription: {
             type: mongoose.Schema.Types.ObjectId,
             ref: 'Subscription',
-            required: true,
+            // A per-use park (Nov 11 2026) has no plan behind it.
+            required: function () {
+                return this.tier !== 'per_use';
+            },
         },
         // street_cleaning is deliberately absent. That plan is sold by the move
         // against days the customer typed, services/subscriptionScheduler.js
         // owns it, and nothing here may ever touch it.
         tier: {
             type: String,
-            enum: ['home_garage', 'valet_anywhere'],
+            // per_use (Nov 11 2026): a pay-per-use customer asked the valet to
+            // keep the keys ("Who should keep the keys?"). Held only for the
+            // parking time they bought: a sweep inside it we move, at its end the
+            // keys go back (or the car does, if they asked for it).
+            enum: ['home_garage', 'valet_anywhere', 'per_use'],
             required: true,
         },
+        // per_use only: when the parking time ends (pickUpTime + duration).
+        holdUntil: { type: Date },
 
         // The order the car is currently sitting under. Hops when a sweep move
         // mints a new one; the row itself lives until the car goes back.
@@ -321,6 +330,8 @@ const CurbCustodySchema = new mongoose.Schema(
                 'car_gone',
                 'operator',
                 'superseded',
+                // per_use: the parking time ran out and the keys went back.
+                'keys_returned',
             ],
         },
     },
