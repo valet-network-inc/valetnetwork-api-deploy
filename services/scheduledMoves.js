@@ -970,6 +970,8 @@ function earlySameDay(move, key, now) {
 
 async function tick({ now = new Date(), http = axios } = {}) {
     await sweepUnpaid(now);
+    // Ops hears about every job a few hours ahead (services/opsAlert.js).
+    await opsAlert.headsUp(now);
     // Today's runs are read too: a parking booked today for later today is
     // booked at once (earlySameDay), so it is in the valet's order list from
     // the moment it's requested (Nov 14 2026).
@@ -988,6 +990,8 @@ async function tick({ now = new Date(), http = axios } = {}) {
         );
         if (!claimed) continue;
         const r = await runOne(claimed, http);
+        // Ops heard about this run as a scheduled move: its order isn't news.
+        if (r.orderId) await Order.updateOne({ _id: r.orderId, opsAlertedAt: { $exists: false } }, { $set: { opsAlertedAt: now } });
         // An early try that didn't book (the car is still out with us, or the
         // order was refused) is left for the usual time, PICKUP_LEAD before.
         if (early && (r.retry || r.outcome === 'failed')) {
