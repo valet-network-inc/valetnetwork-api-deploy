@@ -539,6 +539,9 @@ const OrderSchema = new mongoose.Schema({
     // recognised by its already-populated `notifiedValets`. Absent on every
     // order written before advance dispatch shipped, which is exactly what
     // lets the job adopt them.
+    // When ops (alwaysNotify valets) was told this booking is for later today
+    // (services/opsAlert.js, Nov 14 2026).
+    opsAlertedAt: { type: Date },
     dispatchedAt: {
         type: Date,
     },

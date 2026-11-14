@@ -62,6 +62,11 @@ const ScheduledMoveSchema = new mongoose.Schema(
         lastOrder: { type: mongoose.Schema.Types.ObjectId, ref: 'Order' },
         lastOutcome: { type: String },
         lastError: { type: String },
+        // Same-day bookings (Nov 14 2026): the occurrence ops was told about
+        // (services/opsAlert.js), and the occurrence a same-day parking was
+        // tried early for, so each happens once.
+        opsAlertKey: { type: String },
+        earlyKey: { type: String },
     },
     { timestamps: true }
 );

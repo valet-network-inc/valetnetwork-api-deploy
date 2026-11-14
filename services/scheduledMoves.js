@@ -44,6 +44,7 @@ const { nyClock, nyWallTimeToInstant } = require('./nyTime');
 const stripeClient = require('./stripeClient');
 const giftBalance = require('./giftBalance');
 const orderPricing = require('./orderPricing');
+const opsAlert = require('./opsAlert');
 
 const PICKUP_LEAD_MS = 50 * 60 * 1000;
 const DROPOFF_LEAD_MS = 45 * 60 * 1000;
@@ -383,6 +384,7 @@ async function create(userId, input, now = new Date()) {
         if (cents > 0) return startPayment(userId, move, cents);
     }
     await move.save();
+    await opsAlert.scheduledMove(move, now);
     return { move: view(move, sub, sub ? null : await pickUpPrices(), sub ? null : await dropOffCents(userId)) };
 }
 
@@ -492,6 +494,7 @@ async function settlePayment(move, now = new Date()) {
         },
         { new: true }
     );
+    if (done) await opsAlert.scheduledMove(done, now);
     return { move: done || (await ScheduledMove.findById(move._id)) };
 }
 
@@ -650,6 +653,7 @@ async function update(userId, id, input, now = new Date()) {
         : occurrenceAfter(move, now);
     move.lastKey = undefined;
     await move.save();
+    await opsAlert.scheduledMove(move, now);
     return { move: view(move, sub, sub ? null : await pickUpPrices(), sub ? null : await dropOffCents(userId)) };
 }
 
@@ -948,22 +952,49 @@ async function sweepUnpaid(now) {
     }
 }
 
+/**
+ * A parking requested today for later today is booked as soon as it's on the
+ * schedule, not PICKUP_LEAD before: the order (pending, paid, for its time)
+ * is then in the order list of every alwaysNotify valet at once, and
+ * scheduledDispatch still sends it out 45 minutes before, as with any
+ * advance booking. Once per run (earlyKey). Retrievals keep their lead: a
+ * retrieval is dispatched the moment it's made.
+ */
+function earlySameDay(move, key, now) {
+    if (move.kind !== 'pick-up' || move.earlyKey === key) return false;
+    if (!opsAlert.isLaterToday(move.nextAt, now)) return false;
+    const { nyDateKey } = require('./nyTime');
+    const askedAt = move.updatedAt || move.createdAt;
+    return !!askedAt && nyDateKey(askedAt) === nyDateKey(now);
+}
+
 async function tick({ now = new Date(), http = axios } = {}) {
     await sweepUnpaid(now);
-    const horizon = new Date(now.getTime() + Math.max(PICKUP_LEAD_MS, DROPOFF_LEAD_MS));
+    // Today's runs are read too: a parking booked today for later today is
+    // booked at once (earlySameDay), so it is in the valet's order list from
+    // the moment it's requested (Nov 14 2026).
+    const horizon = new Date(Math.max(now.getTime() + Math.max(PICKUP_LEAD_MS, DROPOFF_LEAD_MS), opsAlert.endOfNyToday(now).getTime()));
     const due = await ScheduledMove.find({ active: true, nextAt: { $ne: null, $lte: horizon } });
     const results = [];
     for (const move of due) {
         const lead = move.kind === 'pick-up' ? PICKUP_LEAD_MS : DROPOFF_LEAD_MS;
-        if (move.nextAt.getTime() - lead > now.getTime()) continue;
         const key = keyOf(move.nextAt);
+        const early = earlySameDay(move, key, now);
+        if (!early && move.nextAt.getTime() - lead > now.getTime()) continue;
         const claimed = await ScheduledMove.findOneAndUpdate(
             { _id: move._id, active: true, nextAt: move.nextAt, lastKey: { $ne: key } },
-            { $set: { lastKey: key } },
+            { $set: { lastKey: key, ...(early ? { earlyKey: key } : {}) } },
             { new: true }
         );
         if (!claimed) continue;
         const r = await runOne(claimed, http);
+        // An early try that didn't book (the car is still out with us, or the
+        // order was refused) is left for the usual time, PICKUP_LEAD before.
+        if (early && (r.retry || r.outcome === 'failed')) {
+            await ScheduledMove.updateOne({ _id: claimed._id, lastKey: key }, { $unset: { lastKey: 1 }, $set: { lastOutcome: r.outcome, lastError: r.error } });
+            results.push({ id: String(claimed._id), early: true, ...r });
+            continue;
+        }
         if (r.retry && now.getTime() < claimed.nextAt.getTime() + GIVE_UP_AFTER_MS) {
             // Let the next tick try this occurrence again.
             await ScheduledMove.updateOne({ _id: claimed._id, lastKey: key }, { $unset: { lastKey: 1 }, $set: { lastOutcome: r.outcome, lastError: r.error } });

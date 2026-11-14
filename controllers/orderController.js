@@ -1197,11 +1197,23 @@ exports.getPendingOrders = async (req, res) => {
             .map((s) => s.trim())
             .filter((s) => /^[a-f0-9]{24}$/i.test(s));
 
+        // An alwaysNotify valet (ops) sees the rest of today too: a booking
+        // for later today is in his list from the moment it's made (Nov 14
+        // 2026). Everyone else keeps the dispatch window above.
+        let horizon = dispatchHorizon;
+        if (req.callerUserId) {
+            const me = await User.findById(req.callerUserId).select('alwaysNotify').lean();
+            if (me && me.alwaysNotify) {
+                const { endOfNyToday } = require('../services/opsAlert');
+                horizon = new Date(Math.max(dispatchHorizon.getTime(), endOfNyToday().getTime()));
+            }
+        }
+
         const orders = await Order.find({
             status: 'pending',
             paymentStatus: 'paid',
             $or: [
-                { pickUpTime: { $lte: dispatchHorizon } },
+                { pickUpTime: { $lte: horizon } },
                 { pickUpTime: { $exists: false } },
                 { pickUpTime: null },
                 ...(earlyIds.length ? [{ _id: { $in: earlyIds } }] : []),

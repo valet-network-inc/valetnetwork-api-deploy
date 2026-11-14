@@ -289,6 +289,8 @@ exports.notifyClosestValets = async (req, res) => {
                 new Date(order.pickUpTime).toISOString(),
                 '— deferring to scheduledDispatch'
             );
+            // Booked for later today: ops hears now (services/opsAlert.js).
+            await require('../services/opsAlert').order(order);
             return res.status(200).json({
                 success: true,
                 deferred: true,
