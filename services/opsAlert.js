@@ -20,7 +20,8 @@ const { nyDateKey } = require('./nyTime');
 // earlier than 45 minutes before ... like a good few hours earlier"). A job
 // booked earlier than this is told this long before it; one booked inside
 // it, or for later the same day, is told when it's booked. Once per job.
-const HEADS_UP_MS = 3 * 60 * 60 * 1000;
+// 3 hours until Nov 19 2026, then 2 (Rishi: "2 hours earlier instead of 3").
+const HEADS_UP_MS = 2 * 60 * 60 * 1000;
 const DISPATCH_LEAD_MS = 45 * 60 * 1000;
 
 function isWithinHeadsUp(at, now = new Date()) {

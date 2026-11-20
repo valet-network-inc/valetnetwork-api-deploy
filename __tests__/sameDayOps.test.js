@@ -193,8 +193,8 @@ describe('the order list', () => {
     });
 });
 
-describe('the heads-up, three hours before', () => {
-    test('a parking booked yesterday for 3 PM pushes once at noon, and its order at 2:10 adds nothing', async () => {
+describe('the heads-up, two hours before', () => {
+    test('a parking booked yesterday for 3 PM pushes once at 1 PM, and its order at 2:10 adds nothing', async () => {
         const orderId = new mongoose.Types.ObjectId();
         await insertMove({ kind: 'pick-up', createdAt: YESTERDAY, updatedAt: YESTERDAY });
         // createOrder makes the paid pending order, as the real endpoint does.
@@ -202,10 +202,10 @@ describe('the heads-up, three hours before', () => {
             await Order.collection.insertOne({ _id: orderId, customer: user._id, orderType: 'parking', status: 'pending', paymentStatus: 'paid', pickUpTime: THREE_PM, customerLocation: HOME, createdAt: new Date() });
             return { data: { success: true, coveredBySubscription: true, order: { _id: orderId } } };
         }) };
-        await moves.tick({ now: at('2026-11-14T16:59:00Z'), http }); // 11:59
+        await moves.tick({ now: at('2026-11-14T17:59:00Z'), http }); // 12:59
         expect(pushes).toHaveLength(0);
-        await moves.tick({ now: at('2026-11-14T17:01:00Z'), http }); // 12:01
-        await moves.tick({ now: at('2026-11-14T17:02:00Z'), http });
+        await moves.tick({ now: at('2026-11-14T18:01:00Z'), http }); // 1:01
+        await moves.tick({ now: at('2026-11-14T18:02:00Z'), http });
         expect(pushes).toHaveLength(1);
         expect(pushes[0]).toMatchObject({ uid: 'rishi', title: 'Coming up today', body: 'Marcie B · parking at 3:00 PM · 134 Boerum Pl' });
         await moves.tick({ now: at('2026-11-14T19:10:00Z'), http }); // minted
@@ -214,20 +214,20 @@ describe('the heads-up, three hours before', () => {
         expect(pushes).toHaveLength(1);
     });
 
-    test('an advance order pushes three hours out, once; a job for now never does', async () => {
+    test('an advance order pushes two hours out, once; a job for now never does', async () => {
         await Order.collection.insertMany([
             { customer: user._id, orderType: 'parking', status: 'pending', paymentStatus: 'paid', pickUpTime: THREE_PM, customerLocation: HOME, createdAt: YESTERDAY },
             { customer: user._id, orderType: 'parking', status: 'pending', paymentStatus: 'paid', pickUpTime: at('2026-11-14T17:10:00Z'), customerLocation: HOME, createdAt: NOW },
         ]);
-        expect(await opsAlert.headsUp(at('2026-11-14T17:01:00Z'))).toBe(1);
-        expect(await opsAlert.headsUp(at('2026-11-14T17:05:00Z'))).toBe(0);
+        expect(await opsAlert.headsUp(at('2026-11-14T18:01:00Z'))).toBe(1);
+        expect(await opsAlert.headsUp(at('2026-11-14T18:05:00Z'))).toBe(0);
         expect(pushes.map((p) => p.body)).toEqual(['Marcie B · parking at 3:00 PM · 134 Boerum Pl']);
     });
 
-    test('a retrieval booked yesterday for 9 AM pushes at 6 AM', async () => {
+    test('a retrieval booked yesterday for 9 AM pushes at 7 AM', async () => {
         await insertMove({ kind: 'drop-off', nextAt: at('2026-11-14T14:00:00Z'), createdAt: YESTERDAY, updatedAt: YESTERDAY });
-        expect(await opsAlert.headsUp(at('2026-11-14T10:59:00Z'))).toBe(0);
-        expect(await opsAlert.headsUp(at('2026-11-14T11:00:00Z'))).toBe(1);
+        expect(await opsAlert.headsUp(at('2026-11-14T11:59:00Z'))).toBe(0);
+        expect(await opsAlert.headsUp(at('2026-11-14T12:00:00Z'))).toBe(1);
         expect(pushes[0].body).toBe('Marcie B · retrieval at 9:00 AM · 134 Boerum Pl');
     });
 });
